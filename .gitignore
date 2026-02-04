@@ -1,0 +1,45 @@
+# TeamsFx files - all env files
+env/.env*
+env/.env.*.user
+env/.env.local
+env/.env.playground
+env/.env.dev
+env/.env.sandbox
+env/.env.*
+env/backup*
+.env
+.env.*
+appPackage/build
+
+# python virtual environment
+.venv/
+__pycache__/
+
+# Source folder - all env and json files with secrets
+src/.env*
+src/*.env
+src/*.json
+src/*_cache.json
+src/ai_search_cache.json
+src/conversation_memory.json
+src/document_cache.json
+src/user_profiles_cache.json
+src/web_cache.json
+
+# All .env files anywhere
+**/.env
+**/.env.*
+**/*.env
+
+# Backup files with secrets
+env/backup.*
+*.backup
+backup*
+
+# others
+.deployment/
+node_modules/
+devTools/*.log
+
+# Dev tool directories
+/devTools/

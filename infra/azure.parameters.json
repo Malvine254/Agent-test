@@ -1,0 +1,96 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "resourceBaseName": {
+      "value": "bot${{RESOURCE_SUFFIX}}"
+    },
+    "azureOpenaiKey": {
+      "value": "${{SECRET_AZURE_OPENAI_API_KEY}}"
+    },
+    "azureOpenaiModelDeploymentName" : {
+      "value": "${{AZURE_OPENAI_MODEL_DEPLOYMENT_NAME}}"
+    },
+    "azureOpenaiEndpoint" : {
+      "value": "${{AZURE_OPENAI_ENDPOINT}}"
+    },
+    "azureSearchEndpoint": {
+      "value": "${{AZURE_SEARCH_ENDPOINT}}"
+    },
+    "azureSearchKey": {
+      "value": "${{AZURE_SEARCH_KEY}}"
+    },
+    "azureSearchIndex": {
+      "value": "${{AZURE_SEARCH_INDEX}}"
+    },
+    "azureSearchSemanticConfig": {
+      "value": "${{AZURE_SEARCH_SEMANTIC_CONFIG}}"
+    },
+    "graphClientId": {
+      "value": "${{GRAPH_CLIENT_ID}}"
+    },
+    "graphClientSecret": {
+      "value": "${{GRAPH_CLIENT_SECRET}}"
+    },
+    "retryMaxRetries": {
+      "value": ${{RETRY_MAX_RETRIES}}
+    },
+    "retryBaseDelay": {
+      "value": "${{RETRY_BASE_DELAY}}"
+    },
+    "retryMaxDelay": {
+      "value": ${{RETRY_MAX_DELAY}}
+    },
+    "alwaysCallAiSearch": {
+      "value": ${{ALWAYS_CALL_AI_SEARCH}}
+    },
+    "llmConcurrency": {
+      "value": ${{LLM_CONCURRENCY}}
+    },
+    "minCachedScoreBeforeAi": {
+      "value": ${{MIN_CACHED_SCORE_BEFORE_AI}}
+    },
+    "maxDocContextChars": {
+      "value": ${{MAX_DOC_CONTEXT_CHARS}}
+    },
+    "maxTotalContextChars": {
+      "value": ${{MAX_TOTAL_CONTEXT_CHARS}}
+    },
+    "maxPromptTokensApprox": {
+      "value": ${{MAX_PROMPT_TOKENS_APPROX}}
+    },
+    "maxCompletionTokens": {
+      "value": ${{MAX_COMPLETION_TOKENS}}
+    },
+    "maxPromptChars": {
+      "value": ${{MAX_PROMPT_CHARS}}
+    },
+    "maxDocs": {
+      "value": ${{MAX_DOCS}}
+    },
+    "maxSnippetChars": {
+      "value": ${{MAX_SNIPPET_CHARS}}
+    },
+    "maxAttachChars": {
+      "value": ${{MAX_ATTACH_CHARS}}
+    },
+    "maxWebChars": {
+      "value": ${{MAX_WEB_CHARS}}
+    },
+    "maxMemoryTurns": {
+      "value": ${{MAX_MEMORY_TURNS}}
+    },
+    "streamChunkInterval": {
+      "value": "${{STREAM_CHUNK_INTERVAL}}"
+    },
+    "webAppSKU": {
+      "value": "B3"
+    },
+    "botDisplayName": {
+      "value": "SwopeAI"
+    },
+    "linuxFxVersion": {
+      "value": "PYTHON|3.12"
+    }
+  }
+}
