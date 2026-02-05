@@ -20,6 +20,7 @@ from microsoft_teams.api import (
     MessageActivity,
     MessageActivityInput,
     MessageSubmitActionInvokeActivity,
+    TypingActivityInput,
 
 
 )
@@ -41,6 +42,12 @@ from knowledge_base import (
 from document_cache import get_cache
 # Web indexer for background website crawling
 from web_indexer import get_web_indexer
+# Attachment cache for persisting file contents across follow-up questions
+from attachment_cache import (
+    cache_attachment,
+    get_conversation_attachments,
+    cleanup_old_cache,
+)
 
 # ---------------------------
 # Logging (only key application events)
@@ -887,6 +894,14 @@ def create_token_factory():
 
 app = App(token=create_token_factory())
 
+# Cleanup old attachment cache entries on startup
+try:
+    cleaned = cleanup_old_cache()
+    if cleaned > 0:
+        logger.info(f"Cleaned up {cleaned} old attachment cache entries on startup")
+except Exception as e:
+    logger.warning(f"Failed to cleanup attachment cache on startup: {e}")
+
 
 # ---------------------------
 # Azure OpenAI model
@@ -1275,6 +1290,18 @@ async def llm_decide_routing(model: AIModel, user_text: str, conversation_id: st
         }
 
 # ---------------------------
+# Typing indicator helper
+# ---------------------------
+async def send_typing_indicator(ctx: ActivityContext[MessageActivity]) -> None:
+    """Send a typing indicator to show the bot is processing the request."""
+    try:
+        typing_activity = TypingActivityInput()
+        await ctx.send(typing_activity)
+        logger.info("Typing indicator sent")
+    except Exception as e:
+        logger.warning(f"Failed to send typing indicator: {e}")
+
+# ---------------------------
 # Main handler
 # ---------------------------
 async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[MessageActivity]) -> None:
@@ -1286,6 +1313,9 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
     logger.info(
         f"User: '{user_text[:60]}...' | Attachments: {len(attachments)} (raw: {len(attachments_raw)})"
     )
+
+    # Send typing indicator to show the bot is processing
+    await send_typing_indicator(ctx)
 
     # --- FIX: ensure all variables are defined before use and routing is done at the start ---
     # LLM router: decide routing and extract action, route, etc.
@@ -1546,15 +1576,22 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                     parts.append(file_content)
                     continue
 
-                # Success path: include content in memory for this conversation only
-                # Attachments are NOT cached - they're processed in-memory for context
+                # Success path: cache content to disk for follow-up questions
+                # This persists attachment content so memory limits aren't hit on follow-ups
                 parts.append(file_content)
                 extracted_for_aggregation.append((att_name, file_content))
                 file_storage.append({
                     "name": att_name,
                     "content": file_content
                 })
-                logger.info(f"Attachment '{att_name}' processed in memory (not cached) - {len(file_content)} chars")
+                
+                # Cache attachment to disk for follow-up questions
+                try:
+                    cache_attachment(conversation_id, att_name, file_content)
+                    logger.info(f"Attachment '{att_name}' processed and cached - {len(file_content)} chars")
+                except Exception as cache_err:
+                    logger.warning(f"Failed to cache attachment '{att_name}': {cache_err}")
+                    logger.info(f"Attachment '{att_name}' processed (cache failed) - {len(file_content)} chars")
             else:
                 # No content returned; let the LLM know we saw an attachment but could not read it
                 parts.append(f"❌ Unable to read attachment '{att_name}'. The payload did not include a usable file URL.")
@@ -1575,19 +1612,44 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
             attachment_texts_for_llm = parts
     
     # FOLLOW-UP SUPPORT: Include previously uploaded files from this conversation
+    # First check disk cache, then fall back to in-memory storage
     # This enables questions like "top paid players" after uploading a FIFA dataset
-    if not attachments and file_storage:
-        logger.info(f"Including {len(file_storage)} previously uploaded file(s) from conversation context")
-        parts = []
-        for stored_file in file_storage:
-            fname = stored_file.get("name", "unknown")
-            fcontent = stored_file.get("content", "")
-            if fcontent:
-                parts.append(f"[Previously uploaded: {fname}]\n{fcontent}")
-        if parts:
-            attachment_context = "\n\n" + "\n---\n".join(parts)
-            attachment_texts_for_llm = parts
-            logger.info(f"Loaded {len(parts)} stored file(s) with {sum(len(p) for p in parts)} total chars")
+    if not attachments:
+        # Try to load from persistent disk cache first (survives restarts, avoids memory limits)
+        cached_attachments = []
+        try:
+            cached_attachments = get_conversation_attachments(conversation_id)
+        except Exception as cache_err:
+            logger.warning(f"Failed to load cached attachments: {cache_err}")
+        
+        if cached_attachments:
+            logger.info(f"Loading {len(cached_attachments)} attachment(s) from disk cache for follow-up")
+            parts = []
+            for cached_file in cached_attachments:
+                fname = cached_file.get("name", "unknown")
+                fcontent = cached_file.get("content", "")
+                if fcontent:
+                    parts.append(f"[Previously uploaded: {fname}]\n{fcontent}")
+                    # Also populate in-memory storage for this session
+                    if not any(f.get("name") == fname for f in file_storage):
+                        file_storage.append({"name": fname, "content": fcontent})
+            if parts:
+                attachment_context = "\n\n" + "\n---\n".join(parts)
+                attachment_texts_for_llm = parts
+                logger.info(f"Loaded {len(parts)} cached file(s) with {sum(len(p) for p in parts)} total chars")
+        elif file_storage:
+            # Fall back to in-memory storage if no disk cache
+            logger.info(f"Including {len(file_storage)} previously uploaded file(s) from memory")
+            parts = []
+            for stored_file in file_storage:
+                fname = stored_file.get("name", "unknown")
+                fcontent = stored_file.get("content", "")
+                if fcontent:
+                    parts.append(f"[Previously uploaded: {fname}]\n{fcontent}")
+            if parts:
+                attachment_context = "\n\n" + "\n---\n".join(parts)
+                attachment_texts_for_llm = parts
+                logger.info(f"Loaded {len(parts)} stored file(s) with {sum(len(p) for p in parts)} total chars")
 
     # If user provided no instruction but sent attachments, default to summarization
     try:
@@ -1678,6 +1740,9 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
     if action == "search_documents":
         set_last_query(conversation_id, q)
         if q:
+            # Send typing indicator for search operations
+            await send_typing_indicator(ctx)
+            
             # Increase aggregation breadth when ALWAYS_CALL_AI_SEARCH is enabled
             default_top_k = 5 if getattr(Config, "ALWAYS_CALL_AI_SEARCH", False) else 3
             top_k = int(route.get("top_k", default_top_k))
@@ -2104,6 +2169,30 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                     + "No matching content was found for this query. Try rephrasing your question, including more specific terms, or check access permissions.</p>"
                     + "</div>"
                 )
+            
+            # ALWAYS append a summary of sources searched (for mandatory references section)
+            sources_searched_summary = []
+            if cached_results:
+                sources_searched_summary.append(f"Document Cache: {len(cached_results)} result(s)")
+            else:
+                sources_searched_summary.append("Document Cache: 0 results")
+            if web_results:
+                sources_searched_summary.append(f"Web Cache: {len(web_results)} result(s)")
+            else:
+                sources_searched_summary.append("Web Cache: 0 results")
+            if ai_search_results:
+                sources_searched_summary.append(f"AI Search (Azure): {len(ai_search_results)} result(s)")
+            else:
+                sources_searched_summary.append("AI Search (Azure): 0 results")
+            if call_ai_search:
+                sources_searched_summary.append("Graph API: searched")
+            
+            search_context += (
+                "\n\n<!-- sources-searched-summary -->\n"
+                "[SOURCES SEARCHED - Include these in your References section]\n"
+                + "\n".join(f"- {s}" for s in sources_searched_summary)
+                + "\n[IMPORTANT: You MUST include a 'References:' section at the end of your response listing all sources with URLs]"
+            )
 
     # Add personalization context and build full input
     # Build personalization without placeholder name
@@ -2141,6 +2230,9 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
         except Exception:
             web_plain_text = ""
 
+    # Send typing indicator before LLM processing
+    await send_typing_indicator(ctx)
+    
     llm_input, llm_log = build_llm_input(
         user_text=user_text or "",
         attachment_texts=attachment_texts,
@@ -2247,6 +2339,9 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
     
     # Use Teams SDK built-in streaming with retry logic and throttling
     try:
+        # Send final typing indicator before generating response
+        await send_typing_indicator(ctx)
+        
         async def make_chat_call():
             async with llm_semaphore:
                 return await chat_prompt.send(

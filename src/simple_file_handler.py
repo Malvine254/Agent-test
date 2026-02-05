@@ -1,7 +1,7 @@
 """
 Simple File Handler - Teams Attachment Processing
 Handles both direct uploads and SharePoint/OneDrive files via Graph API.
-Attachments are processed in memory only - NOT cached to disk.
+Extracted content is returned to the caller for processing and caching.
 """
 
 import io
@@ -121,15 +121,15 @@ def _is_sharepoint_url(url: str) -> bool:
 
 def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optional[str] = None) -> str:
     """
-    Process file attachment from Teams in memory only (NOT cached).
+    Process file attachment from Teams and extract text content.
     - Per Teams docs: downloadUrl in content is pre-authenticated by Teams
     - SharePoint/OneDrive contentUrl requires bot's Bearer token (app registration)
-    - Attachments are kept in memory for current conversation only
+    - Returns extracted text for caller to cache and use in context
     
     Args:
         attachment: Teams attachment object
         corr_id: Correlation ID for logging
-        user_id: User ID (not used for caching attachments)
+        user_id: User ID for logging purposes
     
     Returns:
         Extracted text or file info
@@ -345,12 +345,12 @@ def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optio
         if not content:
             return f"📎 {display_name} (empty file)"
         
-        # Extract content (in memory only - NOT cached to disk)
+        # Extract content from file bytes
         extracted_text = _extract_content(display_name, content)
         
-        # Log that attachment was processed in memory only
+        # Log successful extraction
         if extracted_text:
-            logger.info(f"{prefix}Attachment {display_name} processed in memory only (not cached) - {len(extracted_text)} chars")
+            logger.info(f"{prefix}Attachment {display_name} extracted - {len(extracted_text)} chars")
         
         return extracted_text
     
