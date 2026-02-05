@@ -20,8 +20,9 @@ ATTACHMENT_CACHE_PATH = os.path.join(os.path.dirname(__file__), "attachment_cach
 _attachment_cache: dict = {}
 
 # Cache settings
-MAX_CACHE_SIZE_MB = 50  # Maximum total cache size in MB
-MAX_CONTENT_SIZE_MB = 10  # Maximum size per attachment in MB
+MAX_CACHE_SIZE_MB = 200  # Maximum total cache size in MB (increased for full content preservation)
+MAX_CONTENT_SIZE_MB = 50  # Maximum size per attachment in MB (increased to handle large files)
+MAX_CONTENT_SIZE_CHARS = 10000000  # Maximum characters per attachment (~10M chars = ~2.5M tokens) - effectively unlimited for most files
 CACHE_EXPIRY_DAYS = 7  # How long to keep cached attachments
 
 
@@ -114,6 +115,7 @@ def _save_cache() -> bool:
 def cache_attachment(conversation_id: str, filename: str, content: str) -> bool:
     """
     Cache an attachment's full content for later retrieval.
+    Implements size limits to prevent memory issues.
     
     Args:
         conversation_id: The conversation this attachment belongs to
@@ -126,7 +128,18 @@ def cache_attachment(conversation_id: str, filename: str, content: str) -> bool:
     if not conversation_id or not filename or not content:
         return False
     
-    # Check content size limit
+    # Check character limit first (faster than byte size)
+    if len(content) > MAX_CONTENT_SIZE_CHARS:
+        logger.warning(f"Attachment '{filename}' content too long ({len(content):,} chars > {MAX_CONTENT_SIZE_CHARS:,})")
+        logger.warning(f"Attachment exceeds maximum - this file is extremely large and may cause issues")
+        # For extremely large files (> 10M chars), we still need a hard limit
+        truncated_content = content[:MAX_CONTENT_SIZE_CHARS]
+        truncated_content += f"\n\n⚠️ [CACHED CONTENT TRUNCATED - Original: {len(content):,} chars, Cached: {MAX_CONTENT_SIZE_CHARS:,} chars]\n"
+        truncated_content += "[Note: This file is exceptionally large. Consider splitting it into smaller files for better results.]"
+        content = truncated_content
+        logger.info(f"Truncated extremely large file {filename}: {len(content):,} chars")
+    
+    # Check byte size limit for storage
     content_size_mb = len(content.encode('utf-8', errors='ignore')) / (1024 * 1024)
     if content_size_mb > MAX_CONTENT_SIZE_MB:
         logger.warning(f"Attachment '{filename}' too large to cache ({content_size_mb:.1f}MB > {MAX_CONTENT_SIZE_MB}MB)")
@@ -160,7 +173,8 @@ def cache_attachment(conversation_id: str, filename: str, content: str) -> bool:
         # Save to disk
         _attachment_cache = cache
         if _save_cache():
-            logger.info(f"Cached attachment '{filename}' for conversation {conversation_id[:8]}... ({len(content)} chars)")
+            size_mb = len(content.encode('utf-8', errors='ignore')) / (1024 * 1024)
+            logger.info(f"Cached attachment '{filename}' for conversation {conversation_id[:8]}... ({len(content):,} chars, {size_mb:.2f} MB) - FULL content preserved")
             return True
         
         return False
@@ -198,15 +212,100 @@ def get_cached_attachment(conversation_id: str, filename: str) -> Optional[str]:
         return None
 
 
-def get_conversation_attachments(conversation_id: str) -> list[dict]:
+def search_attachment_contents(conversation_id: str, query: str, limit: int = 5) -> list[dict]:
+    """
+    Search within cached attachment contents for a conversation.
+    
+    Args:
+        conversation_id: The conversation ID
+        query: The search query
+        limit: Maximum number of results to return
+        
+    Returns:
+        List of dicts with 'filename', 'content_snippet', 'relevance_score' keys
+    """
+    try:
+        if not query or not conversation_id:
+            return []
+            
+        cache = _load_cache()
+        query_lower = query.lower()
+        results = []
+        
+        # Search through all attachments for this conversation
+        for att_id, att_data in cache.get("attachments", {}).items():
+            if att_data.get("conversation_id") == conversation_id:
+                content = att_data.get("content", "")
+                filename = att_data.get("filename", "unknown")
+                
+                if not content:
+                    continue
+                    
+                content_lower = content.lower()
+                
+                # Simple relevance scoring based on query term matches
+                query_terms = query_lower.split()
+                match_count = 0
+                content_matches = []
+                
+                for term in query_terms:
+                    if term in content_lower:
+                        match_count += content_lower.count(term)
+                        # Find ALL occurrences and extract context around each match
+                        # This ensures we capture matches throughout the document, not just the first
+                        idx = 0
+                        while idx < len(content_lower) and len(content_matches) < 10:  # Limit to 10 snippets per file
+                            idx = content_lower.find(term, idx)
+                            if idx == -1:
+                                break
+                            # Extract snippet around the match (400 chars before/after for better context)
+                            snippet_start = max(0, idx - 400)
+                            snippet_end = min(len(content), idx + len(term) + 400)
+                            snippet = content[snippet_start:snippet_end].strip()
+                            if snippet and snippet not in content_matches:
+                                content_matches.append(snippet)
+                            idx += len(term)
+                
+                if match_count > 0:
+                    # Calculate relevance score
+                    content_length = len(content)
+                    relevance_score = (match_count * 100) / max(1, content_length / 1000)  # Normalized score
+                    
+                    results.append({
+                        "filename": filename,
+                        "content_snippet": " ... ".join(content_matches[:3]),  # Best 3 snippets
+                        "relevance_score": round(relevance_score, 2),
+                        "match_count": match_count,
+                        "cached_at": att_data.get("cached_at"),
+                        "full_content": content  # Include full content for further processing
+                    })
+        
+        # Sort by relevance score (highest first)
+        results.sort(key=lambda x: x["relevance_score"], reverse=True)
+        
+        # Limit results
+        limited_results = results[:limit]
+        
+        if limited_results:
+            logger.info(f"Found {len(limited_results)} cached attachment(s) matching '{query}' in conversation {conversation_id[:8]}...")
+        
+        return limited_results
+        
+    except Exception as e:
+        logger.error(f"Failed to search attachment contents: {e}")
+        return []
+
+
+def get_conversation_attachments(conversation_id: str, include_content: bool = True) -> list[dict]:
     """
     Get all cached attachments for a conversation.
     
     Args:
         conversation_id: The conversation ID
+        include_content: If False, returns only metadata (faster for checks)
         
     Returns:
-        List of dicts with 'filename' and 'content' keys
+        List of dicts with 'filename' and optionally 'content' keys
     """
     try:
         cache = _load_cache()
@@ -215,12 +314,15 @@ def get_conversation_attachments(conversation_id: str) -> list[dict]:
         # Find all attachments for this conversation
         for att_id, att_data in cache.get("attachments", {}).items():
             if att_data.get("conversation_id") == conversation_id:
-                attachments.append({
-                    "name": att_data.get("filename"),
-                    "content": att_data.get("content"),
+                result = {
+                    "filename": att_data.get("filename"),
+                    "name": att_data.get("filename"),  # Alias for compatibility
                     "cached_at": att_data.get("cached_at"),
                     "content_length": att_data.get("content_length", 0)
-                })
+                }
+                if include_content:
+                    result["content"] = att_data.get("content")
+                attachments.append(result)
         
         if attachments:
             logger.info(f"Retrieved {len(attachments)} cached attachment(s) for conversation {conversation_id[:8]}...")

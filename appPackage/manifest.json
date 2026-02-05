@@ -15,7 +15,7 @@
     },
     "name": {
         "short": "SwopeAI${{APP_NAME_SUFFIX}}",
-        "full": "SwopeAI"
+        "full": "SwopeAI - Local Version"
     },
     "description": {
         "short": "SwopeAI - Intelligent agent powered by AI",

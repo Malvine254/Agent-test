@@ -291,6 +291,49 @@ def unified_search(query: str, top: int = 5, user_context: bool = True, user_id:
                     return all_results
                 else:
                     logger.info(f"⚠️ Live Graph search returned no results for '{query}'")
+                    
+                    # IMPORTANT: Clear low-relevance cache results when Graph search fails
+                    # This ensures AI Search can be attempted instead of returning irrelevant cached docs
+                    if cache_has_results and all_results:
+                        # Calculate relevance score for cache clearing decision
+                        try:
+                            relevance_threshold = 15  # Minimum score to keep when Graph fails
+                            should_clear_cache = False
+                            top_score = "unknown"
+                            
+                            # Check if we have the original cache results to examine their scores
+                            if 'cache_results' in locals() and cache_results and len(cache_results) > 0:
+                                first_item = cache_results[0] 
+                                if isinstance(first_item, dict):
+                                    top_score = first_item.get("score", 0)
+                                else:
+                                    top_score = first_item[1] if len(first_item) > 1 else 0
+                            else:
+                                # Fallback: Check the score in the all_results directly
+                                for result in all_results:
+                                    if isinstance(result, dict) and 'score' in result:
+                                        top_score = result['score']
+                                        break
+                                if top_score == "unknown":
+                                    top_score = 0  # Default to low score
+                            
+                            # Decision: clear cache if score is too low when Graph fails
+                            if isinstance(top_score, (int, float)) and top_score < relevance_threshold:
+                                should_clear_cache = True
+                            elif top_score == "unknown":
+                                should_clear_cache = True  # Clear if we can't determine relevance
+                            
+                            if should_clear_cache:
+                                logger.info(f"🗑️ Clearing low-relevance cache results (score={top_score} < {relevance_threshold}) since Graph found nothing relevant")  
+                                all_results = []  # Clear cache results to allow AI Search
+                                seen_ids = set()  # Reset seen IDs  
+                                cache_has_results = False  # Update flag
+                            else:
+                                logger.info(f"✓ Keeping cache results (score={top_score} >= {relevance_threshold}) even though Graph found nothing")
+                                
+                        except Exception as clear_err:
+                            logger.warning(f"Error in cache clearing logic: {clear_err}, proceeding with cache results")
+                            # Leave cache results as-is if we can't determine their quality
             except Exception as e:
                 logger.error(f"❌ Live Graph search error: {e}")
         else:

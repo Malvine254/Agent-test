@@ -46,6 +46,7 @@ from web_indexer import get_web_indexer
 from attachment_cache import (
     cache_attachment,
     get_conversation_attachments,
+    search_attachment_contents,
     cleanup_old_cache,
 )
 
@@ -135,7 +136,11 @@ def is_document_file(filename: str) -> bool:
 
 def is_file_attachment(att) -> bool:
     """Return True only for real file attachments (exclude cards/mentions/etc.)."""
+    # Log BEFORE try block to ensure visibility
+    logger.info(f"[ATTACHMENT CHECK] Checking attachment: type={type(att).__name__}, att_obj={att}")
+    
     try:
+        # Extract all possible attribute names
         content_type = (
             getattr(att, "content_type", None)
             or getattr(att, "contentType", None)
@@ -145,18 +150,46 @@ def is_file_attachment(att) -> bool:
         name = getattr(att, "name", "") or ""
         
         # DEBUG: Log attachment details for troubleshooting
-        logger.info(f"[ATTACHMENT DEBUG] content_type='{content_type}', name='{name}', att_type={type(att).__name__}")
+        logger.info(f"[ATTACHMENT DEBUG] content_type='{content_type}', name='{name}'")
+        
+        # Log all attributes for comprehensive debugging
         if hasattr(att, "__dict__"):
-            logger.info(f"[ATTACHMENT DEBUG] att.__dict__={att.__dict__}")
+            logger.info(f"[ATTACHMENT DEBUG] Full attributes: {att.__dict__}")
+        else:
+            # Try to extract any available attributes
+            all_attrs = [attr for attr in dir(att) if not attr.startswith('_')]
+            attr_values = {attr: getattr(att, attr, None) for attr in all_attrs[:20]}  # Limit to first 20
+            logger.info(f"[ATTACHMENT DEBUG] Available attributes: {attr_values}")
+        
+        # Check for potential mobile timing issues
+        content = getattr(att, "content", None)
+        has_content_structure = isinstance(content, dict) or (isinstance(content, str) and content.strip().startswith("{"))
+        content_url = getattr(att, "contentUrl", None) or getattr(att, "content_url", None)
+        
+        # Log potential mobile timing issue
+        if content_type == "application/vnd.microsoft.teams.file.download.info" and name:
+            if not has_content_structure and not content_url:
+                logger.warning(f"[MOBILE ISSUE?] Teams file attachment '{name}' has content_type but missing content/URLs - possible mobile timing issue")
+            elif isinstance(content, dict) and not content.get("downloadUrl") and not content_url:
+                logger.warning(f"[MOBILE ISSUE?] Teams file attachment '{name}' has content dict but no downloadUrl - possible mobile upload still processing")
         
         # Teams file attachment content type
         if content_type == "application/vnd.microsoft.teams.file.download.info":
+            logger.info(f"[ATTACHMENT ACCEPTED] Teams file: '{name}'")
             return True
         # Fallback: treat as file if it has a document-like filename
         if name and is_document_file(name):
+            logger.info(f"[ATTACHMENT ACCEPTED] Document file: '{name}'")
             return True
+            
+        # Special handling for text/html - could be rich message embeds or malformed file attachment
+        if content_type == "text/html":
+            logger.warning(f"[ATTACHMENT REJECTED] text/html attachment (possibly rich message embed, link preview, or mobile file with missing metadata): name='{name}'")
+        else:
+            logger.warning(f"[ATTACHMENT REJECTED] Not recognized as file: content_type='{content_type}', name='{name}'")
     except Exception as e:
-        logger.error(f"[ATTACHMENT DEBUG] Exception: {e}")
+        logger.error(f"[ATTACHMENT DEBUG] Exception in is_file_attachment: {e}", exc_info=True)
+    
     return False
 
 
@@ -646,6 +679,35 @@ def _trim_to_token_budget(text: str, max_tokens: int) -> str:
     except Exception:
         return text
 
+def _convert_to_network_path(path: str) -> str:
+    """
+    Convert local drive paths to network UNC paths or format as plain reference.
+    Removes clickable links and shows full path for reference.
+    
+    Examples:
+        C:\\Users\\Documents\\file.pdf -> File Path: C:\\Users\\Documents\\file.pdf
+        D:\\Shared\\Data\\report.xlsx -> File Path: D:\\Shared\\Data\\report.xlsx
+        https://... -> SharePoint/OneDrive: https://...
+    """
+    if not path or not path.strip():
+        return ""
+    
+    path = path.strip()
+    
+    # Keep SharePoint/OneDrive URLs as-is but mark them
+    if path.startswith(("http://", "https://")):
+        # For web URLs, show as reference (not clickable)
+        return f"SharePoint/OneDrive: {path}"
+    
+    # Local file paths - show as plain text reference
+    # Check if it looks like a local path (has drive letter or starts with backslash)
+    if (len(path) >= 2 and path[1] == ':') or path.startswith('\\\\'):
+        # This is a local or network path - show exactly as-is
+        return f"File Path: {path}"
+    
+    # Unknown format - show as-is
+    return f"Location: {path}"
+
 def _strip_html(text: str) -> str:
     """Convert simple HTML to plain text by removing tags."""
     try:
@@ -677,13 +739,13 @@ def build_llm_input(
     doc_items: [{"title": str, "url": str, "snippet": str}]
     Returns (prompt_text, log_info)
     """
-    # Config budgets - GPT-4.1 supports 128K tokens (~500KB)
-    # Use high defaults for maximum content extraction
-    MAX_PROMPT_TOKENS = int(getattr(Config, "MAX_PROMPT_TOKENS_APPROX", 120000))
-    MAX_PROMPT_CHARS = int(getattr(Config, "MAX_PROMPT_CHARS", 480000))
+    # Config budgets - REDUCED to prevent crashes with large attachments
+    # GPT-4.1 supports 128K tokens but we limit for memory safety
+    MAX_PROMPT_TOKENS = int(getattr(Config, "MAX_PROMPT_TOKENS_APPROX", 40000))  # ~40K tokens = safe
+    MAX_PROMPT_CHARS = int(getattr(Config, "MAX_PROMPT_CHARS", 160000))  # ~160KB total
     MAX_DOCS = int(getattr(Config, "MAX_DOCS", 20))
     MAX_SNIPPET_CHARS = int(getattr(Config, "MAX_SNIPPET_CHARS", 100000))
-    MAX_ATTACH_CHARS = int(getattr(Config, "MAX_ATTACH_CHARS", 450000))
+    MAX_ATTACH_CHARS = int(getattr(Config, "MAX_ATTACH_CHARS", 120000))  # ~120KB for all attachments
     MAX_WEB_CHARS = int(getattr(Config, "MAX_WEB_CHARS", 20000))
     MAX_MEMORY_TURNS = int(getattr(Config, "MAX_MEMORY_TURNS", 20))
 
@@ -711,11 +773,13 @@ def build_llm_input(
     for d in (doc_items or []):
         title = (d.get("title") or d.get("name") or "Untitled").strip()
         url = (d.get("url") or "").strip()
+        # Convert local paths to network paths and format as non-clickable reference
+        url_reference = _convert_to_network_path(url) if url else ""
         # FULL content - no truncation
         snippet = _strip_html((d.get("snippet") or d.get("content") or ""))
         if not snippet:
             continue
-        docs.append({"title": title, "url": url, "snippet": snippet})
+        docs.append({"title": title, "url": url_reference, "snippet": snippet})
     # Respect MAX_DOCS hard limit initially
     docs = docs[:MAX_DOCS]
 
@@ -754,16 +818,13 @@ def build_llm_input(
     # Log budget values for debugging
     logger.info(f"Budget check: MAX_PROMPT_TOKENS={MAX_PROMPT_TOKENS}, MAX_PROMPT_CHARS={MAX_PROMPT_CHARS}, MAX_ATTACH_CHARS={MAX_ATTACH_CHARS}")
     
-    # Truncation guard - only for extremely large content (>400KB)
-    # GPT-4.1 handles 128K tokens (~500KB) so we allow most content through
+    # Truncation guard - use configured limits to prevent crashes
     actions = []
     def within_budget(text: str) -> bool:
-        # Allow up to 450KB of content - GPT-4.1 can handle it
-        return len(text) <= 450000
+        return len(text) <= MAX_PROMPT_CHARS
     
-    # Skip aggressive truncation for normal-sized content (<100KB)
-    # Only truncate if content is extremely large
-    if len(prompt) > 450000:
+    # Truncate if content exceeds configured limit
+    if len(prompt) > MAX_PROMPT_CHARS:
         # 1) Drop web first
         if web_plain:
             actions.append("drop:web")
@@ -772,7 +833,7 @@ def build_llm_input(
                                        ("\n\n".join([f"[DOC {i+1}] {d['title']}\n{d['url']}\n{d['snippet']}" for i, d in enumerate(docs)]) if docs else ""),
                                        (f"[MEMORY (last {MAX_MEMORY_TURNS})]\n{_strip_html(memory_text)}" if memory_text else "")]).strip()
     
-    if len(prompt) > 450000:
+    if len(prompt) > MAX_PROMPT_CHARS:
         # 2) Reduce docs count
         if len(docs) > 1:
             new_docs = docs[:max(1, len(docs)-1)]
@@ -782,23 +843,30 @@ def build_llm_input(
                                        ("\n\n".join([f"[DOC {i+1}] {d['title']}\n{d['url']}\n{d['snippet']}" for i, d in enumerate(docs)]) if docs else ""),
                                        (f"[MEMORY (last {MAX_MEMORY_TURNS})]\n{_strip_html(memory_text)}" if memory_text else "")]).strip()
     
-    if len(prompt) > 450000:
-        # 3) Shorten attachments to fit in ~450KB budget
-        if attach_plain and len(attach_plain) > 400000:
-            available = 400000  # Leave room for other content
+    if len(prompt) > MAX_PROMPT_CHARS:
+        # 3) Shorten attachments to fit budget
+        if attach_plain and len(attach_plain) > MAX_ATTACH_CHARS:
+            available = MAX_ATTACH_CHARS
             actions.append(f"shorten:attachments:{len(attach_plain)}->{available}")
             attach_plain = attach_plain[:available]
             prompt = "\n\n".join([utext, ptext, (f"[ATTACHMENTS]\n{attach_plain}" if attach_plain else ""),
                                        ("\n\n".join([f"[DOC {i+1}] {d['title']}\n{d['url']}\n{d['snippet']}" for i, d in enumerate(docs)]) if docs else ""),
                                        (f"[MEMORY (last {MAX_MEMORY_TURNS})]\n{_strip_html(memory_text)}" if memory_text else "")]).strip()
     
-    if len(prompt) > 450000:
+    if len(prompt) > MAX_PROMPT_CHARS:
         # 4) Drop memory if still over
         if memory_text:
             actions.append("drop:memory")
             memory_text = ""
             prompt = "\n\n".join([utext, ptext, (f"[ATTACHMENTS]\n{attach_plain}" if attach_plain else ""),
                                        ("\n\n".join([f"[DOC {i+1}] {d['title']}\n{d['url']}\n{d['snippet']}" for i, d in enumerate(docs)]) if docs else "")]).strip()
+    
+    # SAFETY: Final hard limit to prevent token limit crashes
+    if len(prompt) > MAX_PROMPT_CHARS:
+        logger.warning(f"EMERGENCY TRUNCATION: Prompt still too large ({len(prompt):,} chars) - applying hard limit")
+        actions.append(f"emergency_truncate:{len(prompt)}->{MAX_PROMPT_CHARS}")
+        prompt = prompt[:MAX_PROMPT_CHARS]
+        prompt += "\n\n⚠️ [CONTENT TRUNCATED - Input exceeded maximum size]"
 
     log_info = {
         "sizes": sizes,
@@ -1009,9 +1077,8 @@ def memory_for(conversation_id: str) -> ListMemory:
     return conversation_store[conversation_id]
 
 def files_for(conversation_id: str) -> list:
-    if conversation_id not in conversation_files:
-        conversation_files[conversation_id] = []
-    return conversation_files[conversation_id]
+    """Get cached attachment files for a conversation from persistent storage."""
+    return get_conversation_attachments(conversation_id)
 
 def last_query_for(conversation_id: str) -> str:
     return conversation_last_query.get(conversation_id, "")
@@ -1227,6 +1294,10 @@ async def llm_decide_routing(model: AIModel, user_text: str, conversation_id: st
         # ChatPrompt may return str or object; ensure str
         if hasattr(result_text, "text"):
             result_text = result_text.text
+        elif hasattr(result_text, "response") and hasattr(result_text.response, "content"):
+            result_text = result_text.response.content
+        elif not isinstance(result_text, str):
+            result_text = str(result_text)
 
         # Log the raw LLM response for debugging
         logger.info(f"Raw LLM router response: {result_text}")
@@ -1301,6 +1372,187 @@ async def send_typing_indicator(ctx: ActivityContext[MessageActivity]) -> None:
     except Exception as e:
         logger.warning(f"Failed to send typing indicator: {e}")
 
+async def send_typing_with_status(ctx: ActivityContext[MessageActivity], status: str) -> None:
+    """Send typing indicator with a brief status message for long operations."""
+    try:
+        # Send typing indicator first
+        typing_activity = TypingActivityInput()
+        await ctx.send(typing_activity)
+        
+        # Send brief status update
+        import asyncio
+        await asyncio.sleep(0.1)  # Brief delay to ensure typing shows first
+        
+        status_activity = MessageActivityInput(
+            text=f"🔄 {status}",
+            type="message"
+        )
+        await ctx.send(status_activity)
+        logger.info(f"Typing indicator with status sent: {status}")
+    except Exception as e:
+        logger.warning(f"Failed to send typing indicator with status: {e}")
+        # Fallback to regular typing indicator
+        await send_typing_indicator(ctx)
+
+class TypingIndicatorManager:
+    """Manages periodic typing indicators during long operations to prevent timeout."""
+    
+    def __init__(self, ctx: ActivityContext[MessageActivity]):
+        self.ctx = ctx
+        self.refresh_task = None
+        self.should_refresh = False
+    
+    async def start_periodic_refresh(self, interval: float = 5.0):
+        """Start sending typing indicators every `interval` seconds (default 5s to prevent Teams timeout)."""
+        self.should_refresh = True
+        self.refresh_task = asyncio.create_task(self._refresh_loop(interval))
+        logger.info(f"Started periodic typing indicator refresh (every {interval}s)")
+    
+    async def stop_refresh(self):
+        """Stop the periodic refresh."""
+        self.should_refresh = False
+        if self.refresh_task and not self.refresh_task.done():
+            self.refresh_task.cancel()
+            try:
+                await self.refresh_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Stopped periodic typing indicator refresh")
+    
+    async def _refresh_loop(self, interval: float):
+        """Internal loop that sends typing indicators periodically."""
+        try:
+            while self.should_refresh:
+                await asyncio.sleep(interval)
+                if self.should_refresh:  # Check again after sleep
+                    await send_typing_indicator(self.ctx)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"Error in typing indicator refresh loop: {e}")
+    
+    async def __aenter__(self):
+        """Context manager entry."""
+        await self.start_periodic_refresh()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        await self.stop_refresh()
+
+async def send_typing_with_message(ctx: ActivityContext[MessageActivity], message: str) -> None:
+    """Send typing indicator with a status message for long operations."""
+    try:
+        # Send typing indicator
+        typing_activity = TypingActivityInput()
+        await ctx.send(typing_activity)
+        
+        # Send status message
+        status_activity = MessageActivityInput(
+            text=f"🔄 {message}",
+            type="message"
+        )
+        await ctx.send(status_activity)
+        logger.info(f"Typing indicator with message sent: {message}")
+    except Exception as e:
+        logger.warning(f"Failed to send typing indicator with message: {e}")
+
+async def process_attachments_with_typing(ctx: ActivityContext[MessageActivity], attachments: list, conversation_id: str, cache_user_id: str) -> tuple:
+    """Process attachments with periodic typing indicators to prevent timeout."""
+    MAX_ATTACHMENTS = 5
+    parts = []
+    extracted_for_aggregation = []  # For multi-file comparison
+    
+    if len(attachments) > MAX_ATTACHMENTS:
+        logger.info(f"Attachment limit exceeded ({len(attachments)}). Processing first {MAX_ATTACHMENTS} only.")
+        await send_typing_indicator(ctx)
+    
+    total_attachments = min(len(attachments), MAX_ATTACHMENTS)
+    
+    for i, att in enumerate(attachments[:MAX_ATTACHMENTS], 1):
+        att_name = getattr(att, "name", "unknown")
+        
+        # Send typing indicator before each attachment to keep connection alive
+        if total_attachments > 1:
+            await send_typing_with_message(ctx, f"Processing attachment {i}/{total_attachments}: {att_name}")
+        else:
+            await send_typing_indicator(ctx)
+        
+        # Validate file before processing
+        is_valid, validation_error = validate_file_attachment(att)
+        if not is_valid:
+            parts.append(validation_error)
+            logger.warning(f"File validation failed for '{att_name}': {validation_error}")
+            continue
+        
+        # Process the attachment with periodic typing indicators for large files
+        logger.info(f"Processing attachment {i}/{total_attachments}: {att_name}")
+        
+        # ALWAYS use async to prevent blocking - wrap in typing manager for all files
+        try:
+            async with TypingIndicatorManager(ctx):
+                file_content = await asyncio.to_thread(process_attachment, att, conversation_id, user_id=cache_user_id)
+        except MemoryError:
+            logger.error(f"Memory error processing '{att_name}' - file too large")
+            error_msg = f"""❌ **Memory Error**: {att_name}
+
+⚠️ File is too large to process in available memory.
+
+**Solutions:**
+• Upload a smaller file (< 50 MB recommended)
+• Split large files into sections
+• Use compressed formats
+• Share specific pages/sections instead"""
+            parts.append(error_msg)
+            continue
+        except Exception as proc_err:
+            logger.error(f"Error processing '{att_name}': {proc_err}", exc_info=True)
+            parts.append(f"❌ Error processing {att_name}: {str(proc_err)[:200]}")
+            continue
+        
+        # Send another typing indicator after processing (before caching)
+        if i < total_attachments:
+            await send_typing_indicator(ctx)
+
+        if file_content:
+            if file_content.startswith("❌"):
+                # Surface the failure to the LLM so it doesn't say "no attachment".
+                parts.append(file_content)
+                continue
+
+            # Success path: cache content to disk for follow-up questions
+            # IMPORTANT: Full content is cached without truncation (up to 10M chars / ~50MB)
+            # This ensures follow-up questions can access ALL data, including "lower values" in large files
+            
+            # Include FULL content for LLM - user wants complete extraction
+            parts.append(file_content)
+            
+            # Keep full content for aggregation processing
+            extracted_for_aggregation.append((att_name, file_content))
+            
+            # Cache attachment to disk for follow-up questions with FULL content preserved
+            try:
+                cache_attachment(conversation_id, att_name, file_content)
+                logger.info(f"Attachment '{att_name}' processed and cached - {len(file_content):,} chars (FULL content preserved)")
+            except Exception as cache_err:
+                logger.warning(f"Failed to cache attachment '{att_name}': {cache_err}")
+                logger.info(f"Attachment '{att_name}' processed (cache failed) - {len(file_content):,} chars")
+        else:
+            # No content returned; provide mobile-friendly guidance
+            mobile_guidance = f"""❌ Unable to read attachment '{att_name}'.
+
+**If using Teams mobile app:**
+• **Wait 30-60 seconds** after selecting files before sending
+• Use the **paperclip button** (not drag-and-drop)
+• Try **desktop/web Teams** for more reliable file uploads
+• Ensure **strong network connection**
+
+• Make sure file has proper extension (.pdf, .docx, etc.)"""
+            
+            parts.append(mobile_guidance)
+    
+    return parts, extracted_for_aggregation
+
 # ---------------------------
 # Main handler
 # ---------------------------
@@ -1308,19 +1560,101 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
     conversation_id = ctx.activity.conversation.id
     user_text = (ctx.activity.text or "").strip()
     attachments_raw = ctx.activity.attachments or []
+    
+    # Log raw attachments BEFORE filtering
+    logger.info(f"Raw attachments received: {len(attachments_raw)}")
+    for idx, raw_att in enumerate(attachments_raw, 1):
+        logger.info(f"  Raw attachment {idx}: type={type(raw_att).__name__}")
+    
     attachments = [a for a in attachments_raw if is_file_attachment(a)]
 
     logger.info(
         f"User: '{user_text[:60]}...' | Attachments: {len(attachments)} (raw: {len(attachments_raw)})"
     )
 
-    # Send typing indicator to show the bot is processing
+    # EARLY DETECTION: Handle empty messages (no text, no valid attachments)
+    if not user_text and not attachments:
+        # Check if attachments were sent but rejected
+        if attachments_raw:
+            logger.info(f"Attachments detected ({len(attachments_raw)}) but none were valid - sending guidance")
+            await ctx.send(
+                MessageActivityInput(
+                    text="🤔 I detected an attachment, but couldn't recognize it as a file.\n\n"
+                         "**This usually happens because:**\n"
+                         "• Teams sent a link preview or rich message embed (not a file)\n"
+                         "• Mobile file upload hasn't finished yet\n"
+                         "• File metadata is missing\n\n"
+                         "**To fix this:**\n"
+                         "1️⃣ **Wait 10-30 seconds** after selecting your file, then send\n"
+                         "2️⃣ **Use the paperclip button** (📎) to attach files\n"
+                         "3️⃣ **Try desktop or web Teams** for best results\n"
+                         "4️⃣ **Make sure it's a supported file**: PDF, Word, Excel, PowerPoint, CSV, TXT\n\n"
+                         "💡 *Tip: You can also just ask me a question or search your documents without attachments!*"
+                ).add_ai_generated()
+            )
+        else:
+            logger.info("Empty message detected (no text, no attachments) - sending clarification")
+            await ctx.send(
+                MessageActivityInput(
+                    text="👋 Hi! I'm here to help. You can:\n\n"
+                         "📎 **Upload documents** (PDF, Word, Excel, PowerPoint, CSV)\n"
+                         "💬 **Ask questions** about your files or information\n"
+                         "🔍 **Search** your OneDrive/SharePoint documents\n\n"
+                         "💡 *Tip: If you tried to upload a file from mobile, wait 10-30 seconds after selecting it before sending your message, or use the desktop/web app for best results.*"
+                ).add_ai_generated()
+            )
+        return
+
+    # Send typing indicator IMMEDIATELY to show the bot is processing
     await send_typing_indicator(ctx)
+
+    # OPTIMIZATION: Check for cached attachments BEFORE routing
+    # This avoids expensive Graph/AI searches when follow-up questions are about uploaded files
+    has_cached_attachments = False
+    cached_attachment_filenames = []
+    try:
+        # Quick check without loading full content (faster)
+        cached_attachments_check = get_conversation_attachments(conversation_id, include_content=False)
+        if cached_attachments_check:
+            has_cached_attachments = True
+            cached_attachment_filenames = [f.get("filename") or f.get("name", "unknown") for f in cached_attachments_check]
+            logger.info(f"Found {len(cached_attachments_check)} cached attachment(s) in conversation: {', '.join(cached_attachment_filenames)}")
+    except Exception:
+        pass
 
     # --- FIX: ensure all variables are defined before use and routing is done at the start ---
     # LLM router: decide routing and extract action, route, etc.
-    route = await llm_decide_routing(model, user_text, conversation_id)
+    # Keep connection alive during LLM call
+    async with TypingIndicatorManager(ctx):
+        route = await llm_decide_routing(model, user_text, conversation_id)
     action = route.get("action", "respond_direct")
+
+    # OPTIMIZATION OVERRIDE: For follow-up questions when cached attachments exist, skip external searches
+    # This reduces latency from ~8-10s to <2s by avoiding Graph API and AI Search calls
+    # Can be disabled via SKIP_SEARCH_FOR_CACHED_FOLLOWUPS=false config
+    if (has_cached_attachments 
+        and action == "search_documents" 
+        and not attachments 
+        and getattr(Config, "SKIP_SEARCH_FOR_CACHED_FOLLOWUPS", True)):
+        
+        # Check if this looks like a follow-up question about the uploaded files
+        user_text_lower = (user_text or "").lower()
+        
+        # Simple heuristic: short questions without external indicators are likely follow-ups
+        is_likely_followup = (
+            len(user_text.split()) < 15  # Short question
+            and not any(keyword in user_text_lower for keyword in ["sharepoint", "onedrive", "find", "search for", "look for", "document", "file"])  # No external search intent
+            and any(keyword in user_text_lower for keyword in ["what", "who", "how", "show", "list", "tell", "any", "which"])  # Typical question words
+        )
+        
+        if is_likely_followup:
+            logger.info(f"⚡ FAST PATH: Follow-up detected with {len(cached_attachment_filenames)} cached attachment(s) - skipping Graph/AI Search")
+            logger.info(f"   Cached files: {', '.join(cached_attachment_filenames)}")
+            action = "respond_direct"
+            route["action"] = "respond_direct"
+            # Clear search query to prevent fallthrough
+            route["query"] = ""
+            route["should_search"] = False
 
     # Extract and remember user identity
     # Use 'from_' attribute (Python renames 'from' to 'from_' since 'from' is a reserved keyword)
@@ -1553,13 +1887,25 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
     
     # Attachment processing - files uploaded directly to chat
     if attachments:
+        await send_typing_indicator(ctx)
         MAX_ATTACHMENTS = 5
         parts = []
         extracted_for_aggregation = []  # For multi-file comparison
+        
         if len(attachments) > MAX_ATTACHMENTS:
             logger.info(f"Attachment limit exceeded ({len(attachments)}). Processing first {MAX_ATTACHMENTS} only.")
-        for att in attachments[:MAX_ATTACHMENTS]:
+            await send_typing_indicator(ctx)
+        
+        total_attachments = min(len(attachments), MAX_ATTACHMENTS)
+        
+        for i, att in enumerate(attachments[:MAX_ATTACHMENTS], 1):
             att_name = getattr(att, "name", "unknown")
+            
+            # Send typing indicator before each attachment to keep connection alive
+            if total_attachments > 1:
+                await send_typing_with_status(ctx, f"Processing {att_name} ({i}/{total_attachments})")
+            else:
+                await send_typing_indicator(ctx)
             
             # Validate file before processing
             is_valid, validation_error = validate_file_attachment(att)
@@ -1568,7 +1914,29 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                 logger.warning(f"File validation failed for '{att_name}': {validation_error}")
                 continue
             
-            file_content = process_attachment(att, conversation_id, user_id=cache_user_id)
+            # Send another typing indicator before the heavy processing
+            await send_typing_indicator(ctx)
+            logger.info(f"Processing attachment {i}/{total_attachments}: {att_name}")
+            
+            # Wrap processing in try-except to prevent crashes
+            file_content = None
+            try:
+                # ALWAYS use async with typing manager to prevent timeout
+                file_size_mb = getattr(att, 'content_size', 0) / (1024 * 1024) if hasattr(att, 'content_size') else 0
+                logger.info(f"Processing {att_name} (size: {file_size_mb:.1f}MB) with periodic typing refresh")
+                
+                async with TypingIndicatorManager(ctx):
+                    file_content = await asyncio.to_thread(process_attachment, att, conversation_id, user_id=cache_user_id)
+            except MemoryError as mem_err:
+                logger.error(f"MEMORY ERROR processing '{att_name}': {mem_err}")
+                file_content = f"❌ **File too large**: {att_name}\n\nThis file caused a memory error. Try:\n• Splitting into smaller files\n• Reducing file size\n• Asking about specific sections"
+            except Exception as proc_err:
+                logger.error(f"ERROR processing attachment '{att_name}': {proc_err}", exc_info=True)
+                file_content = f"❌ **Processing failed**: {att_name}\n\nError: {str(proc_err)[:200]}"
+            
+            # Send typing indicator after processing (before caching)
+            if file_content and len(file_content) > 10000:  # Large files get extra typing indicator
+                await send_typing_indicator(ctx)
 
             if file_content:
                 if file_content.startswith("❌"):
@@ -1578,23 +1946,41 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
 
                 # Success path: cache content to disk for follow-up questions
                 # This persists attachment content so memory limits aren't hit on follow-ups
+                
+                # Include FULL content for LLM - user wants complete extraction
                 parts.append(file_content)
+                
+                # Keep full content for aggregation processing
                 extracted_for_aggregation.append((att_name, file_content))
-                file_storage.append({
-                    "name": att_name,
-                    "content": file_content
-                })
+                # Note: Full content stored in cache and sent to LLM for complete analysis
                 
                 # Cache attachment to disk for follow-up questions
                 try:
                     cache_attachment(conversation_id, att_name, file_content)
-                    logger.info(f"Attachment '{att_name}' processed and cached - {len(file_content)} chars")
+                    logger.info(f"Attachment '{att_name}' processed and cached - {len(file_content)} chars (FULL content)")
                 except Exception as cache_err:
                     logger.warning(f"Failed to cache attachment '{att_name}': {cache_err}")
                     logger.info(f"Attachment '{att_name}' processed (cache failed) - {len(file_content)} chars")
             else:
-                # No content returned; let the LLM know we saw an attachment but could not read it
-                parts.append(f"❌ Unable to read attachment '{att_name}'. The payload did not include a usable file URL.")
+                # No content returned; provide mobile-friendly guidance
+                mobile_guidance = f"""❌ Unable to read attachment '{att_name}'.
+
+**If using Teams mobile app:**
+• **Wait 30-60 seconds** after selecting files before sending
+• Use the **paperclip button** (not drag-and-drop)
+• Try **desktop/web Teams** for more reliable file uploads
+• Ensure **strong network connection**
+
+**File troubleshooting:**
+• Check file size (keep under 250 MB)
+• Verify file isn't corrupted or password-protected
+• Make sure file has proper extension (.pdf, .docx, etc.)"""
+                
+                parts.append(mobile_guidance)
+        
+        # Final typing indicator after all attachments processed
+        if total_attachments > 1:
+            await send_typing_indicator(ctx)
 
         # If multiple tabular files uploaded, add aggregated comparison
         if len(extracted_for_aggregation) >= 2:
@@ -1629,23 +2015,25 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                 fname = cached_file.get("name", "unknown")
                 fcontent = cached_file.get("content", "")
                 if fcontent:
+                    # Include FULL cached content - no truncation for complete analysis
                     parts.append(f"[Previously uploaded: {fname}]\n{fcontent}")
-                    # Also populate in-memory storage for this session
-                    if not any(f.get("name") == fname for f in file_storage):
-                        file_storage.append({"name": fname, "content": fcontent})
+                    logger.info(f"Loaded full cached content for {fname}: {len(fcontent)} chars")
+                    # Content already in cache - no need to store in memory
             if parts:
                 attachment_context = "\n\n" + "\n---\n".join(parts)
                 attachment_texts_for_llm = parts
                 logger.info(f"Loaded {len(parts)} cached file(s) with {sum(len(p) for p in parts)} total chars")
         elif file_storage:
-            # Fall back to in-memory storage if no disk cache
-            logger.info(f"Including {len(file_storage)} previously uploaded file(s) from memory")
+            # Use cached attachments as primary source (file_storage is now cache-based)
+            logger.info(f"Including {len(file_storage)} previously uploaded file(s) from cache")
             parts = []
             for stored_file in file_storage:
                 fname = stored_file.get("name", "unknown")
                 fcontent = stored_file.get("content", "")
                 if fcontent:
+                    # Include FULL cached content - no truncation for complete analysis  
                     parts.append(f"[Previously uploaded: {fname}]\n{fcontent}")
+                    logger.info(f"Including full cached file {fname}: {len(fcontent)} chars")
             if parts:
                 attachment_context = "\n\n" + "\n---\n".join(parts)
                 attachment_texts_for_llm = parts
@@ -1752,6 +2140,37 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
             sources_refs = []
             full_contents = []
             
+            # STEP 0: Search cached attachments if no current attachments in context
+            # This allows follow-up questions to access previously uploaded files
+            # NOTE: Full content is preserved in cache (no truncation) to ensure all data is available
+            if not attachment_context and not attachments:
+                logger.info(f"No current attachments - searching cached attachments for: {q}")
+                try:
+                    cached_search_results = search_attachment_contents(conversation_id, q, limit=3)
+                    if cached_search_results:
+                        logger.info(f"Found {len(cached_search_results)} relevant cached attachment(s)")
+                        cached_attachment_parts = []
+                        for result in cached_search_results:
+                            filename = result.get("filename", "Unknown")
+                            snippet = result.get("content_snippet", "")
+                            score = result.get("relevance_score", 0)
+                            full_content = result.get("full_content", "")
+                            content_size = len(full_content)
+                            
+                            logger.info(f"Including cached attachment: {filename} (relevance: {score}, size: {content_size:,} chars)")
+                            # Add full content to context for thorough analysis
+                            # Full content is available regardless of original file size
+                            cached_attachment_parts.append(f"[Cached attachment: {filename}]\n{full_content}")
+                        
+                        # Add cached attachments to context
+                        if cached_attachment_parts:
+                            attachment_context = "\n\n" + "\n---\n".join(cached_attachment_parts)
+                            attachment_texts_for_llm = cached_attachment_parts
+                            total_cached_chars = sum(len(part) for part in cached_attachment_parts)
+                            logger.info(f"Added {len(cached_attachment_parts)} cached attachment(s) to context ({total_cached_chars:,} chars total)")
+                except Exception as cache_search_err:
+                    logger.warning(f"Failed to search cached attachments: {cache_search_err}")
+            
             # STEP 1: Search local document cache first (fastest)
             logger.info(f"Searching document cache for: {q}")
             try:
@@ -1853,13 +2272,28 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
             if call_ai_search:
                 from knowledge_base import unified_search
                 ai_search_results = await asyncio.to_thread(unified_search, q, top=top_k, user_id=cache_user_id)
+                logger.info(f"✅ AI Search completed: {len(ai_search_results or [])} results returned")
                 try:
-                    logger.debug(
-                        "AI search result names: %s",
-                        ", ".join([d.get("name", "(no-name)") for d in (ai_search_results or [])])
-                    )
-                except Exception:
-                    pass
+                    if ai_search_results:
+                        result_names = [d.get("name", "(no-name)") for d in ai_search_results]
+                        logger.info(f"AI Search results: {', '.join(result_names[:3])}{'...' if len(result_names) > 3 else ''}")
+                        
+                        # Detailed logging of what AI search actually returned
+                        logger.info("📋 AI Search Results Detail:")
+                        for i, doc in enumerate(ai_search_results[:5], 1):  # Show first 5 results
+                            name = doc.get("name", "(no-name)")
+                            url = doc.get("url", doc.get("file_path", doc.get("webUrl", "(no-url)")))
+                            score = doc.get("score", "N/A")
+                            snippet = doc.get("snippet", doc.get("content", ""))[:150] + "..." if doc.get("snippet", doc.get("content", "")) else "(no content)"
+                            source = "Graph" if doc.get("driveId") else "Cache/Local"
+                            
+                            logger.info(f"  [{i}] {name} (score: {score}, source: {source})")
+                            logger.info(f"      URL: {url[:100]}{'...' if len(str(url)) > 100 else ''}")
+                            logger.info(f"      Content: {snippet}")
+                    else:
+                        logger.info("AI Search returned no results")
+                except Exception as e:
+                    logger.warning(f"Error logging AI search details: {e}")
             else:
                 # Heuristic: filename-style queries with attachments should prefer AI Search
                 try:
@@ -1872,13 +2306,49 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                         ai_search_results = await asyncio.to_thread(unified_search, q, top=top_k, user_id=cache_user_id)
                         decision_reasons.append("forced_filename_query_with_attachments")
                         logger.info(f"AI Search decision override: call=True reasons={decision_reasons}")
+                        logger.info(f"✅ AI Search override completed: {len(ai_search_results or [])} results returned")
+                        
+                        # Detailed logging for override results too
+                        try:
+                            if ai_search_results:
+                                logger.info("📋 AI Search Override Results Detail:")
+                                for i, doc in enumerate(ai_search_results[:3], 1):  # Show first 3 results
+                                    name = doc.get("name", "(no-name)")
+                                    score = doc.get("score", "N/A")
+                                    snippet = doc.get("snippet", doc.get("content", ""))[:100] + "..." if doc.get("snippet", doc.get("content", "")) else "(no content)"
+                                    source = "Graph" if doc.get("driveId") else "Cache/Local"
+                                    logger.info(f"  [{i}] {name} (score: {score}, source: {source}): {snippet}")
+                        except Exception as e:
+                            logger.warning(f"Error logging AI search override details: {e}")
                 except Exception:
                     pass
                 # Note: Graph results are NOT cached here - they will be cached AFTER
                 # the LLM response is generated, and ONLY for documents that were actually used
             
-            # Use cache results if present; otherwise use external search results
-            combined_doc_results = cached_results if cached_results else (ai_search_results or [])
+            # Determine which results to use based on what was actually searched
+            # Priority: AI search results (if called) > cached results
+            if call_ai_search or ai_search_results:
+                combined_doc_results = ai_search_results or []
+                result_source = "AI Search"
+                logger.info(f"Using AI Search results: {len(combined_doc_results)} documents")
+                
+                # Log relevance assessment for debugging
+                if combined_doc_results and q:
+                    query_terms = set(q.lower().split())
+                    logger.info(f"🔍 Query terms for relevance check: {query_terms}")
+                    for i, doc in enumerate(combined_doc_results[:3], 1):
+                        name = doc.get("name", "").lower()
+                        content = doc.get("snippet", doc.get("content", "")).lower()
+                        matching_terms = [term for term in query_terms if term in name or term in content]
+                        logger.info(f"  [{i}] {doc.get('name', '(no-name)')}: matching terms = {matching_terms if matching_terms else 'NONE'}")
+            else:
+                combined_doc_results = cached_results or []
+                result_source = "Document Cache"
+                logger.info(f"Using cached results: {len(combined_doc_results)} documents")
+            
+            # Ensure variables have default values
+            if 'result_source' not in locals():
+                result_source = "None"
             
             # Format combined results (both cache and AI search)
             if combined_doc_results:
@@ -2015,14 +2485,11 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                         "content": content
                     })
 
-                # If we have document results, skip web cache to avoid off-topic content
-                if web_results:
-                    logger.info("Document results found; skipping web cache to avoid unrelated sources")
-                    web_results = []
+                # Note: Web cache results will be processed separately and included alongside document results
                 
                 # Add combined results section
                 citation_urls = [doc.get("url") or "" for doc in combined_doc_results]
-                citation_example = " ".join([f"[[{i+1}]({url})" for i, url in enumerate(citation_urls)])
+                citation_example = " ".join([f"[{i+1}]({url})" for i, url in enumerate(citation_urls)])
                 search_context += (
                     "\n\n<!-- combined-documents -->\n"
                     "<div style=\"font-size: 0.95rem; line-height: 1.5;\">"
@@ -2033,7 +2500,7 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                     + "".join(f"<li>{ref}</li>" for ref in sources_refs) +
                     "</ul>"
                     "<p style=\"margin: 1rem 0 0; font-size: 0.85rem; font-style: italic; color: #666;\">"
-                    "<strong>CITATION FORMAT:</strong> Use [[1]](URL) [[2]](URL) etc. "
+                    "<strong>CITATION FORMAT:</strong> Use [1](URL) [2](URL) etc. "
                     f"Example: {citation_example}</p>"
                     "</div>"
                 )
@@ -2073,7 +2540,7 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                         f"<a href=\"{clean_url}\" style=\"color: #0078d4; text-decoration: none;\">{title}</a>"
                     )
                 citation_urls = [p.get("url") or "" for p in web_results]
-                citation_example = " ".join([f"[[{i+1}]]({url})" for i, url in enumerate(citation_urls)])
+                citation_example = " ".join([f"[{i+1}]({url})" for i, url in enumerate(citation_urls)])
                 search_context += (
                     "\n\n<!-- web-cache -->\n"
                     "<div style=\"font-size: 0.95rem; line-height: 1.5;\">"
@@ -2084,7 +2551,7 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                     + "".join(f"<li>{ref}</li>" for ref in web_refs) +
                     "</ul>"
                     "<p style=\"margin: 1rem 0 0; font-size: 0.85rem; font-style: italic; color: #666;\">"
-                    "<strong>CITATION FORMAT:</strong> Use [[1]](URL) [[2]](URL) etc. "
+                    "<strong>CITATION FORMAT:</strong> Use [1](URL) [2](URL) etc. "
                     f"Example: {citation_example}</p>"
                     "</div>"
                 )
@@ -2121,8 +2588,7 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                         "url": clean_url,
                         "content": content
                     })
-                citation_urls = [doc.get("file_path") or doc.get("url") or doc.get("webUrl") or "" for doc in search_results]
-                citation_example = " ".join([f"[[{i+1}]]({url})" for i, url in enumerate(citation_urls)])
+                citation_example = " ".join([f"[{i+1}]" for i in range(len(search_results))])  # AI search: no hyperlinks
                 search_context += (
                     "\n\n<!-- ai-search -->\n"
                     "<div style=\"font-size: 0.95rem; line-height: 1.5;\">"
@@ -2133,7 +2599,7 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                     + "".join(f"<li>{ref}</li>" for ref in sources_refs) +
                     "</ul>"
                     "<p style=\"margin: 1rem 0 0; font-size: 0.85rem; font-style: italic; color: #666;\">"
-                    "<strong>CITATION FORMAT:</strong> Use [[1]](URL) [[2]](URL) etc. "
+                    "<strong>CITATION FORMAT:</strong> Use [1] [2] etc. (no hyperlinks for AI search)"
                     f"Example: {citation_example}</p>"
                     "</div>"
                 )
@@ -2170,29 +2636,30 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                     + "</div>"
                 )
             
-            # ALWAYS append a summary of sources searched (for mandatory references section)
-            sources_searched_summary = []
-            if cached_results:
-                sources_searched_summary.append(f"Document Cache: {len(cached_results)} result(s)")
-            else:
-                sources_searched_summary.append("Document Cache: 0 results")
-            if web_results:
-                sources_searched_summary.append(f"Web Cache: {len(web_results)} result(s)")
-            else:
-                sources_searched_summary.append("Web Cache: 0 results")
-            if ai_search_results:
-                sources_searched_summary.append(f"AI Search (Azure): {len(ai_search_results)} result(s)")
-            else:
-                sources_searched_summary.append("AI Search (Azure): 0 results")
-            if call_ai_search:
-                sources_searched_summary.append("Graph API: searched")
-            
-            search_context += (
-                "\n\n<!-- sources-searched-summary -->\n"
-                "[SOURCES SEARCHED - Include these in your References section]\n"
-                + "\n".join(f"- {s}" for s in sources_searched_summary)
-                + "\n[IMPORTANT: You MUST include a 'References:' section at the end of your response listing all sources with URLs]"
+            # Only append references instruction if there are actual relevant external sources with content
+            has_external_sources = (
+                (combined_doc_results and result_source == "AI Search" and any(d.get("content") or d.get("snippet") for d in combined_doc_results)) or
+                (web_results and any(w.get("content") for w in web_results))
+                # Note: Only show references for AI search results and web results, not cached attachments
             )
+            
+            if has_external_sources:
+                sources_searched_summary = []
+                if combined_doc_results and result_source == "AI Search":
+                    sources_searched_summary.append(f"AI Search (Azure): {len(combined_doc_results)} result(s)")
+                elif combined_doc_results and result_source == "Document Cache":
+                    sources_searched_summary.append(f"Document Cache: {len(combined_doc_results)} result(s)")
+                if web_results:
+                    sources_searched_summary.append(f"Web Cache: {len(web_results)} result(s)")
+                if call_ai_search:
+                    sources_searched_summary.append("Graph API: searched")
+                
+                search_context += (
+                    "\n\n<!-- sources-searched-summary -->\n"
+                    "[SOURCES SEARCHED - Include these in your References section]\n"
+                    + "\n".join(f"- {s}" for s in sources_searched_summary)
+                    + "\n[IMPORTANT: You MUST include a 'References:' section at the end of your response listing all sources with URLs]"
+                )
 
     # Add personalization context and build full input
     # Build personalization without placeholder name
@@ -2254,7 +2721,7 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
         is_calc, calc_type = detect_calculation_intent(user_text or "")
         
         if is_calc and file_storage:
-            # Get CSV files from storage
+            # Calculator mode: process cached CSV files for comparison/aggregation
             csv_files = []
             for stored_file in file_storage:
                 fname = stored_file.get("name", "").lower()
@@ -2359,7 +2826,12 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
             ctx.stream.emit(combined)
             chunk_buffer = []
         
-        logger.info("Chat response completed")
+        # Log response for debugging
+        try:
+            response_text = str(chat_result).strip() if chat_result else "(empty)"
+            logger.info(f"Chat response completed | Length: {len(response_text)} chars | Preview: {response_text[:100]}...")
+        except Exception:
+            logger.info("Chat response completed")
         
         # CACHE DOCUMENTS POST-RESPONSE: Only cache documents from live Graph search that were used
         # Save conversation memory after response for instant recovery on next turn
@@ -2465,6 +2937,50 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
 # ---------------------------
 # Event handlers
 # ---------------------------
+async def send_welcome_message(ctx: ActivityContext):
+    """Send welcome message for new users or when requested"""
+    try:
+        welcome_message = """👋 **Welcome to SwopeAI!**
+
+I'm your intelligent assistant powered by AI. Here's what I can help you with:
+
+📄 **Document Analysis**
+• Upload and analyze PDFs, Word docs, Excel files, and more
+• Extract information and summarize content
+• Compare multiple documents
+
+🔍 **Smart Search**
+• Search your SharePoint and OneDrive files
+• Find information across your organization's documents
+• Get answers from indexed web content
+
+💬 **Natural Conversations**
+• Ask questions in plain English
+• Get detailed explanations with source citations
+• Access current date/time information
+
+🏥 **Swope Health Information**
+• Learn about services, locations, and healthcare offerings
+• Get organization-specific information
+
+**Ready to get started?** Try asking me something like:
+• "What can you help me with?"
+• "Tell me about Swope Health"
+• "Search my SharePoint files"
+
+Or simply upload a document and ask me to analyze it! 📎"""
+
+        await ctx.send(MessageActivityInput(text=welcome_message).add_ai_generated())
+        logger.info("Welcome message sent to user")
+        
+    except Exception as e:
+        logger.error(f"Error sending welcome message: {e}", exc_info=True)
+        # Fallback simple welcome message
+        try:
+            await ctx.send(MessageActivityInput(text="👋 Hello! I'm SwopeAI, your intelligent assistant. How can I help you today?").add_ai_generated())
+        except Exception as fallback_error:
+            logger.error(f"Failed to send fallback welcome message: {fallback_error}")
+
 @app.on_message
 async def handle_message(ctx: ActivityContext[MessageActivity]):
     try:
@@ -2472,6 +2988,14 @@ async def handle_message(ctx: ActivityContext[MessageActivity]):
         logger.info(f"MESSAGE RECEIVED | Text: {ctx.activity.text[:100] if ctx.activity.text else 'None'}")
         logger.info(f"From: {getattr(ctx.activity.from_, 'name', 'Unknown')} | Conv: {ctx.activity.conversation.id if ctx.activity.conversation else 'Unknown'}")
         logger.info("=" * 60)
+        
+        # Handle welcome for first-time users or specific welcome commands
+        user_text = (ctx.activity.text or "").strip().lower()
+        if user_text in ["hello", "hi", "start", "welcome", "help"]:
+            # This might be a first interaction, consider showing welcome
+            await send_welcome_message(ctx)
+            return  # Don't process further for welcome commands
+        
         await handle_stateful_conversation(model, ctx)
     except Exception as e:
         error_msg = str(e)

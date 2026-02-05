@@ -256,7 +256,7 @@ class WebIndexer:
                                 self.cache["websites"][domain]["pages"][page_id] = {
                                     "url": url,
                                     "title": title,
-                                    "content": text[:8000],  # Increased limit for more complete content
+                                    "content": text,  # No truncation - store full content
                                     "indexed_at": datetime.now().isoformat()
                                 }
                                 pages_indexed += 1

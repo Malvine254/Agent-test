@@ -120,7 +120,7 @@ class Config:
     MAX_DOCS = int(os.environ.get("MAX_DOCS", "20"))
     MAX_SNIPPET_CHARS = int(os.environ.get("MAX_SNIPPET_CHARS", "100000"))
     MAX_ATTACH_CHARS = int(os.environ.get("MAX_ATTACH_CHARS", "450000"))
-    MAX_WEB_CHARS = int(os.environ.get("MAX_WEB_CHARS", "20000"))
+    MAX_WEB_CHARS = int(os.environ.get("MAX_WEB_CHARS", "0"))  # 0 = no limit on web content
     MAX_MEMORY_TURNS = int(os.environ.get("MAX_MEMORY_TURNS", "20"))
 
     # Optional: Always call AI Search regardless of cache heuristics
@@ -129,6 +129,11 @@ class Config:
     ALLOW_CACHE_USER_INFERENCE = os.environ.get("ALLOW_CACHE_USER_INFERENCE", "false").strip().lower() in ("1", "true", "yes")
     # Disable external APIs (AI Search & Graph) when attachments are present
     DISABLE_APIS_ON_ATTACHMENTS = os.environ.get("DISABLE_APIS_ON_ATTACHMENTS", "false").strip().lower() in ("1", "true", "yes")
+    
+    # PERFORMANCE: Skip Graph/AI Search for follow-up questions when cached attachments exist
+    # Reduces latency from ~8-10s to <2s for questions about recently uploaded files
+    # Set to "false" if you want to always search external sources
+    SKIP_SEARCH_FOR_CACHED_FOLLOWUPS = os.environ.get("SKIP_SEARCH_FOR_CACHED_FOLLOWUPS", "true").strip().lower() in ("1", "true", "yes")
     
     @classmethod
     def get_retry_status_forcelist(cls) -> set[int]:
@@ -171,7 +176,7 @@ class Config:
             _require_env("TENANT_ID")
 
 # File Upload Restrictions
-Config.MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "20"))  # 20MB default
+Config.MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "10"))  # 10MB default - prevents memory crashes
 Config.ALLOWED_FILE_TYPES = {
     # Documents
     '.pdf', '.docx', '.doc', '.pptx', '.ppt', '.xlsx', '.xls',

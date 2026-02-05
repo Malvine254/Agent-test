@@ -119,12 +119,18 @@ def _is_sharepoint_url(url: str) -> bool:
     return "sharepoint.com" in url_lower or "onedrive.com" in url_lower
 
 
+# File size limits for memory safety
+MAX_FILE_SIZE_MB = 50  # Maximum file size to download (50MB)
+MAX_EXTRACTED_CHARS = 80000  # Maximum extracted text characters PER FILE (~20K tokens) - prevents crashes
+MAX_DOWNLOAD_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
 def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optional[str] = None) -> str:
     """
     Process file attachment from Teams and extract text content.
     - Per Teams docs: downloadUrl in content is pre-authenticated by Teams
     - SharePoint/OneDrive contentUrl requires bot's Bearer token (app registration)
     - Returns extracted text for caller to cache and use in context
+    - Implements size limits and truncation to prevent memory crashes
     
     Args:
         attachment: Teams attachment object
@@ -132,7 +138,7 @@ def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optio
         user_id: User ID for logging purposes
     
     Returns:
-        Extracted text or file info
+        Extracted text or file info (truncated if necessary)
     """
     prefix = f"[{corr_id}] " if corr_id else ""
     
@@ -298,8 +304,21 @@ def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optio
                     if not has_file_extension:
                         logger.warning(f"{prefix}No URL and no file extension found - skipping")
                         return "ℹ️ This looks like a link or card preview. Please upload the file directly so I can analyze it."
-                    # Otherwise, surface a clearer message for missing file URL
-                    return f"❌ No download URL found for {display_name}. The attachment payload did not include a usable file URL."
+                    # Mobile-specific error message with guidance
+                    return f"""❌ I detected file attachment '{display_name}' but couldn't access it.
+
+**This often happens with mobile Teams app. Here's how to fix it:**
+
+1. **Wait 10-30 seconds** after uploading, then send your message
+   (Files need time to upload to OneDrive)
+
+2. **Use the paperclip/attach button** instead of drag-and-drop
+
+3. **Use Desktop or Web Teams** for best file attachment experience
+
+4. **Check file size** (keep under 250 MB for best results)
+
+The attachment payload did not include a usable download URL, which typically indicates a timing issue with mobile uploads."""
         
         # If SharePoint/OneDrive URL and no pre-auth downloadUrl, use robust Graph download+extract
         if _is_sharepoint_url(url_to_use) and not download_url:
@@ -318,30 +337,125 @@ def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optio
         # Otherwise direct download and local extraction
         logger.info(f"{prefix}Downloading from: {url_to_use[:120]}...")
         import requests
+        import time
+        
+        # SAFETY: Check file size first with HEAD request to avoid downloading huge files
         try:
-            resp = requests.get(url_to_use, timeout=30, allow_redirects=True)
-            if resp.status_code != 200:
-                logger.error(f"{prefix}Download failed: HTTP {resp.status_code}")
-                if resp.status_code == 403:
-                    return f"❌ Access denied for {display_name} (HTTP 403). Check file permissions."
-                elif resp.status_code == 404:
-                    return f"❌ File not found: {display_name} (HTTP 404)."
-                return f"❌ Failed to download {display_name} (HTTP {resp.status_code})."
-            content = resp.content or b""
-            logger.info(f"{prefix}Downloaded {len(content)} bytes")
-            # Detect HTML viewer pages masquerading as files
+            head_resp = requests.head(url_to_use, timeout=10, allow_redirects=True)
+            content_length = head_resp.headers.get('Content-Length')
+            if content_length:
+                file_size_mb = int(content_length) / (1024 * 1024)
+                logger.info(f"{prefix}File size: {file_size_mb:.1f} MB")
+                
+                if int(content_length) > MAX_DOWNLOAD_SIZE_BYTES:
+                    logger.warning(f"{prefix}File too large: {file_size_mb:.1f} MB > {MAX_FILE_SIZE_MB} MB")
+                    return f"""❌ **File too large**: {display_name} ({file_size_mb:.1f} MB)
+
+⚠️ Maximum file size: {MAX_FILE_SIZE_MB} MB
+
+**Suggestions:**
+• Split the file into smaller parts
+• Share specific sections instead of the full file
+• Use a compressed format
+• For very large datasets, consider uploading to SharePoint and asking specific questions"""
+        except Exception as head_err:
+            logger.debug(f"{prefix}HEAD request failed (continuing): {head_err}")
+        
+        # Mobile-friendly retry logic for attachment download
+        max_retries = 3
+        retry_delays = [2, 4, 8]  # Exponential backoff
+        
+        for attempt in range(max_retries):
             try:
-                ctype = (resp.headers.get("Content-Type") or "").lower()
-            except Exception:
-                ctype = ""
-            if ("text/html" in ctype) or (content[:20].lower().startswith(b"<html") or content[:40].lower().startswith(b"<!doctype html")):
-                return f"❌ The downloaded content appears to be an HTML viewer page, not the raw file: {display_name}. If this is a SharePoint/OneDrive file, I can access it via Graph—please share the original file link."
-        except requests.exceptions.Timeout:
-            logger.error(f"{prefix}Download timeout (>30s)")
-            return f"❌ Download timeout for {display_name}. File may be too large or network is slow."
-        except Exception as e:
-            logger.error(f"{prefix}Download exception: {e}", exc_info=True)
-            return f"❌ Failed to download {display_name}: {str(e)}"
+                # Stream download with size limit for memory safety
+                # REDUCED timeout: 15s to prevent long hangs that cause Teams timeout
+                resp = requests.get(url_to_use, timeout=15, allow_redirects=True, stream=True)
+                if resp.status_code == 200:
+                    # Download with size limit to prevent memory crashes
+                    content_chunks = []
+                    total_size = 0
+                    
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            content_chunks.append(chunk)
+                            total_size += len(chunk)
+                            
+                            # Safety: Stop if file exceeds limit during download
+                            if total_size > MAX_DOWNLOAD_SIZE_BYTES:
+                                logger.warning(f"{prefix}File exceeded size limit during download: {total_size / (1024*1024):.1f} MB")
+                                return f"""❌ **File too large**: {display_name} (>{MAX_FILE_SIZE_MB} MB)
+
+⚠️ Download stopped to prevent memory issues.
+
+**Please:**
+• Upload a smaller file
+• Share only relevant sections
+• Use compressed formats"""
+                    
+                    content = b''.join(content_chunks)
+                    logger.info(f"{prefix}Downloaded {len(content)} bytes ({len(content)/(1024*1024):.1f} MB) (attempt {attempt + 1})")
+                    break
+                elif resp.status_code == 403:
+                    logger.error(f"{prefix}Download failed: HTTP {resp.status_code} (attempt {attempt + 1})")
+                    if attempt < max_retries - 1:
+                        logger.info(f"{prefix}Access denied, retrying in {retry_delays[attempt]}s (mobile timing issue?)")
+                        time.sleep(retry_delays[attempt])
+                        continue
+                    return f"""❌ Access denied for {display_name} (HTTP 403).
+
+**If using mobile Teams app:**
+• Wait 30+ seconds after uploading, then try again
+• Use the paperclip button (not drag-and-drop)  
+• Switch to desktop/web Teams for better reliability
+
+**Otherwise:**
+• Check file permissions in OneDrive/SharePoint
+• Make sure the file isn't restricted"""
+                elif resp.status_code == 404:
+                    if attempt < max_retries - 1:
+                        logger.info(f"{prefix}File not found, retrying in {retry_delays[attempt]}s (upload may still be processing)")
+                        time.sleep(retry_delays[attempt])
+                        continue
+                    return f"""❌ File not found: {display_name} (HTTP 404).
+
+**If using mobile Teams app:**
+• The file upload might not be complete yet
+• Wait 30+ seconds after selecting the file, then try again
+• Use desktop/web Teams for immediate file access"""
+                else:
+                    logger.error(f"{prefix}Download failed: HTTP {resp.status_code} (attempt {attempt + 1})")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delays[attempt])
+                        continue
+                    return f"❌ Failed to download {display_name} (HTTP {resp.status_code})."
+            except requests.exceptions.Timeout:
+                logger.error(f"{prefix}Download timeout (>30s) (attempt {attempt + 1})")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delays[attempt])
+                    continue
+                return f"❌ Download timeout for {display_name}. File may be too large or network is slow."
+            except Exception as e:
+                logger.error(f"{prefix}Download exception: {e} (attempt {attempt + 1})", exc_info=True)
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delays[attempt])
+                    continue
+                return f"❌ Failed to download {display_name}: {str(e)}"
+        else:
+            # All retries failed
+            return f"""❌ Failed to download {display_name} after {max_retries} attempts.
+
+**This commonly happens with mobile Teams:**
+• Wait longer (60+ seconds) after uploading files
+• Use desktop/web Teams instead of mobile app
+• Check your network connection"""
+
+        # Detect HTML viewer pages masquerading as files
+        try:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+        except Exception:
+            ctype = ""
+        if ("text/html" in ctype) or (content[:20].lower().startswith(b"<html") or content[:40].lower().startswith(b"<!doctype html")):
+            return f"❌ The downloaded content appears to be an HTML viewer page, not the raw file: {display_name}. If this is a SharePoint/OneDrive file, I can access it via Graph—please share the original file link."
         if not content:
             return f"📎 {display_name} (empty file)"
         
@@ -360,8 +474,40 @@ def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optio
 
 
 def _extract_content(display_name: str, content: bytes) -> str:
-    """Extract text content from file bytes based on file type."""
+    """Extract text content from file bytes based on file type.
+    
+    Implements smart truncation to prevent token limit crashes:
+    - Extracts content normally
+    - Truncates if exceeds MAX_EXTRACTED_CHARS
+    - Adds clear indication when content is truncated
+    """
     file_name = display_name.lower()
+    
+    # Helper function to truncate if needed
+    def _smart_truncate(text: str, file_type: str) -> str:
+        """Truncate text if it exceeds limit, keeping beginning and summary."""
+        if len(text) <= MAX_EXTRACTED_CHARS:
+            return text
+        
+        # Take first 90% of allowed chars, add truncation notice
+        kept_chars = int(MAX_EXTRACTED_CHARS * 0.90)
+        truncated = text[:kept_chars]
+        
+        original_size_mb = len(text.encode('utf-8', errors='ignore')) / (1024 * 1024)
+        kept_size_mb = len(truncated.encode('utf-8', errors='ignore')) / (1024 * 1024)
+        
+        truncation_notice = f"""\n\n⚠️ **CONTENT TRUNCATED**
+Original: {len(text):,} chars ({original_size_mb:.1f} MB)
+Showing: {len(truncated):,} chars ({kept_size_mb:.1f} MB)
+Reason: Prevents token limit errors with large files
+
+💡 For full analysis:
+• Ask specific questions about sections
+• Request analysis of particular pages/ranges
+• Split into smaller files"""
+        
+        logger.warning(f"Truncated {file_type} content: {len(text):,} -> {len(truncated):,} chars")
+        return truncated + truncation_notice
     
     # PDF with extensive analysis
     if file_name.endswith(".pdf"):
@@ -388,7 +534,7 @@ def _extract_content(display_name: str, content: bytes) -> str:
             summary = f"📄 **PDF Document**: {display_name}\n"
             summary += f"**Pages:** {len(pdf_reader.pages)} | **Extracted Pages:** {len(text_parts)} | **Total Words:** {total_words:,}\n\n"
             summary += text
-            return summary
+            return _smart_truncate(summary, "PDF")
         except Exception as e:
             return f"📄 PDF: {display_name}\n\n(Error: {str(e)})"
     
@@ -408,7 +554,7 @@ def _extract_content(display_name: str, content: bytes) -> str:
                 summary = f"📝 **Word Document**: {display_name}\n"
                 summary += f"**Paragraphs:** {len(paragraphs)} | **Words:** {word_count:,}\n\n"
                 summary += text
-                return summary
+                return _smart_truncate(summary, "Word")
             except Exception as e:
                 logger.warning(f"Error parsing {display_name} as DOCX: {e}")
                 # This is a real legacy .doc file - try textract extraction
@@ -448,7 +594,7 @@ def _extract_content(display_name: str, content: bytes) -> str:
             summary = f"📝 **Word Document**: {display_name}\n"
             summary += f"**Paragraphs:** {len(paragraphs)} | **Words:** {word_count:,} | **Characters:** {char_count:,}\n\n"
             summary += text
-            return summary
+            return _smart_truncate(summary, "Word")
         except Exception as e:
             # Log detailed error for debugging
             error_msg = str(e)
@@ -493,7 +639,7 @@ def _extract_content(display_name: str, content: bytes) -> str:
                 
                 result = f"📊 **Excel File**: {display_name}\n\n"
                 result += "\n".join(sheets_text)
-                return result
+                return _smart_truncate(result, "Excel")
             except Exception as e:
                 return f"📊 Excel: {display_name}\n\n(Error: {str(e)})"
 
@@ -526,7 +672,8 @@ def _extract_content(display_name: str, content: bytes) -> str:
             
             result = f"📊 **Excel File**: {display_name}\n\n"
             result += "\n".join(sheets_text)
-            return result if sheets_text else result + "[No data found]"
+            final_result = result if sheets_text else result + "[No data found]"
+            return _smart_truncate(final_result, "Excel")
         except Exception as e:
             return f"📊 Excel: {display_name}\n\n(Error: {str(e)})"
 
@@ -662,7 +809,7 @@ def _extract_content(display_name: str, content: bytes) -> str:
             else:
                 summary += text
             
-            return summary
+            return _smart_truncate(summary, "PowerPoint")
         except Exception as e:
             logger.error(f"PowerPoint extraction error for {display_name}: {e}", exc_info=True)
             error_msg = str(e)
@@ -688,7 +835,8 @@ def _extract_content(display_name: str, content: bytes) -> str:
             if file_name.endswith(".csv"):
                 if not text:
                     return f"📄 **CSV File**: {display_name}\n\n[Empty file]"
-                return f"📄 **CSV File**: {display_name}\n\n{text}"
+                summary = f"📄 **CSV File**: {display_name}\n\n{text}"
+                return _smart_truncate(summary, "CSV")
             
             # JSON with structure info
             elif file_name.endswith(".json"):
@@ -703,7 +851,7 @@ def _extract_content(display_name: str, content: bytes) -> str:
                     else:
                         keys_info = ""
                     summary = f"📄 **{label}**: {display_name}{keys_info}\n\n{text}"
-                    return summary
+                    return _smart_truncate(summary, "JSON")
                 except:
                     pass
             
@@ -711,9 +859,12 @@ def _extract_content(display_name: str, content: bytes) -> str:
             elif file_name.endswith(".xml"):
                 label = "XML Data"
                 summary = f"📄 **{label}**: {display_name} | **Size:** {len(text):,} chars\n\n{text}"
-                return summary
+                return _smart_truncate(summary, "XML")
             
-            return f"📄 **{label}**: {display_name}\n\n{text}"
+            # Default text file
+            label = "Text File"
+            summary = f"📄 **{label}**: {display_name}\n\n{text}"
+            return _smart_truncate(summary, "Text")
         except Exception as e:
             return f"📄 Text: {display_name}\n\n(Error: {str(e)})"
     
