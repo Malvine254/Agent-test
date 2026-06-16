@@ -68,6 +68,7 @@ def build_sharepoint_index():
         SimpleField(name="checksum", type=SearchFieldDataType.String, filterable=True),
         SearchField(name="acl_users", type=SearchFieldDataType.Collection(SearchFieldDataType.String), filterable=True),
         SearchField(name="acl_groups", type=SearchFieldDataType.Collection(SearchFieldDataType.String), filterable=True),
+        SimpleField(name="acl_everyone", type=SearchFieldDataType.Boolean, filterable=True),
     ]
     vector_search = VectorSearch(
         algorithms=[HnswAlgorithmConfiguration(name="default-hnsw")],
