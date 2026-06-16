@@ -57,7 +57,7 @@ def index_sharepoint_document(item: dict) -> dict:
         existing_by_source = get_documents_by_source_url(source_url)
         if existing_by_source:
             same_checksum = any(row.get("checksum") == checksum for row in existing_by_source)
-            if same_checksum:
+            if same_checksum and not Config.SHAREPOINT_FORCE_REINDEX:
                 logger.info(
                     "INDEXING SKIP | file=%s | reason=duplicate_source_url_same_checksum | source_url=%s",
                     file_name,
