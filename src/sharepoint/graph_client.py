@@ -162,6 +162,24 @@ def _parse_permissions(permissions: list[dict]) -> dict:
     return {"acl_users": sorted(acl_users), "acl_groups": sorted(acl_groups), "acl_everyone": acl_everyone}
 
 
+def get_user_transitive_groups(user_object_id: str) -> list[str]:
+    """All AAD group object ids the user belongs to (transitive).
+
+    Requires GroupMember.Read.All (or Directory.Read.All) on the app registration.
+    Handles @odata.nextLink pagination — a user in many groups paginates, and
+    missing a page would silently under-grant access.
+    """
+    if not user_object_id:
+        return []
+    url = f"/users/{user_object_id}/transitiveMemberOf/microsoft.graph.group?$select=id&$top=100"
+    group_ids: list[str] = []
+    while url:
+        data = graph_get(url)
+        group_ids.extend(g["id"] for g in data.get("value", []) if g.get("id"))
+        url = data.get("@odata.nextLink") or ""
+    return group_ids
+
+
 def get_library_permissions(site_id: str, drive_id: str) -> dict:
     """Permissions for the document library root, cached per run."""
     cache_key = f"lib:{site_id}:{drive_id}"
