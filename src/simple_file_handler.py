@@ -14,8 +14,69 @@ from datetime import datetime
 import json
 import os
 import tempfile
+from config import Config
 
 logger = logging.getLogger(__name__)
+
+
+def _smart_truncate(text: str, file_type: str) -> str:
+    """Truncate very large extracted content while logging useful diagnostics.
+
+    Uses Config.MAX_EXTRACTED_CHARS as a hard cap. If the content is below
+    the limit it is returned unchanged; otherwise we keep most of it and
+    append a clear truncation notice so the LLM/user understands why
+    the tail of the document is missing.
+    """
+    if text is None:
+        return ""
+
+    text = str(text)
+
+    if len(text) <= Config.MAX_EXTRACTED_CHARS:
+        size_mb = len(text.encode("utf-8", errors="ignore")) / (1024 * 1024)
+        logger.info(
+            f"\u2713 {file_type} content extracted FULLY: {len(text):,} chars ({size_mb:.2f} MB)"
+        )
+        return text
+
+    kept_chars = int(Config.MAX_EXTRACTED_CHARS * 0.95)
+    truncated = text[:kept_chars]
+
+    original_size_mb = len(text.encode("utf-8", errors="ignore")) / (1024 * 1024)
+    kept_size_mb = len(truncated.encode("utf-8", errors="ignore")) / (1024 * 1024)
+
+    truncation_notice = (
+        "\n\n⚠️ **CONTENT TRUNCATED (EXTREMELY LARGE FILE)**\n"
+        f"Original: {len(text):,} chars ({original_size_mb:.1f} MB)\n"
+        f"Extracted: {len(truncated):,} chars ({kept_size_mb:.1f} MB)\n"
+        "Reason: File exceeds 20M character limit\n\n"
+        "💡 This file is exceptionally large. For best results:\n"
+        "• Split into smaller files\n"
+        "• Ask specific questions about sections\n"
+        "• Request analysis of particular ranges"
+    )
+
+    logger.warning(
+        f"Truncated {file_type} content (EXTREMELY LARGE): {len(text):,} -> {len(truncated):,} chars"
+    )
+    return truncated + truncation_notice
+
+
+def _llm_safe_cap(text: str, max_chars: int = None) -> str:
+    """Secondary LLM-safe cap applied AFTER extraction.
+
+    Cache may store the full _smart_truncate result (up to MAX_EXTRACTED_CHARS),
+    but anything entering an LLM prompt MUST be capped much lower.
+    Default cap: Config.MAX_DOC_SNIPPET_CHARS (typically 6000 chars).
+    """
+    if not text:
+        return ""
+    if max_chars is None:
+        max_chars = getattr(Config, "MAX_DOC_SNIPPET_CHARS", 6000)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n[...CONTENT CAPPED FOR LLM SAFETY...]"
+
 
 # Optional document processing imports
 pypdf = None
@@ -119,10 +180,117 @@ def _is_sharepoint_url(url: str) -> bool:
     return "sharepoint.com" in url_lower or "onedrive.com" in url_lower
 
 
-# File size limits for memory safety
-MAX_FILE_SIZE_MB = 50  # Maximum file size to download (50MB)
-MAX_EXTRACTED_CHARS = 80000  # Maximum extracted text characters PER FILE (~20K tokens) - prevents crashes
-MAX_DOWNLOAD_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+def _analyze_csv_content(csv_text: str, display_name: str) -> str:
+    """
+    Analyze CSV content intelligently:
+    - Parse and summarize data
+    - Calculate totals for numeric columns
+    - Identify key metrics and groupings
+    - Return structured insights for the LLM
+    """
+    try:
+        import pandas as pd
+        import io
+        
+        # Parse CSV
+        df = pd.read_csv(io.StringIO(csv_text))
+        
+        # Get basic info
+        rows, cols = df.shape
+        column_names = df.columns.tolist()
+        
+        from data_calculator import is_identifier_column, measure_columns, categorical_columns
+
+        # Find numeric measure columns and calculate totals. Numeric identifiers
+        # such as ProjectID are labels, not values to add up.
+        numeric_cols = measure_columns(df)
+        identifier_cols = [
+            col for col in df.select_dtypes(include=['number']).columns.tolist()
+            if is_identifier_column(col, df[col])
+        ]
+        categorical_cols = categorical_columns(df)
+        totals = {}
+        
+        for col in numeric_cols:
+            total = df[col].sum()
+            totals[col] = total
+        
+        # Build analysis report
+        report = f"**CSV Analysis**: {display_name}\n"
+        report += f"**Rows:** {rows:,} | **Columns:** {cols}\n\n"
+        
+        # Summary section
+        report += "**Column Info:**\n"
+        for col in column_names:
+            if col in numeric_cols:
+                total = totals[col]
+                avg = df[col].mean()
+                report += f"  • {col}: NUMERIC (Sum: {total:,.2f}, Avg: {avg:,.2f})\n"
+            else:
+                unique = df[col].nunique()
+                report += f"  • {col}: TEXT ({unique} unique values)\n"
+        
+        # Totals section if we have numeric data
+        if totals:
+            report += f"\n**CALCULATED TOTALS:**\n"
+            for col, total in totals.items():
+                # Format based on value - whole numbers vs decimals
+                if total == int(total):
+                    report += f"  * **{col}**: {int(total):,}\n"
+                else:
+                    report += f"  * **{col}**: {total:,.2f}\n"
+        
+        # Grouping analysis - find text columns that might be used for grouping
+        text_cols = [c for c in categorical_cols if c not in numeric_cols]
+        if text_cols and numeric_cols:
+            report += f"\n**GROUPING & ANALYSIS:**\n"
+            for text_col in text_cols[:3]:  # Show top 3 text columns
+                try:
+                    # Group by text column and sum numeric columns
+                    grouped = df.groupby(text_col)[numeric_cols].sum()
+                    if len(grouped) <= 10:  # Only show if reasonable number of groups
+                        report += f"\n  **By {text_col}:**\n"
+                        for idx, (group_name, row) in enumerate(grouped.iterrows(), 1):
+                            group_totals = " | ".join([f"{col}: {row[col]:,.2f}" if row[col] != int(row[col]) else f"{col}: {int(row[col]):,}" for col in numeric_cols])
+                            report += f"    {idx}. {group_name}: {group_totals}\n"
+                except Exception:
+                    pass
+
+        if text_cols:
+            report += f"\n**CATEGORY COUNTS:**\n"
+            for text_col in text_cols[:5]:
+                try:
+                    counts = df[text_col].fillna("Missing").replace("", "Missing").value_counts(dropna=False)
+                    if len(counts) <= 20:
+                        report += f"\n  **{text_col}:**\n"
+                        for value, count in counts.items():
+                            report += f"    - {value}: {int(count)}\n"
+                except Exception:
+                    pass
+        
+        # Show sample data
+        report += f"\n**SAMPLE DATA (First 5 rows):**\n"
+        for idx, row in df.head(5).iterrows():
+            row_str = " | ".join([f"{col}: {row[col]}" for col in column_names])
+            report += f"  {row_str}\n"
+
+        report += "\n**RAW CSV DATA FOR CALCULATION:**\n```csv\n"
+        report += csv_text.strip()
+        report += "\n```\n"
+        
+        return _smart_truncate(report, "CSV")
+    
+    except ImportError:
+        # pandas not available - fall back to basic CSV display
+        logger.warning("pandas not available for CSV analysis - showing raw CSV")
+        summary = f"📄 **CSV File**: {display_name}\n\n⚠️ Install pandas for intelligent CSV analysis:\n`pip install pandas`\n\n**Raw CSV:**\n{csv_text}"
+        return _smart_truncate(summary, "CSV")
+    except Exception as e:
+        logger.error(f"Error analyzing CSV {display_name}: {e}", exc_info=True)
+        # Fall back to raw display on error
+        summary = f"📄 **CSV File**: {display_name}\n\n⚠️ Error during analysis: {str(e)}\n\n**Raw CSV:**\n{csv_text}"
+        return _smart_truncate(summary, "CSV")
+
 
 def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optional[str] = None) -> str:
     """
@@ -347,11 +515,11 @@ The attachment payload did not include a usable download URL, which typically in
                 file_size_mb = int(content_length) / (1024 * 1024)
                 logger.info(f"{prefix}File size: {file_size_mb:.1f} MB")
                 
-                if int(content_length) > MAX_DOWNLOAD_SIZE_BYTES:
-                    logger.warning(f"{prefix}File too large: {file_size_mb:.1f} MB > {MAX_FILE_SIZE_MB} MB")
+                if int(content_length) > (Config.MAX_FILE_SIZE_MB * 1024 * 1024):
+                    logger.warning(f"{prefix}File too large: {file_size_mb:.1f} MB > {Config.MAX_FILE_SIZE_MB} MB")
                     return f"""❌ **File too large**: {display_name} ({file_size_mb:.1f} MB)
 
-⚠️ Maximum file size: {MAX_FILE_SIZE_MB} MB
+⚠️ Maximum file size: {Config.MAX_FILE_SIZE_MB} MB
 
 **Suggestions:**
 • Split the file into smaller parts
@@ -381,9 +549,9 @@ The attachment payload did not include a usable download URL, which typically in
                             total_size += len(chunk)
                             
                             # Safety: Stop if file exceeds limit during download
-                            if total_size > MAX_DOWNLOAD_SIZE_BYTES:
+                            if total_size > (Config.MAX_FILE_SIZE_MB * 1024 * 1024):
                                 logger.warning(f"{prefix}File exceeded size limit during download: {total_size / (1024*1024):.1f} MB")
-                                return f"""❌ **File too large**: {display_name} (>{MAX_FILE_SIZE_MB} MB)
+                                return f"""❌ **File too large**: {display_name} (>{Config.MAX_FILE_SIZE_MB} MB)
 
 ⚠️ Download stopped to prevent memory issues.
 
@@ -482,32 +650,6 @@ def _extract_content(display_name: str, content: bytes) -> str:
     - Adds clear indication when content is truncated
     """
     file_name = display_name.lower()
-    
-    # Helper function to truncate if needed
-    def _smart_truncate(text: str, file_type: str) -> str:
-        """Truncate text if it exceeds limit, keeping beginning and summary."""
-        if len(text) <= MAX_EXTRACTED_CHARS:
-            return text
-        
-        # Take first 90% of allowed chars, add truncation notice
-        kept_chars = int(MAX_EXTRACTED_CHARS * 0.90)
-        truncated = text[:kept_chars]
-        
-        original_size_mb = len(text.encode('utf-8', errors='ignore')) / (1024 * 1024)
-        kept_size_mb = len(truncated.encode('utf-8', errors='ignore')) / (1024 * 1024)
-        
-        truncation_notice = f"""\n\n⚠️ **CONTENT TRUNCATED**
-Original: {len(text):,} chars ({original_size_mb:.1f} MB)
-Showing: {len(truncated):,} chars ({kept_size_mb:.1f} MB)
-Reason: Prevents token limit errors with large files
-
-💡 For full analysis:
-• Ask specific questions about sections
-• Request analysis of particular pages/ranges
-• Split into smaller files"""
-        
-        logger.warning(f"Truncated {file_type} content: {len(text):,} -> {len(truncated):,} chars")
-        return truncated + truncation_notice
     
     # PDF with extensive analysis
     if file_name.endswith(".pdf"):
@@ -831,12 +973,11 @@ Reason: Prevents token limit errors with large files
         try:
             text = content.decode("utf-8", errors="ignore").strip()
             
-            # CSV - just output the raw data
+            # CSV - intelligent analysis with totals, summaries, grouping
             if file_name.endswith(".csv"):
                 if not text:
                     return f"📄 **CSV File**: {display_name}\n\n[Empty file]"
-                summary = f"📄 **CSV File**: {display_name}\n\n{text}"
-                return _smart_truncate(summary, "CSV")
+                return _analyze_csv_content(text, display_name)
             
             # JSON with structure info
             elif file_name.endswith(".json"):

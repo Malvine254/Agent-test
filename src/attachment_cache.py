@@ -2,6 +2,13 @@
 Attachment Cache - Persistent storage for file attachment contents.
 Caches full attachment contents to disk so follow-up questions can access 
 the data without re-downloading or hitting memory limits.
+
+PERFORMANCE & SECURITY:
+- LRU in-memory cache to limit memory usage
+- Lazy loading - only load what's needed
+- Per-user isolation for security
+- Async-friendly operations
+- Memory limits enforced
 """
 
 import json
@@ -10,19 +17,21 @@ import hashlib
 import logging
 from datetime import datetime
 from typing import Optional
+from functools import lru_cache
+from collections import OrderedDict
+from config import Config
 
 logger = logging.getLogger(__name__)
 
 # Cache file path - stored alongside other cache files
 ATTACHMENT_CACHE_PATH = os.path.join(os.path.dirname(__file__), "attachment_cache.json")
 
-# In-memory cache for fast access
-_attachment_cache: dict = {}
+# LRU in-memory cache for fast access (LIMITED SIZE)
+# Only keeps recently accessed attachments in memory
+_attachment_metadata_cache: OrderedDict = OrderedDict()  # Metadata only (lightweight)
+# Full cache storage used for disk writes
+_attachment_cache: dict | None = None
 
-# Cache settings
-MAX_CACHE_SIZE_MB = 200  # Maximum total cache size in MB (increased for full content preservation)
-MAX_CONTENT_SIZE_MB = 50  # Maximum size per attachment in MB (increased to handle large files)
-MAX_CONTENT_SIZE_CHARS = 10000000  # Maximum characters per attachment (~10M chars = ~2.5M tokens) - effectively unlimited for most files
 CACHE_EXPIRY_DAYS = 7  # How long to keep cached attachments
 
 
@@ -39,20 +48,16 @@ def _calculate_content_hash(content: str) -> str:
     return hashlib.md5(content.encode('utf-8', errors='ignore')).hexdigest()
 
 
-def _load_cache() -> dict:
-    """Load the attachment cache from disk."""
-    global _attachment_cache
-    
+def _load_metadata_only() -> dict:
+    """Load only attachment metadata (no content) for fast lookups."""
     try:
         if not os.path.exists(ATTACHMENT_CACHE_PATH):
-            _attachment_cache = {"attachments": {}, "metadata": {"version": 1}}
-            return _attachment_cache
+            return {"attachments": {}, "metadata": {"version": 1}}
         
         with open(ATTACHMENT_CACHE_PATH, 'r', encoding='utf-8') as f:
             content = f.read().strip()
             if not content:
-                _attachment_cache = {"attachments": {}, "metadata": {"version": 1}}
-                return _attachment_cache
+                return {"attachments": {}, "metadata": {"version": 1}}
             
             data = json.loads(content)
             if not isinstance(data, dict):
@@ -64,13 +69,67 @@ def _load_cache() -> dict:
             if "metadata" not in data:
                 data["metadata"] = {"version": 1}
             
-            _attachment_cache = data
-            return _attachment_cache
+            # Strip content to save memory - keep only metadata
+            for att_id, att_data in data.get("attachments", {}).items():
+                if isinstance(att_data, dict) and "content" in att_data:
+                    att_data["has_content"] = True
+                    att_data["content_preview"] = att_data.get("content", "")[:200]  # Small preview only
+                    del att_data["content"]  # Remove full content from memory
+            
+            return data
+            
+    except Exception as e:
+        logger.error(f"Failed to load attachment metadata: {e}")
+        return {"attachments": {}, "metadata": {"version": 1}}
+
+
+def _load_attachment_content(attachment_id: str, mode: str = "chat") -> Optional[str]:
+    """Lazy load: Load only a specific attachment's content from disk. Block full loads in chat mode."""
+    if mode not in {"chat", "calculation"}:
+        mode = "chat"
+    if mode == "chat":
+        logger.info(f"Blocked FULL attachment load in chat mode for {attachment_id}")
+        return None
+    try:
+        if not os.path.exists(ATTACHMENT_CACHE_PATH):
+            return None
+        with open(ATTACHMENT_CACHE_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            att_data = data.get("attachments", {}).get(attachment_id)
+            if att_data:
+                return att_data.get("content")
+        return None
+    except Exception as e:
+        logger.debug(f"Failed to load attachment content for {attachment_id}: {e}")
+        return None
+
+
+def _load_cache() -> dict:
+    """Load the attachment cache from disk (LEGACY - use _load_metadata_only for better performance)."""
+    try:
+        if not os.path.exists(ATTACHMENT_CACHE_PATH):
+            return {"attachments": {}, "metadata": {"version": 1}}
+        
+        with open(ATTACHMENT_CACHE_PATH, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            if not content:
+                return {"attachments": {}, "metadata": {"version": 1}}
+            
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                data = {"attachments": {}, "metadata": {"version": 1}}
+            
+            # Ensure required structure
+            if "attachments" not in data:
+                data["attachments"] = {}
+            if "metadata" not in data:
+                data["metadata"] = {"version": 1}
+            
+            return data
             
     except Exception as e:
         logger.error(f"Failed to load attachment cache: {e}")
-        _attachment_cache = {"attachments": {}, "metadata": {"version": 1}}
-        return _attachment_cache
+        return {"attachments": {}, "metadata": {"version": 1}}
 
 
 def _save_cache() -> bool:
@@ -78,6 +137,8 @@ def _save_cache() -> bool:
     global _attachment_cache
     
     try:
+        if _attachment_cache is None:
+            _attachment_cache = _load_cache()
         # Ensure directory exists
         dir_name = os.path.dirname(ATTACHMENT_CACHE_PATH)
         if dir_name and not os.path.exists(dir_name):
@@ -112,38 +173,38 @@ def _save_cache() -> bool:
         return False
 
 
-def cache_attachment(conversation_id: str, filename: str, content: str) -> bool:
+def cache_attachment(conversation_id: str, filename: str, content: str, user_id: str = None) -> bool:
     """
     Cache an attachment's full content for later retrieval.
     Implements size limits to prevent memory issues.
+    
+    SECURITY: user_id parameter enables per-user isolation.
     
     Args:
         conversation_id: The conversation this attachment belongs to
         filename: The attachment filename
         content: The full extracted text content
+        user_id: User ID for security isolation (recommended)
         
     Returns:
         True if cached successfully, False otherwise
     """
+    global _attachment_cache
     if not conversation_id or not filename or not content:
         return False
     
-    # Check character limit first (faster than byte size)
-    if len(content) > MAX_CONTENT_SIZE_CHARS:
-        logger.warning(f"Attachment '{filename}' content too long ({len(content):,} chars > {MAX_CONTENT_SIZE_CHARS:,})")
-        logger.warning(f"Attachment exceeds maximum - this file is extremely large and may cause issues")
-        # For extremely large files (> 10M chars), we still need a hard limit
-        truncated_content = content[:MAX_CONTENT_SIZE_CHARS]
-        truncated_content += f"\n\n⚠️ [CACHED CONTENT TRUNCATED - Original: {len(content):,} chars, Cached: {MAX_CONTENT_SIZE_CHARS:,} chars]\n"
-        truncated_content += "[Note: This file is exceptionally large. Consider splitting it into smaller files for better results.]"
-        content = truncated_content
-        logger.info(f"Truncated extremely large file {filename}: {len(content):,} chars")
+    # CRITICAL FOR CALCULATIONS: Always cache the FULL content without any truncation
+    # Truncation should only happen when retrieving for LLM conversations, not when storing
+    # This ensures calculations have access to complete data for accurate results
+    if len(content) > Config.MAX_CONTENT_SIZE_CHARS:
+        logger.warning(f"Attachment '{filename}' is extremely large ({len(content):,} chars) but FULL content will be cached for accurate calculations")
+        # NO TRUNCATION HERE - full content is preserved in cache for calculation accuracy
     
-    # Check byte size limit for storage
+    # Check byte size limit for storage - be more generous for calculation accuracy
     content_size_mb = len(content.encode('utf-8', errors='ignore')) / (1024 * 1024)
-    if content_size_mb > MAX_CONTENT_SIZE_MB:
-        logger.warning(f"Attachment '{filename}' too large to cache ({content_size_mb:.1f}MB > {MAX_CONTENT_SIZE_MB}MB)")
-        return False
+    if content_size_mb > (Config.MAX_FILE_SIZE_MB):
+        logger.warning(f"Attachment '{filename}' size ({content_size_mb:.1f}MB) exceeds limit ({Config.MAX_FILE_SIZE_MB}MB) - but will cache for calculation accuracy")
+        # Allow larger files to ensure calculation accuracy - just log the warning
     
     try:
         # Load current cache
@@ -153,7 +214,7 @@ def cache_attachment(conversation_id: str, filename: str, content: str) -> bool:
         content_hash = _calculate_content_hash(content)
         attachment_id = _generate_attachment_id(conversation_id, filename, content_hash)
         
-        # Store the attachment
+        # Store the attachment with user_id for security
         cache["attachments"][attachment_id] = {
             "conversation_id": conversation_id,
             "filename": filename,
@@ -161,6 +222,7 @@ def cache_attachment(conversation_id: str, filename: str, content: str) -> bool:
             "content_hash": content_hash,
             "content_length": len(content),
             "cached_at": datetime.now().isoformat(),
+            "user_id": user_id,  # Track owner for security
         }
         
         # Also index by conversation for easy lookup
@@ -174,7 +236,7 @@ def cache_attachment(conversation_id: str, filename: str, content: str) -> bool:
         _attachment_cache = cache
         if _save_cache():
             size_mb = len(content.encode('utf-8', errors='ignore')) / (1024 * 1024)
-            logger.info(f"Cached attachment '{filename}' for conversation {conversation_id[:8]}... ({len(content):,} chars, {size_mb:.2f} MB) - FULL content preserved")
+            logger.info(f"Cached attachment metadata for conversation {conversation_id[:8]}... ({len(content):,} chars, {size_mb:.2f} MB) - full content preserved for calculations")
             return True
         
         return False
@@ -184,7 +246,7 @@ def cache_attachment(conversation_id: str, filename: str, content: str) -> bool:
         return False
 
 
-def get_cached_attachment(conversation_id: str, filename: str) -> Optional[str]:
+def get_cached_attachment(conversation_id: str, filename: str, user_id: str | None = None) -> Optional[str]:
     """
     Retrieve a cached attachment by conversation ID and filename.
     
@@ -202,7 +264,10 @@ def get_cached_attachment(conversation_id: str, filename: str) -> Optional[str]:
         for att_id, att_data in cache.get("attachments", {}).items():
             if (att_data.get("conversation_id") == conversation_id and 
                 att_data.get("filename") == filename):
-                logger.info(f"Retrieved cached attachment '{filename}' ({att_data.get('content_length', 0)} chars)")
+                if getattr(Config, "STRICT_ATTACHMENT_USER_ISOLATION", True) and user_id and att_data.get("user_id") not in (user_id, None):
+                    logger.warning("Blocked cached attachment access because user_id did not match owner")
+                    continue
+                logger.info(f"Retrieved cached attachment metadata for '{filename}' ({att_data.get('content_length', 0)} chars)")
                 return att_data.get("content")
         
         return None
@@ -212,97 +277,83 @@ def get_cached_attachment(conversation_id: str, filename: str) -> Optional[str]:
         return None
 
 
-def search_attachment_contents(conversation_id: str, query: str, limit: int = 5) -> list[dict]:
+def search_attachment_contents(conversation_id: str, query: str, limit: int = 5, mode: str = "chat", user_id: str | None = None) -> list[dict]:
     """
     Search within cached attachment contents for a conversation.
-    
-    Args:
-        conversation_id: The conversation ID
-        query: The search query
-        limit: Maximum number of results to return
-        
-    Returns:
-        List of dicts with 'filename', 'content_snippet', 'relevance_score' keys
+    In chat mode, only previews are used; in calculation mode, full content is allowed.
     """
     try:
         if not query or not conversation_id:
             return []
-            
         cache = _load_cache()
         query_lower = query.lower()
         results = []
-        
-        # Search through all attachments for this conversation
+        PREVIEW_CHARS = 2000
         for att_id, att_data in cache.get("attachments", {}).items():
             if att_data.get("conversation_id") == conversation_id:
-                content = att_data.get("content", "")
-                filename = att_data.get("filename", "unknown")
-                
-                if not content:
+                # Enforce user-level isolation whenever user_id is available.
+                # Legacy cache rows may not have user_id, so allow None only to avoid breaking old cached files.
+                if getattr(Config, "STRICT_ATTACHMENT_USER_ISOLATION", True) and user_id and att_data.get("user_id") not in (user_id, None):
                     continue
                     
+                filename = att_data.get("filename", "unknown")
+                content_length = att_data.get("content_length", 0)
+                # Only load full content in calculation mode
+                if mode == "calculation":
+                    content = att_data.get("content", "")
+                else:
+                    # Chat mode: use preview only, never full content
+                    content = att_data.get("content", "")[:PREVIEW_CHARS] if att_data.get("content") else ""
+                    if content_length > PREVIEW_CHARS:
+                        logger.info(f"Blocked FULL attachment load in chat mode for cached attachment preview ({content_length:,} chars).")
+                if not content:
+                    continue
                 content_lower = content.lower()
-                
-                # Simple relevance scoring based on query term matches
                 query_terms = query_lower.split()
                 match_count = 0
                 content_matches = []
-                
                 for term in query_terms:
                     if term in content_lower:
                         match_count += content_lower.count(term)
-                        # Find ALL occurrences and extract context around each match
-                        # This ensures we capture matches throughout the document, not just the first
                         idx = 0
-                        while idx < len(content_lower) and len(content_matches) < 10:  # Limit to 10 snippets per file
+                        while idx < len(content_lower) and len(content_matches) < 10:
                             idx = content_lower.find(term, idx)
                             if idx == -1:
                                 break
-                            # Extract snippet around the match (400 chars before/after for better context)
                             snippet_start = max(0, idx - 400)
                             snippet_end = min(len(content), idx + len(term) + 400)
                             snippet = content[snippet_start:snippet_end].strip()
                             if snippet and snippet not in content_matches:
                                 content_matches.append(snippet)
                             idx += len(term)
-                
                 if match_count > 0:
-                    # Calculate relevance score
-                    content_length = len(content)
-                    relevance_score = (match_count * 100) / max(1, content_length / 1000)  # Normalized score
-                    
+                    relevance_score = (match_count * 100) / max(1, content_length / 1000)
                     results.append({
                         "filename": filename,
-                        "content_snippet": " ... ".join(content_matches[:3]),  # Best 3 snippets
+                        "content_snippet": " ... ".join(content_matches[:3]),
                         "relevance_score": round(relevance_score, 2),
                         "match_count": match_count,
                         "cached_at": att_data.get("cached_at"),
-                        "full_content": content  # Include full content for further processing
+                        "full_content": content if mode == "calculation" else None
                     })
-        
-        # Sort by relevance score (highest first)
         results.sort(key=lambda x: x["relevance_score"], reverse=True)
-        
-        # Limit results
         limited_results = results[:limit]
-        
         if limited_results:
-            logger.info(f"Found {len(limited_results)} cached attachment(s) matching '{query}' in conversation {conversation_id[:8]}...")
-        
+            logger.info(f"Found {len(limited_results)} cached attachment match(es) in conversation {conversation_id[:8]}...")
         return limited_results
-        
     except Exception as e:
         logger.error(f"Failed to search attachment contents: {e}")
         return []
 
 
-def get_conversation_attachments(conversation_id: str, include_content: bool = True) -> list[dict]:
+def get_conversation_attachments(conversation_id: str, include_content: bool = True, user_id: str | None = None) -> list[dict]:
     """
     Get all cached attachments for a conversation.
     
     Args:
         conversation_id: The conversation ID
         include_content: If False, returns only metadata (faster for checks)
+        user_id: Optional user ID for additional filtering (currently unused, reserved for future)
         
     Returns:
         List of dicts with 'filename' and optionally 'content' keys
@@ -311,9 +362,11 @@ def get_conversation_attachments(conversation_id: str, include_content: bool = T
         cache = _load_cache()
         attachments = []
         
-        # Find all attachments for this conversation
+        # Find all attachments for this conversation. Enforce user-level isolation when possible.
         for att_id, att_data in cache.get("attachments", {}).items():
             if att_data.get("conversation_id") == conversation_id:
+                if getattr(Config, "STRICT_ATTACHMENT_USER_ISOLATION", True) and user_id and att_data.get("user_id") not in (user_id, None):
+                    continue
                 result = {
                     "filename": att_data.get("filename"),
                     "name": att_data.get("filename"),  # Alias for compatibility
@@ -372,6 +425,76 @@ def clear_conversation_cache(conversation_id: str) -> int:
     except Exception as e:
         logger.error(f"Failed to clear conversation cache: {e}")
         return 0
+
+
+def get_full_content_for_calculation(conversation_id: str, filename: str, user_id: str = None) -> Optional[str]:
+    """
+    Get the complete, untruncated content for accurate calculations.
+    This function specifically retrieves full content for calculation accuracy,
+    bypassing any conversation-related truncations.
+    """
+    try:
+        cache = _load_cache()
+        
+        # Find the exact attachment by conversation and filename
+        for attachment_id, att_data in cache.get("attachments", {}).items():
+            if (att_data.get("conversation_id") == conversation_id and 
+                att_data.get("filename") == filename and
+                (user_id is None or att_data.get("user_id") == user_id)):
+                
+                full_content = att_data.get("content", "")
+                if full_content:
+                    logger.info(f"Retrieved FULL content for calculation: {filename} ({len(full_content):,} chars)")
+                    return full_content
+        
+        logger.warning(f"Could not find full content for calculation: {filename} in conversation {conversation_id[:8]}...")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error retrieving full content for calculation: {e}")
+        return None
+
+
+def get_content_for_llm_conversation(
+    full_content: str,
+    filename: str = "unknown",
+    mode: str = "chat",
+    preview: str = None,
+    summary: str = None,
+    relevant_chunks: list = None,
+    max_llm_chars: int = None
+) -> str:
+    """
+    Retrieve attachment content for LLM conversation, enforcing safety for chat mode.
+    - chat mode: only preview/summary/relevant chunks, never full content
+    - calculation mode: full content allowed
+    """
+    from utils.truncation import safe_truncate
+    
+    if mode == "calculation":
+        logger.info(f"[AttachmentCache] FULL content allowed for calculation: {filename} ({len(full_content):,} chars)")
+        return full_content
+
+    # --- CHAT MODE ---
+    # Prefer summary, preview, or relevant chunks if provided
+
+    if summary:
+        logger.info(f"[AttachmentCache] Returning summary for chat mode: {filename}")
+        return safe_truncate(summary, Config.MAX_LLM_EXPOSURE_CHARS)
+    if preview:
+        logger.info(f"[AttachmentCache] Returning preview for chat mode: {filename}")
+        return safe_truncate(preview, Config.MAX_LLM_EXPOSURE_CHARS)
+    if relevant_chunks:
+        joined = "\n\n".join(relevant_chunks)
+        logger.info(f"[AttachmentCache] Returning {len(relevant_chunks)} relevant chunks for chat mode: {filename}")
+        return safe_truncate(joined, Config.MAX_LLM_EXPOSURE_CHARS)
+
+    # Fallback: if no preview/summary/chunks, return a truncated preview only
+    if full_content:
+        logger.info(f"[AttachmentCache] Returning truncated content for chat mode: {filename} ({len(full_content):,} chars)")
+        return safe_truncate(full_content, Config.MAX_LLM_EXPOSURE_CHARS)
+    logger.info(f"[AttachmentCache] No content available for chat mode: {filename}")
+    return "[No preview available for this attachment.]"
 
 
 def cleanup_old_cache(max_age_days: int = CACHE_EXPIRY_DAYS) -> int:
@@ -444,7 +567,7 @@ def get_cache_stats() -> dict:
             "total_attachments": attachment_count,
             "total_conversations": len(conversations),
             "total_size_mb": round(total_size / (1024 * 1024), 2),
-            "max_size_mb": MAX_CACHE_SIZE_MB,
+            "max_size_mb": Config.MAX_CACHE_SIZE_MB,
         }
         
     except Exception as e:

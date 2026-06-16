@@ -8,6 +8,9 @@ param resourceBaseName string
 param azureOpenaiKey string
 param azureOpenaiModelDeploymentName string
 param azureOpenaiEndpoint string
+param azureOpenaiEmbeddingDeployment string = 'text-embedding-3-small'
+param embeddingDimensions int = 1536
+param appTimezone string = 'UTC'
 
 param webAppSKU string
 param linuxFxVersion string
@@ -27,6 +30,9 @@ param senderUpn string = ''
 @description('Optional: Comma-separated SharePoint site URLs to crawl/search')
 param sharepointSites string = ''
 
+@description('Optional: Toggle SharePoint indexing in the deployed environment')
+param enableSharepointIndexing bool = true
+
 @description('Optional: Comma-separated external web sources to index')
 param externalWebSources string = ''
 
@@ -42,6 +48,7 @@ param azureSearchIndex string
 
 @description('Azure Cognitive Search semantic configuration name')
 param azureSearchSemanticConfig string = 'semantic-config'
+param azureSearchApiVersion string = '2025-09-01'
 
 @description('Graph Client ID for Microsoft Graph API access')
 param graphClientId string = ''
@@ -68,6 +75,9 @@ param llmConcurrency int = 1
 
 @description('Minimum cached score before triggering AI Search')
 param minCachedScoreBeforeAi int = 55
+
+@description('Minimum cached score before triggering Graph fallback')
+param minCachedScoreBeforeGraph int = 30
 
 @description('Max characters per single document included in model input')
 param maxDocContextChars int = 3000
@@ -101,6 +111,37 @@ param maxMemoryTurns int = 8
 
 @description('Min interval (seconds) between streaming chunks')
 param streamChunkInterval string = '0.3'
+param httpTimeout int = 8
+param graphTimeout int = 8
+param cacheLoadTimeout int = 2
+param profileLookupTimeout int = 2
+param userDetailsTimeout int = 1
+param attachmentCheckTimeout int = 1
+param conversationHistoryTimeout int = 1
+param sharepointIndexPollSeconds int = 900
+param sharepointIndexRunOnStartup bool = true
+param sharepointIndexMaxItemsPerRun int = 200
+param sharepointIndexMaxDepth int = 8
+param minSearchResultsBeforeGraph int = 3
+param requireMultiDocumentSearch bool = true
+param maxLlmContextChars int = 10000
+param maxAttachSnippetChars int = 1000
+param maxLlmExposureChars int = 1500
+param maxLlmAttachChars int = 12000
+param maxFileSizeMb int = 10
+param maxContentSizeChars int = 5000000
+param maxExtractedChars int = 200000
+param maxCacheSizeMb int = 500
+param maxMemoryCacheItems int = 100
+param maxConversationAttachments int = 8
+param allowCacheUserInference bool = false
+param disableApisOnAttachments bool = false
+param skipSearchForCachedFollowups bool = true
+param graphAllowAppOnlyFallback bool = true
+param crawlWorkers int = 2
+param summaryDocSnippetChars int = 18000
+param summaryPrimaryDocChars int = 20000
+param summaryTotalContextChars int = 12000
 
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   location: location
@@ -157,6 +198,18 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
           value: azureOpenaiEndpoint
         }
         {
+          name: 'AZURE_OPENAI_EMBEDDING_DEPLOYMENT'
+          value: azureOpenaiEmbeddingDeployment
+        }
+        {
+          name: 'EMBEDDING_DIMENSIONS'
+          value: string(embeddingDimensions)
+        }
+        {
+          name: 'APP_TIMEZONE'
+          value: appTimezone
+        }
+        {
           name: 'TENANT_ID'
           value: identity.properties.tenantId
         }
@@ -173,6 +226,10 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
           value: sharepointSites
         }
         {
+          name: 'ENABLE_SHAREPOINT_INDEXING'
+          value: string(enableSharepointIndexing)
+        }
+        {
           name: 'EXTERNAL_WEB_SOURCES'
           value: externalWebSources
         }
@@ -182,8 +239,20 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
           value: azureSearchEndpoint
         }
         {
+          name: 'AZURE_SEARCH_ADMIN_KEY'
+          value: azureSearchKey
+        }
+        {
+          name: 'AZURE_SEARCH_QUERY_KEY'
+          value: azureSearchKey
+        }
+        {
           name: 'AZURE_SEARCH_KEY'
           value: azureSearchKey
+        }
+        {
+          name: 'AZURE_SEARCH_INDEX_NAME'
+          value: azureSearchIndex
         }
         {
           name: 'AZURE_SEARCH_INDEX'
@@ -192,6 +261,10 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
         {
           name: 'AZURE_SEARCH_SEMANTIC_CONFIG'
           value: azureSearchSemanticConfig
+        }
+        {
+          name: 'AZURE_SEARCH_API_VERSION'
+          value: azureSearchApiVersion
         }
         // Prompt and runtime tunables
         {
@@ -246,6 +319,50 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
           name: 'STREAM_CHUNK_INTERVAL'
           value: streamChunkInterval
         }
+        {
+          name: 'HTTP_TIMEOUT'
+          value: string(httpTimeout)
+        }
+        {
+          name: 'GRAPH_TIMEOUT'
+          value: string(graphTimeout)
+        }
+        {
+          name: 'CACHE_LOAD_TIMEOUT'
+          value: string(cacheLoadTimeout)
+        }
+        {
+          name: 'PROFILE_LOOKUP_TIMEOUT'
+          value: string(profileLookupTimeout)
+        }
+        {
+          name: 'USER_DETAILS_TIMEOUT'
+          value: string(userDetailsTimeout)
+        }
+        {
+          name: 'ATTACHMENT_CHECK_TIMEOUT'
+          value: string(attachmentCheckTimeout)
+        }
+        {
+          name: 'CONVERSATION_HISTORY_TIMEOUT'
+          value: string(conversationHistoryTimeout)
+        }
+        {
+          name: 'SHAREPOINT_INDEX_RUN_ON_STARTUP'
+          value: string(sharepointIndexRunOnStartup)
+        }
+        {
+          name: 'SHAREPOINT_INDEX_POLL_SECONDS'
+          value: string(sharepointIndexPollSeconds)
+        }
+        {
+          name: 'SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN'
+          value: string(sharepointIndexMaxItemsPerRun)
+        }
+        {
+          name: 'SHAREPOINT_INDEX_MAX_DEPTH'
+          value: string(sharepointIndexMaxDepth)
+        }
         // Graph API credentials
         {
           name: 'GRAPH_CLIENT_ID'
@@ -273,6 +390,70 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
           name: 'ALWAYS_CALL_AI_SEARCH'
           value: string(alwaysCallAiSearch)
         }
+        {
+          name: 'MIN_SEARCH_RESULTS_BEFORE_GRAPH'
+          value: string(minSearchResultsBeforeGraph)
+        }
+        {
+          name: 'REQUIRE_MULTI_DOCUMENT_SEARCH'
+          value: string(requireMultiDocumentSearch)
+        }
+        {
+          name: 'MIN_CACHED_SCORE_BEFORE_GRAPH'
+          value: string(minCachedScoreBeforeGraph)
+        }
+        {
+          name: 'MAX_LLM_CONTEXT_CHARS'
+          value: string(maxLlmContextChars)
+        }
+        {
+          name: 'MAX_ATTACH_SNIPPET_CHARS'
+          value: string(maxAttachSnippetChars)
+        }
+        {
+          name: 'MAX_LLM_EXPOSURE_CHARS'
+          value: string(maxLlmExposureChars)
+        }
+        {
+          name: 'MAX_FILE_SIZE_MB'
+          value: string(maxFileSizeMb)
+        }
+        {
+          name: 'MAX_CONTENT_SIZE_CHARS'
+          value: string(maxContentSizeChars)
+        }
+        {
+          name: 'MAX_EXTRACTED_CHARS'
+          value: string(maxExtractedChars)
+        }
+        {
+          name: 'MAX_CACHE_SIZE_MB'
+          value: string(maxCacheSizeMb)
+        }
+        {
+          name: 'MAX_MEMORY_CACHE_ITEMS'
+          value: string(maxMemoryCacheItems)
+        }
+        {
+          name: 'MAX_CONVERSATION_ATTACHMENTS'
+          value: string(maxConversationAttachments)
+        }
+        {
+          name: 'ALLOW_CACHE_USER_INFERENCE'
+          value: string(allowCacheUserInference)
+        }
+        {
+          name: 'DISABLE_APIS_ON_ATTACHMENTS'
+          value: string(disableApisOnAttachments)
+        }
+        {
+          name: 'SKIP_SEARCH_FOR_CACHED_FOLLOWUPS'
+          value: string(skipSearchForCachedFollowups)
+        }
+        {
+          name: 'GRAPH_ALLOW_APP_ONLY_FALLBACK'
+          value: string(graphAllowAppOnlyFallback)
+        }
       ]
       ftpsState: 'FtpsOnly'
     }
@@ -295,6 +476,9 @@ module azureBotRegistration './botRegistration/azurebot.bicep' = {
     identityTenantId: identity.properties.tenantId
     botAppDomain: webApp.properties.defaultHostName
     botDisplayName: botDisplayName
+    graphClientId: graphClientId
+    graphClientSecret: graphClientSecret
+    graphTenantId: !empty(graphClientId) ? (identity.properties.tenantId) : ''
   }
 }
 

@@ -11,7 +11,7 @@ provision:
   - uses: teamsApp/create
     with:
       # app name
-      name: SwopeAI${{APP_NAME_SUFFIX}}
+      name: Armely AI
     # Write the information of created resources into environment file for
     # the specified environment variable(s).
     writeToEnvironmentFile:
@@ -21,7 +21,7 @@ provision:
   - uses: aadApp/create
     with:
       # The Microsoft Entra application's display name
-      name: SwopeAI${{APP_NAME_SUFFIX}}
+      name: Armely AI
       generateClientSecret: true
       generateServicePrincipal: true
       signInAudience: AzureADMultipleOrgs
@@ -32,6 +32,24 @@ provision:
       clientSecret: SECRET_BOT_PASSWORD
       # The Microsoft Entra application's object id created for bot.
       objectId: BOT_OBJECT_ID
+
+  # Deploy Azure resources (App Service, etc.) - MUST run before aadApp/update to create BOT_DOMAIN
+  - uses: arm/deploy
+    with:
+      subscriptionId: ${{AZURE_SUBSCRIPTION_ID}}
+      resourceGroupName: ${{AZURE_RESOURCE_GROUP_NAME}}
+      templates:
+        - path: ./infra/azure.bicep
+          parameters: ./infra/azure.parameters.json
+          deploymentName: Create-resources-for-bot
+      bicepCliVersion: v0.9.1
+
+  # Configure Entra app for SSO (expose API + Graph permissions for delegated access)
+  # MOVED AFTER arm/deploy so BOT_DOMAIN is available
+  - uses: aadApp/update
+    with:
+      manifestPath: ./aad.manifest.json
+      outputFilePath: ./build/aad.manifest.${{TEAMSFX_ENV}}.json
 
   # Validate using manifest schema
   - uses: teamsApp/validateManifest
@@ -71,17 +89,69 @@ deploy:
         CLIENT_ID: ${{BOT_ID}}
         CLIENT_SECRET: ${{SECRET_BOT_PASSWORD}}
         TENANT_ID: ${{TEAMS_APP_TENANT_ID}}
+        GRAPH_TENANT_ID: ${{TEAMS_APP_TENANT_ID}}
         AZURE_OPENAI_API_KEY: ${{SECRET_AZURE_OPENAI_API_KEY}}
         AZURE_OPENAI_MODEL_DEPLOYMENT_NAME: ${{AZURE_OPENAI_MODEL_DEPLOYMENT_NAME}}
         AZURE_OPENAI_ENDPOINT: ${{AZURE_OPENAI_ENDPOINT}}
+        AZURE_OPENAI_EMBEDDING_DEPLOYMENT: ${{AZURE_OPENAI_EMBEDDING_DEPLOYMENT}}
+        EMBEDDING_DIMENSIONS: ${{EMBEDDING_DIMENSIONS}}
+        APP_TIMEZONE: UTC
         AZURE_SEARCH_ENDPOINT: ${{AZURE_SEARCH_ENDPOINT}}
-        AZURE_SEARCH_KEY: ${{AZURE_SEARCH_KEY}}
-        AZURE_SEARCH_INDEX: ${{AZURE_SEARCH_INDEX}}
+        AZURE_SEARCH_ADMIN_KEY: ${{AZURE_SEARCH_ADMIN_KEY}}
+        AZURE_SEARCH_QUERY_KEY: ${{AZURE_SEARCH_QUERY_KEY}}
+        AZURE_SEARCH_KEY: ${{AZURE_SEARCH_ADMIN_KEY}}
+        AZURE_SEARCH_INDEX_NAME: ${{AZURE_SEARCH_INDEX_NAME}}
+        AZURE_SEARCH_INDEX: ${{AZURE_SEARCH_INDEX_NAME}}
         AZURE_SEARCH_SEMANTIC_CONFIG: ${{AZURE_SEARCH_SEMANTIC_CONFIG}}
+        AZURE_SEARCH_API_VERSION: ${{AZURE_SEARCH_API_VERSION}}
         GRAPH_CLIENT_ID: ${{GRAPH_CLIENT_ID}}
         GRAPH_CLIENT_SECRET: ${{GRAPH_CLIENT_SECRET}}
         SHAREPOINT_SITES: ${{SHAREPOINT_SITES}}
         EXTERNAL_WEB_SOURCES: ${{EXTERNAL_WEB_SOURCES}}
+        ENABLE_SHAREPOINT_INDEXING: ${{ENABLE_SHAREPOINT_INDEXING}}
+        SHAREPOINT_INDEX_RUN_ON_STARTUP: ${{SHAREPOINT_INDEX_RUN_ON_STARTUP}}
+        SHAREPOINT_INDEX_POLL_SECONDS: ${{SHAREPOINT_INDEX_POLL_SECONDS}}
+        SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN: ${{SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN}}
+        SHAREPOINT_INDEX_MAX_DEPTH: ${{SHAREPOINT_INDEX_MAX_DEPTH}}
+        HTTP_TIMEOUT: ${{HTTP_TIMEOUT}}
+        GRAPH_TIMEOUT: ${{GRAPH_TIMEOUT}}
+        CACHE_LOAD_TIMEOUT: ${{CACHE_LOAD_TIMEOUT}}
+        PROFILE_LOOKUP_TIMEOUT: ${{PROFILE_LOOKUP_TIMEOUT}}
+        USER_DETAILS_TIMEOUT: ${{USER_DETAILS_TIMEOUT}}
+        ATTACHMENT_CHECK_TIMEOUT: ${{ATTACHMENT_CHECK_TIMEOUT}}
+        CONVERSATION_HISTORY_TIMEOUT: ${{CONVERSATION_HISTORY_TIMEOUT}}
+        RETRY_MAX_RETRIES: ${{RETRY_MAX_RETRIES}}
+        RETRY_BASE_DELAY: ${{RETRY_BASE_DELAY}}
+        RETRY_MAX_DELAY: ${{RETRY_MAX_DELAY}}
+        LLM_CONCURRENCY: ${{LLM_CONCURRENCY}}
+        STREAM_CHUNK_INTERVAL: ${{STREAM_CHUNK_INTERVAL}}
+        MAX_DOC_CONTEXT_CHARS: ${{MAX_DOC_CONTEXT_CHARS}}
+        MAX_TOTAL_CONTEXT_CHARS: ${{MAX_TOTAL_CONTEXT_CHARS}}
+        MAX_PROMPT_TOKENS_APPROX: ${{MAX_PROMPT_TOKENS_APPROX}}
+        MAX_COMPLETION_TOKENS: ${{MAX_COMPLETION_TOKENS}}
+        MAX_PROMPT_CHARS: ${{MAX_PROMPT_CHARS}}
+        MAX_DOCS: ${{MAX_DOCS}}
+        MAX_SNIPPET_CHARS: ${{MAX_SNIPPET_CHARS}}
+        MAX_ATTACH_CHARS: ${{MAX_ATTACH_CHARS}}
+        MAX_LLM_ATTACH_CHARS: ${{MAX_LLM_ATTACH_CHARS}}
+        MAX_MEMORY_TURNS: ${{MAX_MEMORY_TURNS}}
+        MIN_CACHED_SCORE_BEFORE_AI: ${{MIN_CACHED_SCORE_BEFORE_AI}}
+        MIN_CACHED_SCORE_BEFORE_GRAPH: ${{MIN_CACHED_SCORE_BEFORE_GRAPH}}
+        MIN_SEARCH_RESULTS_BEFORE_GRAPH: ${{MIN_SEARCH_RESULTS_BEFORE_GRAPH}}
+        REQUIRE_MULTI_DOCUMENT_SEARCH: ${{REQUIRE_MULTI_DOCUMENT_SEARCH}}
+        MAX_LLM_CONTEXT_CHARS: ${{MAX_LLM_CONTEXT_CHARS}}
+        MAX_ATTACH_SNIPPET_CHARS: ${{MAX_ATTACH_SNIPPET_CHARS}}
+        MAX_LLM_EXPOSURE_CHARS: ${{MAX_LLM_EXPOSURE_CHARS}}
+        MAX_FILE_SIZE_MB: ${{MAX_FILE_SIZE_MB}}
+        MAX_CONTENT_SIZE_CHARS: ${{MAX_CONTENT_SIZE_CHARS}}
+        MAX_EXTRACTED_CHARS: ${{MAX_EXTRACTED_CHARS}}
+        MAX_CACHE_SIZE_MB: ${{MAX_CACHE_SIZE_MB}}
+        MAX_MEMORY_CACHE_ITEMS: ${{MAX_MEMORY_CACHE_ITEMS}}
+        MAX_CONVERSATION_ATTACHMENTS: ${{MAX_CONVERSATION_ATTACHMENTS}}
+        ALLOW_CACHE_USER_INFERENCE: ${{ALLOW_CACHE_USER_INFERENCE}}
+        DISABLE_APIS_ON_ATTACHMENTS: ${{DISABLE_APIS_ON_ATTACHMENTS}}
+        SKIP_SEARCH_FOR_CACHED_FOLLOWUPS: ${{SKIP_SEARCH_FOR_CACHED_FOLLOWUPS}}
+        GRAPH_ALLOW_APP_ONLY_FALLBACK: ${{GRAPH_ALLOW_APP_ONLY_FALLBACK}}
 
   # Deploy your application to Azure App Service using the zip deploy feature.
   # For additional details, refer to https://aka.ms/zip-deploy-to-app-services.

@@ -14,17 +14,26 @@
     "azureOpenaiEndpoint" : {
       "value": "${{AZURE_OPENAI_ENDPOINT}}"
     },
+    "azureOpenaiEmbeddingDeployment": {
+      "value": "${{AZURE_OPENAI_EMBEDDING_DEPLOYMENT}}"
+    },
+    "embeddingDimensions": {
+      "value": ${{EMBEDDING_DIMENSIONS}}
+    },
     "azureSearchEndpoint": {
       "value": "${{AZURE_SEARCH_ENDPOINT}}"
     },
     "azureSearchKey": {
-      "value": "${{AZURE_SEARCH_KEY}}"
+      "value": "${{AZURE_SEARCH_ADMIN_KEY}}"
     },
     "azureSearchIndex": {
-      "value": "${{AZURE_SEARCH_INDEX}}"
+      "value": "${{AZURE_SEARCH_INDEX_NAME}}"
     },
     "azureSearchSemanticConfig": {
       "value": "${{AZURE_SEARCH_SEMANTIC_CONFIG}}"
+    },
+    "azureSearchApiVersion": {
+      "value": "${{AZURE_SEARCH_API_VERSION}}"
     },
     "graphClientId": {
       "value": "${{GRAPH_CLIENT_ID}}"
@@ -43,6 +52,24 @@
     },
     "alwaysCallAiSearch": {
       "value": ${{ALWAYS_CALL_AI_SEARCH}}
+    },
+    "sharepointSites": {
+      "value": "${{SHAREPOINT_SITES}}"
+    },
+    "enableSharepointIndexing": {
+      "value": ${{ENABLE_SHAREPOINT_INDEXING}}
+    },
+    "sharepointIndexRunOnStartup": {
+      "value": ${{SHAREPOINT_INDEX_RUN_ON_STARTUP}}
+    },
+    "sharepointIndexPollSeconds": {
+      "value": ${{SHAREPOINT_INDEX_POLL_SECONDS}}
+    },
+    "sharepointIndexMaxItemsPerRun": {
+      "value": ${{SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN}}
+    },
+    "sharepointIndexMaxDepth": {
+      "value": ${{SHAREPOINT_INDEX_MAX_DEPTH}}
     },
     "llmConcurrency": {
       "value": ${{LLM_CONCURRENCY}}
@@ -84,10 +111,10 @@
       "value": "${{STREAM_CHUNK_INTERVAL}}"
     },
     "webAppSKU": {
-      "value": "B3"
+      "value": "S1"
     },
     "botDisplayName": {
-      "value": "SwopeAI"
+      "value": "Armely AI"
     },
     "linuxFxVersion": {
       "value": "PYTHON|3.12"
