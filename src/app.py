@@ -3975,6 +3975,7 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
                     search_query,
                     user_email or None,
                     top_k,
+                    aad_id,
                 )
                 logger.info(
                     "AI SEARCH TOTAL | query='%s' | seconds=%.2f | results=%s | source=app_block",

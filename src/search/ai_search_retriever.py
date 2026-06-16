@@ -213,20 +213,65 @@ def _run_search(client, *, query: str, top: int, filter_expr: str, vector_querie
     return results
 
 
-def search_ai_index(query: str, top: int = 8) -> list[dict]:
+def _odata_escape(value: str) -> str:
+    return str(value or "").replace("'", "''")
+
+
+def _build_security_filter(user_id: str, group_ids: list[str]) -> str:
+    """OData filter: chunks where acl_everyone, or the user is in acl_users, or one
+    of the user's groups is in acl_groups."""
+    clauses = [
+        "acl_everyone eq true",
+        f"acl_users/any(u: u eq '{_odata_escape(user_id)}')",
+    ]
+    for gid in group_ids:
+        clauses.append(f"acl_groups/any(g: g eq '{_odata_escape(gid)}')")
+    return " or ".join(f"({c})" for c in clauses)
+
+
+def _resolve_user_group_ids(user_id: str) -> list[str]:
+    """User's AAD group ids, via a 5-minute session cache. Fail closed (no groups)
+    on Graph error so users never see more than they should."""
+    from storage.user_permission_cache import user_permission_cache
+
+    cached = user_permission_cache.get(user_id)
+    if cached is not None:
+        return cached
+    try:
+        from sharepoint.graph_client import get_user_transitive_groups
+
+        group_ids = get_user_transitive_groups(user_id)
+    except Exception as exc:
+        logger.warning("Group membership fetch failed for %s: %s. Defaulting to no groups (fail closed).", user_id, exc)
+        group_ids = []
+    user_permission_cache.set(user_id, group_ids)
+    return group_ids
+
+
+def search_ai_index(query: str, top: int = 8, user_id: str | None = None) -> list[dict]:
     query = (query or "").strip()
     if not query:
         return []
 
     started_at = time.perf_counter()
     client = get_search_client()
+
+    # Phase 2: per-user security trimming. When enabled and we know the requesting
+    # user's AAD object id, restrict results to documents they may access.
     filter_expr = ""
+    trimming = bool(Config.ENABLE_SECURITY_TRIMMING and user_id)
+    group_ids: list[str] = []
+    if trimming:
+        group_ids = _resolve_user_group_ids(user_id)
+        filter_expr = _build_security_filter(user_id, group_ids)
+
     logger.info(
-        "AI SEARCH QUERY | query=%r | index=%s | top=%s | semantic_config=%s",
+        "AI SEARCH QUERY | query=%r | index=%s | top=%s | semantic_config=%s | trimming=%s",
         query,
         Config.AZURE_SEARCH_INDEX_NAME,
         top,
         Config.AZURE_SEARCH_SEMANTIC_CONFIG,
+        trimming,
     )
 
     try:
@@ -257,7 +302,7 @@ def search_ai_index(query: str, top: int = 8) -> list[dict]:
 
     rows = client.search(
         search_text=query,
-        filter=filter_expr,
+        filter=filter_expr or None,
         top=top,
         search_fields=["content", "summary", "title", "file_name", "folder_path"],
         select=SELECT_FIELDS,
@@ -276,6 +321,12 @@ def search_ai_index(query: str, top: int = 8) -> list[dict]:
     if results:
         logger.info("AI SEARCH TOTAL | query=%r | seconds=%.2f | results=%s", query, time.perf_counter() - started_at, len(results))
         return results
+
+    # The live Graph fallback is NOT ACL-filtered, so skip it when security trimming
+    # is active — surfacing it would bypass per-user permissions (fail closed).
+    if trimming:
+        logger.info("AI Search returned no results; live Graph fallback skipped under security trimming")
+        return []
 
     logger.info("AI Search returned no results; falling back to live Graph search for %r", query)
     try:
@@ -307,8 +358,8 @@ def search_ai_index(query: str, top: int = 8) -> list[dict]:
         return []
 
 
-def search_sharepoint_chunks(query: str, user_email: str | None = None, top: int = 8) -> list[dict]:
-    return search_ai_index(query, top=top)
+def search_sharepoint_chunks(query: str, user_email: str | None = None, top: int = 8, user_id: str | None = None) -> list[dict]:
+    return search_ai_index(query, top=top, user_id=user_id)
 
 
 def list_indexed_documents(limit: int = 50) -> list[dict]:
