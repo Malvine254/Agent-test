@@ -195,7 +195,14 @@ def decide_route(user_text: str, context: dict[str, Any] | None = None) -> Route
     if looks_organizational(normalized) or explicit_new_search or compare_to_org:
         return RouteDecision("search_ai_index", True, build_search_query(text, context), "organizational/document question")
 
-    if normalized.startswith(GENERAL_KNOWLEDGE_STARTS):
-        return RouteDecision("answer_direct", False, "", "general knowledge")
-
-    return RouteDecision("answer_direct", False, "", "non-organizational direct answer")
+    # Default: any substantive, non-social, non-attachment, non-followup turn searches
+    # the organizational index. For a SharePoint assistant retrieval is the safe
+    # default — answering from model general knowledge yields empty, unsourced replies
+    # for organizational content. Confirmed small talk / disabled-source / follow-up /
+    # attachment turns are already handled by the branches above.
+    return RouteDecision(
+        "search_ai_index",
+        True,
+        build_search_query(text, context),
+        "default: substantive input searches the index",
+    )
