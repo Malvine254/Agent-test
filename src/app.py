@@ -2723,35 +2723,34 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
         return False
 
     def _is_org_or_document_request(text: str) -> bool:
-        """Decide when SharePoint/document retrieval is actually needed."""
-        t = text.lower().strip()
+        """Default to organizational/document retrieval for any substantive turn.
+
+        For a SharePoint-backed assistant the safe default is to search: answering
+        organizational questions from the model's general knowledge produces empty,
+        unsourced replies. We therefore SEARCH unless the message is confirmed small
+        talk, a greeting/acknowledgement, or a trivially short non-question input.
+
+        Follow-ups ("tell me more about it", "summarize that") are intentionally NOT
+        skipped here — they are handled by the previous-document / refine gates in the
+        routing tree below, which run before the search branch.
+        """
+        t = (text or "").strip().lower()
         if not t:
             return False
-        if is_small_talk(t):
+        if is_small_talk(t) or is_smalltalk(t):
             return False
-
-        org_markers = (
-            "swope", "sharepoint", "policy", "procedure", "handbook", "benefit",
-            "department", "staff", "employee", "clinic", "service line", "internal",
-            "company", "organization", "our ", "we ", "us ", "manager", "hr",
-            "document", "file", "pdf", "docx", "spreadsheet", "report", "specification",
-            " llc", " inc", " corp", " corporation", " ltd", "vendor", "client",
-            "customer",
-            "according to", "based on the document", "from the document", "in the document",
-            "search", "find", "look up", "retrieve", "show me the",
+        # Greetings / acknowledgements / emoji-only / ultra-short inputs never search.
+        small_talk_only = (
+            r"^(hi|hello|hey|yo|hiya|good\s?(morning|afternoon|evening|day)|"
+            r"thanks?|thank you|thx|ty|cheers|bye|goodbye|see ya|"
+            r"ok|okay|kk|sure|fine|cool|great|nice|yes|yeah|yep|yup|no|nope|nah|"
+            r"lol|haha|hehe|hmm|oh|ah)[\s!.?]*$"
         )
-        if any(m in t for m in org_markers):
-            return True
-
-        # Follow-up references should use previous context, not new SharePoint search.
-        followup_refs = (
-            "that", "this", "it", "the document", "the file", "above", "previous",
-            "what is it about", "what is the document about", "summarize it",
-        )
-        if any(f in t for f in followup_refs) and (_prev_sources or _recent_history):
+        if re.match(small_talk_only, t, re.IGNORECASE):
             return False
-
-        return False
+        if len(t) <= 2:  # stray single chars / lone emoji
+            return False
+        return True  # default: substantive input searches the index
 
     def _is_previous_document_followup(text: str) -> bool:
         """Detect follow-ups that should reuse the last document context."""
