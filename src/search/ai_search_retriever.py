@@ -10,6 +10,9 @@ from search.ai_search_client import get_search_client
 from search.embeddings import embed_text
 
 logger = logging.getLogger(__name__)
+# Dedicated audit channel — who asked what and which security filter was applied.
+# Routed separately (e.g. to App Insights/Log Analytics) without debug noise.
+audit_logger = logging.getLogger("audit")
 
 SELECT_FIELDS = [
     "id",
@@ -359,7 +362,21 @@ def search_ai_index(query: str, top: int = 8, user_id: str | None = None) -> lis
 
 
 def search_sharepoint_chunks(query: str, user_email: str | None = None, top: int = 8, user_id: str | None = None) -> list[dict]:
-    return search_ai_index(query, top=top, user_id=user_id)
+    results = search_ai_index(query, top=top, user_id=user_id)
+    # Audit trace: which security filter was applied and how many results came back.
+    trimming = bool(Config.ENABLE_SECURITY_TRIMMING and user_id)
+    group_ids = _resolve_user_group_ids(user_id) if trimming else []  # cached — no extra Graph call
+    filter_expr = _build_security_filter(user_id, group_ids) if trimming else ""
+    audit_logger.info(
+        "RETRIEVAL | user=%s | security_trimming=%s | group_count=%d | filter=%s | results=%d | query=%s",
+        user_id or "anon",
+        trimming,
+        len(group_ids),
+        filter_expr[:120] if filter_expr else "none",
+        len(results),
+        (query or "")[:80],
+    )
+    return results
 
 
 def list_indexed_documents(limit: int = 50) -> list[dict]:
