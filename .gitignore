@@ -36,6 +36,11 @@ env/backup.*
 *.backup
 backup*
 
+# Archives and credential docs that may contain secrets — never commit
+*.zip
+BOT_REGISTRATIONS.md
+get_bot_secret.ps1
+
 # others
 .deployment/
 node_modules/
