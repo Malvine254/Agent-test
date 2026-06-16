@@ -189,6 +189,10 @@ class Config:
 
     # Safety: don't infer user identity from document cache unless explicitly enabled
     ALLOW_CACHE_USER_INFERENCE = os.environ.get("ALLOW_CACHE_USER_INFERENCE", "false").strip().lower() in ("1", "true", "yes")
+    # Per-user security trimming: when enabled, the indexer captures SharePoint ACLs and
+    # every AI Search query is filtered to documents the requesting user may access.
+    # Default OFF so the working bot is unaffected until the feature is verified.
+    ENABLE_SECURITY_TRIMMING = os.environ.get("ENABLE_SECURITY_TRIMMING", "false").strip().lower() in ("1", "true", "yes")
     # Disable external APIs (AI Search & Graph) when attachments are present
     DISABLE_APIS_ON_ATTACHMENTS = os.environ.get("DISABLE_APIS_ON_ATTACHMENTS", "false").strip().lower() in ("1", "true", "yes")
     
