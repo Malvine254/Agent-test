@@ -3396,6 +3396,19 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
         except Exception as list_cache_err:
             logger.warning("Failed to list cached document titles: %s", list_cache_err)
 
+        # Primary source: enumerate distinct documents from the Azure AI Search index.
+        # The legacy cache above is empty in the current AI-Search-based design, so this
+        # is what makes "what documents do you have" actually return real titles.
+        if len(titles) < limit:
+            try:
+                from search.ai_search_retriever import list_indexed_documents
+                indexed_docs = await asyncio.to_thread(list_indexed_documents, max(limit, 50))
+                for d in indexed_docs:
+                    _add_title(d.get("title"), d.get("url"), "ai_search")
+                logger.info("Document title list: after AI Search index=%s title(s)", len(titles))
+            except Exception as idx_list_err:
+                logger.warning("Failed to list AI Search index titles: %s", idx_list_err)
+
         if len(titles) < limit and Config.ENABLE_SHAREPOINT_SEARCH:
             try:
                 site_urls = (
@@ -3449,9 +3462,9 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
                 "last_end_index": next_index,
             }
             lines = [f"{idx}. **{item['name']}**" for idx, item in enumerate(selected, start_index + 1)]
-            source_note = "cached SharePoint documents"
+            source_note = "the indexed SharePoint documents"
             if any(item.get("source") == "sharepoint" for item in selected):
-                source_note = "cached and live SharePoint documents"
+                source_note = "indexed and live SharePoint documents"
             more_note = (
                 f"\n\nShowing {start_index + 1}-{next_index} of {len(titles)}. Say **show more** for the next {min(limit, max(0, len(titles) - next_index))}."
                 if next_index < len(titles)
@@ -3470,7 +3483,7 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
             await ctx.send(
                 MessageActivityInput(
                     text=(
-                        "I checked the cached SharePoint documents and live SharePoint listing, "
+                        "I checked the Azure AI Search index of SharePoint documents, "
                         "but I could not find any available document titles."
                     )
                 ).add_ai_generated()

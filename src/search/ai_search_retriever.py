@@ -309,3 +309,47 @@ def search_ai_index(query: str, top: int = 8) -> list[dict]:
 
 def search_sharepoint_chunks(query: str, user_email: str | None = None, top: int = 8) -> list[dict]:
     return search_ai_index(query, top=top)
+
+
+def list_indexed_documents(limit: int = 50) -> list[dict]:
+    """Return distinct indexed documents (one row per document, newest first).
+
+    The index stores one row per chunk, so we dedupe by source_url/title. Used by
+    the "what documents do you have" listing path so it reflects what is actually
+    searchable in Azure AI Search instead of the legacy (empty) document cache.
+    """
+    client = get_search_client()
+    seen: set[str] = set()
+    docs: list[dict] = []
+    try:
+        rows = client.search(
+            search_text="*",
+            select=["title", "file_name", "source_url", "site_id", "last_modified"],
+            order_by=["last_modified desc"],
+            top=1000,
+        )
+    except Exception as exc:
+        logger.warning("list_indexed_documents failed: %s", exc)
+        return []
+
+    for row in rows:
+        row = dict(row)
+        url = _first_non_empty(row.get("source_url"))
+        title = _first_non_empty(row.get("title"), row.get("file_name"))
+        if not title:
+            continue
+        key = (url or title).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        docs.append(
+            {
+                "title": title,
+                "url": url,
+                "site_id": _first_non_empty(row.get("site_id")),
+                "last_modified": row.get("last_modified"),
+            }
+        )
+        if len(docs) >= limit:
+            break
+    return docs
