@@ -15,6 +15,7 @@ from search.ai_search_client import (
 from search.ai_search_index import ensure_sharepoint_index
 from search.chunking import chunk_document
 from search.embeddings import embed_text
+from sharepoint.graph_client import clear_permission_cache, get_item_permissions, get_library_permissions
 from sharepoint.sharepoint_reader import download_sharepoint_document, extract_document_text, list_sharepoint_documents
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,20 @@ def index_sharepoint_document(item: dict) -> dict:
                 }
             delete_documents_by_source_url(source_url)
 
+    # Phase 2: capture SharePoint ACLs for query-time security trimming. Fail closed
+    # (no grant) if permission resolution errors, so the doc stays hidden until a
+    # later run resolves it correctly.
+    acl = {"acl_users": [], "acl_groups": [], "acl_everyone": False}
+    if Config.ENABLE_SECURITY_TRIMMING:
+        try:
+            resolved = get_item_permissions(item.get("site_id", ""), item.get("drive_id", ""), item.get("id", ""))
+            if resolved is None:
+                resolved = get_library_permissions(item.get("site_id", ""), item.get("drive_id", ""))
+            acl = resolved
+        except Exception as acl_err:
+            logger.warning("ACL fetch failed for %s: %s — failing closed (no access)", file_name, acl_err)
+            acl = {"acl_users": [], "acl_groups": [], "acl_everyone": False}
+
     now = datetime.now(timezone.utc).isoformat()
     chunks = []
     for chunk in chunk_document(content):
@@ -92,8 +107,9 @@ def index_sharepoint_document(item: dict) -> dict:
                 "summary": chunk.get("summary", ""),
                 "source_type": "sharepoint",
                 "checksum": checksum,
-                "acl_users": [],
-                "acl_groups": [],
+                "acl_users": acl["acl_users"],
+                "acl_groups": acl["acl_groups"],
+                "acl_everyone": acl["acl_everyone"],
             }
         )
     upsert_document_chunks(document_id, chunks)
@@ -102,6 +118,7 @@ def index_sharepoint_document(item: dict) -> dict:
 
 def index_all_sharepoint_documents() -> dict:
     ensure_sharepoint_index()
+    clear_permission_cache()  # fresh per-run ACL cache
     summary = {"indexed_documents": 0, "indexed_chunks": 0, "skipped_documents": 0, "failed_documents": 0}
     logger.info(
         "INDEXING RUN STARTED | index=%s | max_items=%s | max_depth=%s",

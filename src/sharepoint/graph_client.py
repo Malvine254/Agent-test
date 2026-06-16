@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -92,3 +93,97 @@ def download_file_bytes(drive_id: str, item_id: str) -> bytes:
     response = requests.get(url, headers={"Authorization": f"Bearer {get_graph_access_token()}"}, timeout=Config.GRAPH_TIMEOUT)
     response.raise_for_status()
     return response.content
+
+
+# ---------------------------------------------------------------------------
+# Security trimming: capture SharePoint ACLs at index time (Phase 2.2)
+# ---------------------------------------------------------------------------
+# Per-indexing-run cache so we don't re-fetch library permissions for every
+# file. Cleared at the start of each run via clear_permission_cache().
+_PERMISSION_CACHE: dict[str, dict] = {}
+
+_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def clear_permission_cache() -> None:
+    """Reset the per-run permission cache. Call at the start of an indexing run."""
+    _PERMISSION_CACHE.clear()
+
+
+def _is_guid(value: Any) -> bool:
+    return isinstance(value, str) and bool(_GUID_RE.match(value.strip()))
+
+
+def _extract_identity(identity: dict, acl_users: set, acl_groups: set) -> None:
+    """Pull AAD object ids out of a grantedTo* identity set.
+
+    Only AAD GUIDs are usable for query-time trimming (they match a user's
+    transitiveMemberOf). SharePoint siteGroup/sharePointGroup/siteUser ids are
+    numeric/site-local and are intentionally skipped (logged by the caller).
+    """
+    if not isinstance(identity, dict):
+        return
+    user = identity.get("user") or {}
+    group = identity.get("group") or {}
+    if _is_guid(user.get("id")):
+        acl_users.add(user["id"])
+    if _is_guid(group.get("id")):
+        acl_groups.add(group["id"])
+
+
+def _parse_permissions(permissions: list[dict]) -> dict:
+    """Parse a Graph /permissions response into {acl_users, acl_groups, acl_everyone}."""
+    acl_users: set = set()
+    acl_groups: set = set()
+    acl_everyone = False
+    unresolved_site_groups = 0
+
+    for perm in permissions or []:
+        link = perm.get("link") or {}
+        if link.get("scope") in ("anonymous", "organization"):
+            acl_everyone = True
+
+        _extract_identity(perm.get("grantedToV2") or {}, acl_users, acl_groups)
+        for identity in perm.get("grantedToIdentitiesV2") or []:
+            _extract_identity(identity, acl_users, acl_groups)
+
+        # Track SharePoint-only groups that carry no AAD id (classic sites). These
+        # cannot be matched at query time; they fail closed (no grant captured).
+        granted = perm.get("grantedToV2") or {}
+        if (granted.get("siteGroup") or granted.get("sharePointGroup")) and not _is_guid((granted.get("group") or {}).get("id")):
+            unresolved_site_groups += 1
+
+    if unresolved_site_groups:
+        logger.debug(
+            "Permission parse: %s SharePoint group grant(s) had no AAD id and were skipped (fail closed)",
+            unresolved_site_groups,
+        )
+
+    return {"acl_users": sorted(acl_users), "acl_groups": sorted(acl_groups), "acl_everyone": acl_everyone}
+
+
+def get_library_permissions(site_id: str, drive_id: str) -> dict:
+    """Permissions for the document library root, cached per run."""
+    cache_key = f"lib:{site_id}:{drive_id}"
+    cached = _PERMISSION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    data = graph_get(f"/sites/{site_id}/drives/{drive_id}/root/permissions")
+    parsed = _parse_permissions(data.get("value", []))
+    _PERMISSION_CACHE[cache_key] = parsed
+    return parsed
+
+
+def get_item_permissions(site_id: str, drive_id: str, item_id: str) -> dict | None:
+    """Item-level permissions, or None if the item fully inherits from its parent.
+
+    When None is returned the caller should fall back to get_library_permissions().
+    """
+    data = graph_get(f"/drives/{drive_id}/items/{item_id}/permissions")
+    permissions = data.get("value", [])
+    # A permission entry with a non-empty inheritedFrom is inherited; an entry with
+    # absent/empty inheritedFrom is unique to this item.
+    has_unique = any(not p.get("inheritedFrom") for p in permissions)
+    if not has_unique:
+        return None
+    return _parse_permissions(permissions)
