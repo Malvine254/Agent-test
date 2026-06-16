@@ -81,6 +81,11 @@ class Config:
     AZURE_SEARCH_API_VERSION = os.environ.get("AZURE_SEARCH_API_VERSION", "2025-09-01")
     AZURE_SEARCH_SEMANTIC_CONFIG = os.environ.get("AZURE_SEARCH_SEMANTIC_CONFIG", "default-semantic-config")
     RECREATE_SEARCH_INDEX = os.environ.get("RECREATE_SEARCH_INDEX", "false").strip().lower() in ("1", "true", "yes")
+    # One-shot: reprocess every SharePoint document on the next indexing run regardless
+    # of checksum. Used to backfill ACLs after enabling security trimming. Turn off again
+    # once the backfill run completes. Checksums live in the index, so this is the
+    # equivalent of "clearing the checksum cache".
+    SHAREPOINT_FORCE_REINDEX = os.environ.get("SHAREPOINT_FORCE_REINDEX", "false").strip().lower() in ("1", "true", "yes")
     SHAREPOINT_INDEX_POLL_SECONDS = int(os.environ.get("SHAREPOINT_INDEX_POLL_SECONDS", "900"))
     SHAREPOINT_INDEX_RUN_ON_STARTUP = os.environ.get("SHAREPOINT_INDEX_RUN_ON_STARTUP", "true").strip().lower() in ("1", "true", "yes")
     SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN = int(os.environ.get("SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN", "200"))

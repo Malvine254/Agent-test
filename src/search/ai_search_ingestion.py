@@ -30,6 +30,8 @@ def calculate_checksum(content: str) -> str:
 
 
 def should_reindex(item: dict, existing_metadata: dict | None) -> bool:
+    if Config.SHAREPOINT_FORCE_REINDEX:
+        return True  # one-shot full backfill (e.g. to populate ACLs)
     if not existing_metadata:
         return True
     return item.get("checksum") != existing_metadata.get("checksum")
