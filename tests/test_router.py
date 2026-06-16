@@ -12,10 +12,14 @@ def test_hi_answers_direct():
     assert route.source_required is False
 
 
-def test_general_knowledge_answers_direct():
+def test_substantive_input_searches_by_default():
+    # Phase 1: the router defaults to retrieval for any substantive, non-small-talk
+    # input. Previously "what is machine learning" answered direct; now it searches
+    # the index and the grounding guard handles the empty-result case. This is the
+    # safe default for a SharePoint assistant.
     route = decide_route("what is machine learning", {})
-    assert route.action == "answer_direct"
-    assert route.source_required is False
+    assert route.action == "search_ai_index"
+    assert route.source_required is True
 
 
 def test_vacation_policy_searches_documents():
