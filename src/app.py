@@ -5856,6 +5856,10 @@ async def startup():
         logger.info(f"Configured CLIENT_ID: {config.APP_ID or 'not set'}")
         logger.info(f"Configured SENDER_UPN: {config.SENDER_UPN or 'not set'}")
         logger.info("Token strategy: app-only client credentials (delegated tokens disabled)")
+        logger.info(
+            "Effective SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN: %s (too low silently leaves later docs unindexed)",
+            config.SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN,
+        )
     except Exception:
         pass
     

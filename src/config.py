@@ -88,7 +88,10 @@ class Config:
     SHAREPOINT_FORCE_REINDEX = os.environ.get("SHAREPOINT_FORCE_REINDEX", "false").strip().lower() in ("1", "true", "yes")
     SHAREPOINT_INDEX_POLL_SECONDS = int(os.environ.get("SHAREPOINT_INDEX_POLL_SECONDS", "900"))
     SHAREPOINT_INDEX_RUN_ON_STARTUP = os.environ.get("SHAREPOINT_INDEX_RUN_ON_STARTUP", "true").strip().lower() in ("1", "true", "yes")
-    SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN = int(os.environ.get("SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN", "200"))
+    # Max documents discovered+indexed per run. Default must be high enough to cover
+    # the whole corpus: if it is too low, later documents are never indexed, and with
+    # security trimming on those unindexed chunks are hidden from everyone.
+    SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN = int(os.environ.get("SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN", "2000"))
     SHAREPOINT_INDEX_MAX_DEPTH = int(os.environ.get("SHAREPOINT_INDEX_MAX_DEPTH", "8"))
 
     # Optional but commonly set in App Service
