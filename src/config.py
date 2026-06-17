@@ -190,7 +190,7 @@ class Config:
     MAX_SNIPPET_CHARS = int(os.environ.get("MAX_SNIPPET_CHARS", "1500"))
     MAX_ATTACH_CHARS = int(os.environ.get("MAX_ATTACH_CHARS", "6000"))
     MAX_LLM_ATTACH_CHARS = int(os.environ.get("MAX_LLM_ATTACH_CHARS", "12000"))
-    MAX_MEMORY_TURNS = int(os.environ.get("MAX_MEMORY_TURNS", "1"))  # 1 turn = 2 messages
+    MAX_MEMORY_TURNS = int(os.environ.get("MAX_MEMORY_TURNS", "5"))  # 1 turn = 2 messages
 
     # Safety: don't infer user identity from document cache unless explicitly enabled
     ALLOW_CACHE_USER_INFERENCE = os.environ.get("ALLOW_CACHE_USER_INFERENCE", "false").strip().lower() in ("1", "true", "yes")
