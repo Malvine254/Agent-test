@@ -1879,13 +1879,30 @@ llm_semaphore = asyncio.Semaphore(max(1, int(getattr(Config, "LLM_CONCURRENCY", 
 # Conversation memory and file storage  
 # ---------------------------
 # âœ… SIMPLE, CLEAN CONVERSATION MANAGEMENT
-conversation_store: dict[str, ListMemory] = {}
+conversation_store: dict[str, ListMemory] = {}  # in-process working copy for the current message
 conversation_files: dict[str, list] = {}  # Store uploaded files per conversation
 conversation_last_query: dict[str, str] = {}  # Store last search query per conversation
 conversation_last_sources: dict[str, list] = {}  # Store last doc sources per conversation for follow-up references
 conversation_title_list_state: dict[str, dict] = {}  # Store document title pagination state per conversation
 conversation_summaries: dict[str, dict] = {}  # Compact running brief per conversation
 background_tasks: list = []  # Track background indexing tasks
+
+# Phase 3: durable conversation memory (turns + summary + last_sources) that survives
+# restart and can be shared across instances. Backed by Azure Table Storage when
+# AZURE_STORAGE_CONNECTION_STRING is set, else a local JSON file. The in-process dicts
+# above act as the working copy for one message: hydrated on entry, flushed on exit.
+from storage.conversation_store import ConversationStore, ConversationState  # noqa: E402
+conversation_db = ConversationStore(connection_string=os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
+
+
+class _StoredTurn:
+    """Lightweight memory item with mutable role/content. The SDK send() uses
+    memory=None, so ListMemory items are only read by this module — no SDK type needed."""
+    __slots__ = ("role", "content")
+
+    def __init__(self, role: str, content: str):
+        self.role = role
+        self.content = content
 
 def _get_memory_items(memory: ListMemory) -> list:
     """Access the actual internal storage of ListMemory (NOT .messages which doesn't exist)."""
@@ -1951,6 +1968,87 @@ def clear_conversation_memory(conversation_id: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to clear conversation memory: {e}")
         return False
+    finally:
+        try:
+            conversation_db.delete(conversation_id)
+        except Exception:
+            pass
+
+
+def _serialize_turns(memory: ListMemory) -> list[dict]:
+    """ListMemory items -> [{role, content}] for durable storage."""
+    out: list[dict] = []
+    for m in _get_memory_items(memory) or []:
+        content = getattr(m, "content", None) or ""
+        if not content:
+            continue
+        out.append({"role": str(getattr(m, "role", "user") or "user"), "content": str(content)})
+    return out
+
+
+def _hydrate_turns(memory: ListMemory, turns: list[dict]) -> None:
+    """[{role, content}] -> ListMemory items."""
+    items = [
+        _StoredTurn(str(t.get("role") or "user"), str(t.get("content") or ""))
+        for t in (turns or [])
+        if t.get("content")
+    ]
+    _set_memory_items(memory, items)
+
+
+def _trim_turns_to_budget(turns: list[dict], max_messages: int, max_bytes: int = 26_000) -> list[dict]:
+    """Keep at most max_messages recent messages, and ensure the JSON payload stays
+    under max_bytes (Azure Table string property limit is 32KB). Trims oldest first."""
+    turns = turns[-max_messages:] if max_messages > 0 else []
+    while turns and len(json.dumps(turns, ensure_ascii=False).encode("utf-8")) > max_bytes:
+        turns = turns[1:]
+    return turns
+
+
+def _load_conversation_state(conversation_id: str) -> None:
+    """Hydrate the in-process working copy from the durable store (called per message)."""
+    try:
+        state = conversation_db.get(conversation_id)
+        memory = get_or_create_conversation_memory(conversation_id)
+        _hydrate_turns(memory, state.turns)
+        if state.summary:
+            conversation_summaries[conversation_id] = {
+                "summary": state.summary,
+                "turn_count": max(1, len(state.turns) // 2),
+                "updated_at": state.updated_at or "",
+            }
+        if state.last_sources:
+            conversation_last_sources[conversation_id] = state.last_sources
+    except Exception as exc:
+        logger.warning("Conversation state load failed for %s: %s", conversation_id, exc)
+
+
+def _persist_conversation_state(conversation_id: str) -> None:
+    """Flush the in-process working copy to the durable store once per message."""
+    try:
+        memory = conversation_store.get(conversation_id)
+        turns = _serialize_turns(memory) if memory is not None else []
+        max_messages = int(getattr(Config, "MAX_MEMORY_TURNS", 5)) * 2
+        turns = _trim_turns_to_budget(turns, max_messages)
+        summary = (conversation_summaries.get(conversation_id, {}) or {}).get("summary", "")
+        raw_sources = conversation_last_sources.get(conversation_id, []) or []
+        last_sources = [
+            {
+                "title": s.get("title", ""),
+                "url": s.get("url", ""),
+                "snippet": (s.get("snippet", "") or "")[:2000],
+                "truncated": bool(s.get("truncated")),
+                "primary": bool(s.get("primary")),
+                "total_chars": s.get("total_chars"),
+            }
+            for s in raw_sources[:8]
+        ]
+        conversation_db.save(
+            conversation_id,
+            ConversationState(turns=turns, summary=summary, last_sources=last_sources),
+        )
+    except Exception as exc:
+        logger.warning("Conversation state persist failed for %s: %s", conversation_id, exc)
 
 def _compact_for_conversation_summary(text: str, max_chars: int = 700) -> str:
     """Keep a message readable while removing noisy markup."""
@@ -5671,9 +5769,18 @@ async def handle_message(ctx: ActivityContext[MessageActivity]):
         mention_found = any(getattr(entity, 'type', None) == 'mention' for entity in mentions)
         logger.info(f"MENTIONS DEBUG - Has mentions: {mention_found} | Entity count: {len(mentions)}")
         logger.info("=" * 60)
-        
-        await handle_stateful_conversation(model, ctx)
-        
+
+        # Phase 3: hydrate durable conversation state on entry, flush on exit. The
+        # finally clause guarantees a single save regardless of how the handler returns.
+        _conv_id = ctx.activity.conversation.id if getattr(ctx.activity, "conversation", None) else None
+        if _conv_id:
+            _load_conversation_state(_conv_id)
+        try:
+            await handle_stateful_conversation(model, ctx)
+        finally:
+            if _conv_id:
+                _persist_conversation_state(_conv_id)
+
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Message handling error: {error_msg}", exc_info=True)
