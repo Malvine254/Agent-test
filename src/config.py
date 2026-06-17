@@ -38,6 +38,17 @@ except Exception:
     pass
 
 
+# Phase 4: load secrets from Azure Key Vault (deployed environments). This MUST run
+# before the Config class below reads secrets at import time — calling it from
+# app.startup() would be too late. KV values override .env when AZURE_KEY_VAULT_URL is
+# set; it's a no-op locally (empty URL), so .env files remain the local source of truth.
+try:
+    from keyvault import load_from_keyvault
+    load_from_keyvault(os.environ.get("AZURE_KEY_VAULT_URL", ""))
+except Exception:
+    pass
+
+
 def _require_env(key: str) -> str:
     """Fetch a required environment variable with a clearer error."""
     value = os.environ.get(key)
