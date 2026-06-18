@@ -8,7 +8,7 @@ provision:
   - uses: teamsApp/create
     with:
       # app name
-      name: SwopeAI${{APP_NAME_SUFFIX}}
+      name: Armely AI${{APP_NAME_SUFFIX}}
     # Write the information of created resources into environment file for
     # the specified environment variable(s).
     writeToEnvironmentFile: 
@@ -18,7 +18,7 @@ provision:
   - uses: aadApp/create
     with:
       # The Microsoft Entra application's display name
-      name: SwopeAI${{APP_NAME_SUFFIX}}
+      name: Armely AI${{APP_NAME_SUFFIX}}
       generateClientSecret: true
       generateServicePrincipal: true
       signInAudience: AzureADMultipleOrgs
@@ -30,11 +30,17 @@ provision:
       # The Microsoft Entra application's object id created for bot.
       objectId: BOT_OBJECT_ID
 
+  # Configure Entra app for SSO (expose API + Graph permissions for delegated access)
+  - uses: aadApp/update
+    with:
+      manifestPath: ./aad.manifest.json
+      outputFilePath: ./build/aad.manifest.${{TEAMSFX_ENV}}.json
+
   # Create or update the bot registration on dev.botframework.com
   - uses: botFramework/create
     with:
       botId: ${{BOT_ID}}
-      name: SwopeAI
+      name: Armely AI
       messagingEndpoint: ${{BOT_ENDPOINT}}/api/messages
       description: ""
       channels:
@@ -78,6 +84,32 @@ deploy:
         CLIENT_ID: ${{BOT_ID}}
         CLIENT_SECRET: ${{SECRET_BOT_PASSWORD}}
         TENANT_ID: ${{TEAMS_APP_TENANT_ID}}
+        GRAPH_TENANT_ID: ${{GRAPH_TENANT_ID}}
         AZURE_OPENAI_API_KEY: ${{SECRET_AZURE_OPENAI_API_KEY}}
         AZURE_OPENAI_MODEL_DEPLOYMENT_NAME: ${{AZURE_OPENAI_MODEL_DEPLOYMENT_NAME}}
         AZURE_OPENAI_ENDPOINT: ${{AZURE_OPENAI_ENDPOINT}}
+        AZURE_OPENAI_EMBEDDING_DEPLOYMENT: ${{AZURE_OPENAI_EMBEDDING_DEPLOYMENT}}
+        EMBEDDING_DIMENSIONS: ${{EMBEDDING_DIMENSIONS}}
+        APP_TIMEZONE: UTC
+        AZURE_SEARCH_ENDPOINT: ${{AZURE_SEARCH_ENDPOINT}}
+        AZURE_SEARCH_ADMIN_KEY: ${{AZURE_SEARCH_ADMIN_KEY}}
+        AZURE_SEARCH_QUERY_KEY: ${{AZURE_SEARCH_QUERY_KEY}}
+        AZURE_SEARCH_KEY: ${{AZURE_SEARCH_ADMIN_KEY}}
+        AZURE_SEARCH_INDEX_NAME: ${{AZURE_SEARCH_INDEX_NAME}}
+        AZURE_SEARCH_INDEX: ${{AZURE_SEARCH_INDEX_NAME}}
+        AZURE_SEARCH_SEMANTIC_CONFIG: ${{AZURE_SEARCH_SEMANTIC_CONFIG}}
+        AZURE_SEARCH_API_VERSION: ${{AZURE_SEARCH_API_VERSION}}
+        SHAREPOINT_SITES: ${{SHAREPOINT_SITES}}
+        EXTERNAL_WEB_SOURCES: ${{EXTERNAL_WEB_SOURCES}}
+        ENABLE_SHAREPOINT_INDEXING: ${{ENABLE_SHAREPOINT_INDEXING}}
+        SHAREPOINT_INDEX_RUN_ON_STARTUP: ${{SHAREPOINT_INDEX_RUN_ON_STARTUP}}
+        SHAREPOINT_INDEX_POLL_SECONDS: ${{SHAREPOINT_INDEX_POLL_SECONDS}}
+        SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN: ${{SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN}}
+        SHAREPOINT_INDEX_MAX_DEPTH: ${{SHAREPOINT_INDEX_MAX_DEPTH}}
+        HTTP_TIMEOUT: ${{HTTP_TIMEOUT}}
+        GRAPH_TIMEOUT: ${{GRAPH_TIMEOUT}}
+        CACHE_LOAD_TIMEOUT: ${{CACHE_LOAD_TIMEOUT}}
+        PROFILE_LOOKUP_TIMEOUT: ${{PROFILE_LOOKUP_TIMEOUT}}
+        USER_DETAILS_TIMEOUT: ${{USER_DETAILS_TIMEOUT}}
+        ATTACHMENT_CHECK_TIMEOUT: ${{ATTACHMENT_CHECK_TIMEOUT}}
+        CONVERSATION_HISTORY_TIMEOUT: ${{CONVERSATION_HISTORY_TIMEOUT}}

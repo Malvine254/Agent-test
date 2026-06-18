@@ -13,6 +13,13 @@ param identityClientId string
 param identityTenantId string
 param botAppDomain string
 
+// OAuth connection parameters for SSO (delegated Graph access)
+@secure()
+param graphClientId string = ''
+@secure()
+param graphClientSecret string = ''
+param graphTenantId string = ''
+
 // Register your web service as a bot with the Bot Framework
 resource botService 'Microsoft.BotService/botServices@2021-03-01' = {
   kind: 'azurebot'
@@ -38,5 +45,23 @@ resource botServiceMsTeamsChannel 'Microsoft.BotService/botServices/channels@202
   name: 'MsTeamsChannel'
   properties: {
     channelName: 'MsTeamsChannel'
+  }
+}
+
+// OAuth connection for SSO - enables delegated Graph access via Bot Framework Token Service
+resource botOAuthConnection 'Microsoft.BotService/botServices/connections@2022-09-15' = if (!empty(graphClientId)) {
+  parent: botService
+  name: 'graph'
+  location: 'global'
+  properties: {
+    clientId: graphClientId
+    clientSecret: graphClientSecret
+    scopes: 'User.Read Mail.Read Files.Read.All Sites.Read.All openid profile offline_access'
+    serviceProviderId: '30dd229c-58e3-4a48-bdfd-91ec48eb906c' // Azure Active Directory v2
+    serviceProviderDisplayName: 'Azure Active Directory v2'
+    parameters: [
+      { key: 'tenantID', value: empty(graphTenantId) ? 'common' : graphTenantId }
+      { key: 'tokenExchangeUrl', value: 'api://${botAppDomain}/${graphClientId}' }
+    ]
   }
 }

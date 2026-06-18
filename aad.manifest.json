@@ -1,0 +1,114 @@
+{
+  "id": "${{BOT_OBJECT_ID}}",
+  "displayName": "Armely AI",
+  "identifierUris": [
+    "api://${{BOT_DOMAIN}}/${{BOT_ID}}"
+  ],
+  "signInAudience": "AzureADMultipleOrgs",
+  "api": {
+    "requestedAccessTokenVersion": 2,
+    "oauth2PermissionScopes": [
+      {
+        "adminConsentDescription": "Allows Teams to call the app's web APIs as the current user.",
+        "adminConsentDisplayName": "Teams can access app's web API",
+        "id": "${{AAD_APP_ACCESS_AS_USER_PERMISSION_ID}}",
+        "isEnabled": true,
+        "type": "User",
+        "userConsentDescription": "Enable Teams to call the app's web APIs with the same rights as you.",
+        "userConsentDisplayName": "Teams can access app's web API and make requests on your behalf",
+        "value": "access_as_user"
+      }
+    ],
+    "preAuthorizedApplications": [
+      {
+        "appId": "1fec8e78-bce4-4aaf-ab1b-5451cc387264",
+        "delegatedPermissionIds": [
+          "${{AAD_APP_ACCESS_AS_USER_PERMISSION_ID}}"
+        ]
+      },
+      {
+        "appId": "5e3ce6c0-2b1f-4285-8d4b-75ee78787346",
+        "delegatedPermissionIds": [
+          "${{AAD_APP_ACCESS_AS_USER_PERMISSION_ID}}"
+        ]
+      },
+      {
+        "appId": "d3590ed6-52b3-4102-aeff-aad2292ab01c",
+        "delegatedPermissionIds": [
+          "${{AAD_APP_ACCESS_AS_USER_PERMISSION_ID}}"
+        ]
+      },
+      {
+        "appId": "00000002-0000-0ff1-ce00-000000000000",
+        "delegatedPermissionIds": [
+          "${{AAD_APP_ACCESS_AS_USER_PERMISSION_ID}}"
+        ]
+      },
+      {
+        "appId": "bc59ab01-8403-45c6-8796-ac3ef710b3e3",
+        "delegatedPermissionIds": [
+          "${{AAD_APP_ACCESS_AS_USER_PERMISSION_ID}}"
+        ]
+      },
+      {
+        "appId": "0ec893e0-5785-4de6-99da-4ed124e5296c",
+        "delegatedPermissionIds": [
+          "${{AAD_APP_ACCESS_AS_USER_PERMISSION_ID}}"
+        ]
+      },
+      {
+        "appId": "4765445b-32c6-49b0-83e6-1d93765276ca",
+        "delegatedPermissionIds": [
+          "${{AAD_APP_ACCESS_AS_USER_PERMISSION_ID}}"
+        ]
+      },
+      {
+        "appId": "4345a7b9-9a63-4910-a426-35363201d503",
+        "delegatedPermissionIds": [
+          "${{AAD_APP_ACCESS_AS_USER_PERMISSION_ID}}"
+        ]
+      }
+    ]
+  },
+  "info": {},
+  "publicClient": {},
+  "requiredResourceAccess": [
+    {
+      "resourceAppId": "00000003-0000-0000-c000-000000000000",
+      "resourceAccess": [
+        {
+          "id": "e1fe6dd8-ba31-4d61-89e7-88639da4683d",
+          "type": "Scope"
+        },
+        {
+          "id": "7b2449af-6ccd-4f4d-9f78-e550c193f0d1",
+          "type": "Scope"
+        },
+        {
+          "id": "5b567255-7703-4780-807c-7be8301ae99b",
+          "type": "Scope"
+        },
+        {
+          "id": "df85f4d6-205c-4ac5-a5ea-6bf408dba283",
+          "type": "Scope"
+        },
+        {
+          "id": "570282fd-fa5c-430d-a7fd-fc8dc98a9dca",
+          "type": "Scope"
+        },
+        {
+          "id": "37f7f235-527c-4136-accd-4a02d197296e",
+          "type": "Scope"
+        },
+        {
+          "id": "14dad69e-099b-42c9-810b-d002981feec1",
+          "type": "Scope"
+        }
+      ]
+    }
+  ],
+  "web": {
+    "implicitGrantSettings": {}
+  },
+  "spa": {}
+}

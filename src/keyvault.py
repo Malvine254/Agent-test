@@ -1,0 +1,84 @@
+"""Azure Key Vault secret loader.
+
+In deployed environments set AZURE_KEY_VAULT_URL; secrets are pulled into os.environ
+before config is read. Locally, leave it unset — secrets come from .env files.
+
+NOTE: this module lives at src/keyvault.py (flat module) because `config` is a module
+(config.py), not a package, so `config/keyvault.py` is not possible. It is invoked from
+the top of config.py (before Config reads secrets at import time) — calling it later
+from app.startup() would be too late, since Config captures env values at import.
+"""
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+# Maps Key Vault secret names (hyphens only — KV doesn't allow underscores) to the
+# environment variable names the rest of the app expects.
+SECRET_MAP = {
+    "graph-client-secret": "GRAPH_CLIENT_SECRET",
+    "azure-openai-api-key": "AZURE_OPENAI_API_KEY",
+    "azure-search-admin-key": "AZURE_SEARCH_ADMIN_KEY",
+    "azure-search-query-key": "AZURE_SEARCH_QUERY_KEY",
+    "azure-storage-conn-string": "AZURE_STORAGE_CONNECTION_STRING",
+    "bot-app-password": "SECRET_BOT_PASSWORD",
+}
+
+
+def load_from_keyvault(vault_url: str) -> None:
+    """Pull secrets from Azure Key Vault into os.environ.
+
+    Uses DefaultAzureCredential (managed identity in Azure, `az login` locally). On any
+    failure, logs and returns — the app falls back to whatever is already in os.environ.
+    """
+    if not vault_url:
+        logger.debug("AZURE_KEY_VAULT_URL not set — skipping Key Vault load")
+        return
+
+    try:
+        from azure.identity import DefaultAzureCredential
+        from azure.keyvault.secrets import SecretClient
+        from azure.core.exceptions import HttpResponseError, ServiceRequestError
+    except ImportError:
+        logger.warning(
+            "azure-identity or azure-keyvault-secrets not installed — cannot load from "
+            "Key Vault. Install them or set secrets via env."
+        )
+        return
+
+    try:
+        credential = DefaultAzureCredential()
+        client = SecretClient(vault_url=vault_url, credential=credential)
+
+        loaded: list[str] = []
+        failed: list[str] = []
+
+        for secret_name, env_key in SECRET_MAP.items():
+            try:
+                secret = client.get_secret(secret_name)
+                if secret.value:
+                    os.environ[env_key] = secret.value
+                    loaded.append(env_key)
+                else:
+                    logger.warning("Key Vault secret '%s' is empty", secret_name)
+            except HttpResponseError as exc:
+                if getattr(exc, "status_code", None) == 404:
+                    logger.debug("Key Vault secret '%s' not found — skipping", secret_name)
+                else:
+                    failed.append(secret_name)
+                    logger.warning("Key Vault: failed to fetch '%s': %s", secret_name, exc)
+
+        logger.info(
+            "Key Vault: loaded %d secrets (%s). Failed: %s",
+            len(loaded),
+            ", ".join(loaded) if loaded else "none",
+            ", ".join(failed) if failed else "none",
+        )
+    except ServiceRequestError as exc:
+        logger.error(
+            "Key Vault: network error connecting to %s: %s — falling back to env/file secrets",
+            vault_url,
+            exc,
+        )
+    except Exception as exc:
+        logger.error("Key Vault: unexpected error: %s — falling back to env/file secrets", exc)

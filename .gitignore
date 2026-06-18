@@ -9,6 +9,7 @@ env/.env.*
 env/backup*
 .env
 .env.*
+!.env.example
 appPackage/build
 
 # python virtual environment
@@ -30,11 +31,18 @@ src/web_cache.json
 **/.env
 **/.env.*
 **/*.env
+!.env.example
+!**/.env.example
 
 # Backup files with secrets
 env/backup.*
 *.backup
 backup*
+
+# Archives and credential docs that may contain secrets — never commit
+*.zip
+BOT_REGISTRATIONS.md
+get_bot_secret.ps1
 
 # others
 .deployment/

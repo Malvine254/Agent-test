@@ -1,0 +1,34 @@
+# Core Teams SDK
+microsoft-teams-ai>=2.0.0a8
+microsoft-teams-apps>=2.0.0a8
+microsoft-teams-api>=2.0.0a8
+microsoft-teams-openai>=2.0.0a8
+
+# Azure and authentication
+azure-search-documents>=11.6.0
+azure-core>=1.30.0
+azure-identity>=1.16.0
+msal>=1.24.0
+openai>=1.0.0
+
+# Configuration and HTTP
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Document processing
+pypdf>=3.17.0
+python-docx>=1.0.0
+openpyxl>=3.1.0
+Pillow>=10.0.0
+python-pptx>=0.6.21
+xlrd==1.2.0
+pandas>=2.0.0
+
+numpy>=1.24.0
+
+# Optional: Legacy Office format support (.doc, .ppt)
+# textract - requires system dependencies (antiword, poppler-utils, etc.)
+# Install manually if needed: pip install textract
+# On Linux: apt-get install antiword poppler-utils
+# On macOS: brew install antiword poppler
+# On Windows: More complex, recommend converting files to modern formats

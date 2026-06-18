@@ -1,5 +1,6 @@
 {
     "debug.onTaskErrors": "abort",
+    "python.defaultInterpreterPath": "C:/Users/Home/AgentsToolkitProjects/Armely-Agent-Main/.venv/Scripts/python.exe",
     "json.schemas": [
         {
             "fileMatch": [

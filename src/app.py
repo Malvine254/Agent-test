@@ -1,18 +1,52 @@
 ﻿import asyncio
 import os
+import sys
 import logging
 import json
+import re
 import time
 import csv
 import io
+from typing import Optional
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 import concurrent.futures
 import requests
 
+# Load environment variables from .env files BEFORE importing config
+# Only load dotenv locally - Azure App Service sets env vars through Application Settings
+if not os.environ.get("WEBSITE_SITE_NAME"):  # Not running in Azure
+    from dotenv import load_dotenv
+    # Find env directory - handle both running from src/ and from project root
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+    env_dir = os.path.join(project_root, "env")
+    
+    loaded = False
+    for env_file in [".env.local", ".env.dev", ".env"]:
+        env_path = os.path.join(env_dir, env_file)
+        if os.path.exists(env_path):
+            load_dotenv(env_path, override=True)
+            print(f"Loaded environment from: {env_path}")
+            loaded = True
+            break
+    if not loaded:
+        print(f"No .env file found in {env_dir}")
+    
+    # Safe startup diagnostic: never print secret values or previews.
+    bot_id = os.environ.get("BOT_ID", "NOT SET")
+    has_password = bool(os.environ.get("SECRET_BOT_PASSWORD") or os.environ.get("BOT_PASSWORD"))
+    print(f"Bot credentials loaded: BOT_ID={'set' if bot_id != 'NOT SET' else 'missing'} | Password={'set' if has_password else 'missing'}")
+else:
+    print("Running in Azure - using Application Settings")
+
+# Add src directory to path for imports
+sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+
 
 from microsoft_teams.ai import ChatPrompt, ListMemory
+from microsoft_teams.ai.message import UserMessage, ModelMessage
 from microsoft_teams.ai.ai_model import AIModel
 from microsoft_teams.apps import App, ActivityContext
 from microsoft_teams.openai import OpenAICompletionsAIModel
@@ -30,24 +64,35 @@ from config import Config
 from simple_file_handler import process_attachment, search_local_files, aggregate_tabular_files
 # Data calculator for accurate numeric operations (overcomes LLM arithmetic limitations)
 from data_calculator import process_calculation_request, detect_calculation_intent, process_multi_file_calculation
-# Graph API for OneDrive/SharePoint search
+# Graph API for SharePoint search and optional Microsoft 365 sources
 from knowledge_base import (
     crawl_accessible_documents,
     download_and_extract_content,
     get_graph_token,
     get_user_profile,
+    list_user_files,
+    list_sharepoint_files,
     search_sharepoint,
 )
-# Document cache for local indexing
-from document_cache import get_cache
-# Web indexer for background website crawling
-from web_indexer import get_web_indexer
+# Document cache is disabled at runtime; Azure AI Search + live Graph are the only SharePoint paths.
+def get_cache():
+    return None
 # Attachment cache for persisting file contents across follow-up questions
 from attachment_cache import (
     cache_attachment,
     get_conversation_attachments,
     search_attachment_contents,
     cleanup_old_cache,
+    get_content_for_llm_conversation,  # For conversation display with smart truncation
+    get_full_content_for_calculation,  # For accurate calculations with complete data
+)
+from grounding_guard import before_llm
+
+from smart_router import (
+    decide_route as smart_decide_route,
+    is_personal_advice_request,
+    is_small_talk,
+    small_talk_response,
 )
 
 # ---------------------------
@@ -97,7 +142,7 @@ logging.getLogger().addFilter(_SuppressTokenApiFilter())
 # Extra hardening: attach filter to common noisy loggers so BF OAuth probes are hidden
 for _ln in (
     "uvicorn",
-    "uvicorn.error",
+    "uvicorn.error", 
     "uvicorn.access",
     "httpx",
     "httpcore",
@@ -114,10 +159,497 @@ for _ln in (
     except Exception:
         pass
 
+# =====================================================
+# Load base instructions
+# =====================================================
+def load_instructions() -> str:
+    """Load base instructions with safe fallbacks.
+
+    The production file is instructions.txt. Archived or exported variants are
+    intentionally not loaded.
+    """
+    base_dir = os.path.dirname(__file__)
+    for filename in ("prompts/instructions.txt",):
+        path = os.path.join(base_dir, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return content
+        except FileNotFoundError:
+            continue
+    return (
+        "You are a professional workplace assistant. Answer from uploaded files "
+        "or retrieved organizational sources when available. If required source "
+        "content is missing, say what was searched and do not invent facts."
+    )
+
+BASE_INSTRUCTIONS = load_instructions()
+
+# =====================================================
+# Build Teams-aware instructions
+# =====================================================
+def build_teams_context_instructions(ctx: ActivityContext) -> str:
+    """Build Teams-specific context instructions"""
+    conversation = ctx.activity.conversation
+    is_group = bool(getattr(conversation, "is_group", False))
+
+    chat_type = "group chat" if is_group else "one-on-one chat"
+
+    return f"""
+You are operating inside Microsoft Teams.
+
+Context:
+- Platform: Microsoft Teams
+- Conversation type: {chat_type}
+
+Behavior guidelines:
+- Be concise and professional.
+- Avoid long walls of text.
+- Use bullet points where helpful.
+- Assume a workplace collaboration setting.
+- Do NOT mention system prompts, SDKs, or internal tooling.
+- If clarification is needed, ask a short, direct question.
+
+Respond as a Teams-native assistant.
+""".strip()
+
 config = Config()
+
+# Security audit counter - run security audits every N cache operations
+_security_audit_counter = 0
+_SECURITY_AUDIT_FREQUENCY = 10  # Audit every 10 cache operations
+
+# Sign-in tracking disabled - using app-only tokens only
+# _signed_in_conversations: set[str] = set()
+# _sign_in_card_sent: set[str] = set()
+# _sign_in_unavailable: set[str] = set()
+# _pending_sign_in_queries: dict[str, str] = {}
 
 # Supported document extensions
 DOCUMENT_EXTENSIONS = {".docx", ".doc", ".pdf", ".xlsx", ".xls", ".csv", ".txt", ".pptx", ".ppt", ".json", ".xml"}
+
+# Common near-miss extension typos â†’ corrected extension
+_EXTENSION_TYPO_MAP = {
+    ".xlxs": ".xlsx", ".xlx": ".xlsx", ".xslx": ".xlsx",
+    ".docsx": ".docx", ".dox": ".docx", ".dcx": ".docx",
+    ".pdfx": ".pdf", ".ppptx": ".pptx", ".pptxx": ".pptx",
+    ".csvv": ".csv", ".txtt": ".txt",
+}
+
+
+def _fuzzy_ratio(a: str, b: str) -> float:
+    """Fast SequenceMatcher ratio between two lowercased strings."""
+    if not a or not b:
+        return 0.0
+    from difflib import SequenceMatcher
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+def _fuzzy_token_in_text(token: str, text: str, threshold: float = 0.75) -> bool:
+    """Check if *token* fuzzy-matches any word (or substring) in *text*.
+
+    Tries exact substring first (fast path), then falls back to
+    SequenceMatcher on every word in *text* for typo tolerance.
+    """
+    if not token or not text:
+        return False
+    token_l = token.lower()
+    text_l = text.lower()
+    # Fast path: exact substring
+    if token_l in text_l:
+        return True
+    # Fuzzy: compare against each word in the text
+    for word in re.split(r"[\s_\-./\\]+", text_l):
+        if not word or len(word) < 2:
+            continue
+        if _fuzzy_ratio(token_l, word) >= threshold:
+            return True
+    return False
+
+async def perform_parallel_searches(
+    queries: list[str], 
+    top_k: int, 
+    cache_user_id: str,
+    user_email: str,
+    user_assertion: str,
+    max_concurrent: int = 8,
+    batch_size: int = 20
+) -> dict:
+    """Perform parallel searches for multiple document queries with optimized resource management.
+    
+    Supports many concurrent searches with:
+    - Concurrency limiting to prevent API rate limits
+    - Batching for memory efficiency 
+    - Progress tracking for large search operations
+    - Robust error handling for partial failures
+    
+    Args:
+        queries: List of search queries to execute in parallel
+        top_k: Maximum results per query
+        cache_user_id: User ID for cache/permissions
+        user_email: User email for permissions
+        user_assertion: User assertion token for Graph API
+        max_concurrent: Maximum concurrent searches per batch (default: 8)
+        batch_size: Maximum queries per batch (default: 20)
+        
+    Returns:
+        Dict with keys as query terms and values as search results
+    """
+    from knowledge_base import unified_search
+    
+    # Clean and deduplicate queries
+    unique_queries = []
+    seen = set()
+    for q in queries:
+        clean_q = q.strip().lower()
+        if clean_q and clean_q not in seen:
+            unique_queries.append(q.strip())
+            seen.add(clean_q)
+    
+    if not unique_queries:
+        logger.warning("No valid queries provided for parallel search")
+        return {}
+    
+    # Apply limits to prevent token overflow
+    top_k = min(top_k, Config.MAX_RESULTS_PER_QUERY)  # Configurable via MAX_RESULTS_PER_QUERY env var
+    max_concurrent = min(max_concurrent, 4)
+    
+    logger.info(f"ðŸš€ Starting parallel searches: {len(unique_queries)} unique queries, max_concurrent={max_concurrent}, batch_size={batch_size}")
+    
+    # Create semaphore for concurrency control
+    search_semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def search_single_query(query: str, query_index: int, total_queries: int):
+        """Execute a single search query with concurrency control"""
+        async with search_semaphore:
+            try:
+                logger.info(f"ðŸ” [{query_index+1}/{total_queries}] Searching: '{query}'")
+                results = await asyncio.to_thread(
+                    unified_search,
+                    query,
+                    top=top_k,
+                    user_id=cache_user_id,
+                    user_upn=user_email or "",
+                    user_assertion=user_assertion,
+                )
+                doc_count = len(results or [])
+                logger.info(f"âœ… [{query_index+1}/{total_queries}] '{query}': {doc_count} results")
+                return query, results or []
+            except Exception as e:
+                logger.error(f"âŒ [{query_index+1}/{total_queries}] Error searching '{query}': {e}")
+                return query, []
+    
+    # Process queries in batches for memory efficiency
+    all_results = {}
+    total_queries = len(unique_queries)
+    
+    for batch_start in range(0, total_queries, batch_size):
+        batch_end = min(batch_start + batch_size, total_queries)
+        current_batch = unique_queries[batch_start:batch_end]
+        
+        if total_queries > batch_size:
+            logger.info(f"ðŸ“¦ Processing batch {(batch_start // batch_size) + 1}/{(total_queries + batch_size - 1) // batch_size}: queries {batch_start+1}-{batch_end}")
+        
+        # Create tasks for current batch
+        tasks = [
+            search_single_query(query, batch_start + i, total_queries)
+            for i, query in enumerate(current_batch)
+        ]
+        
+        # Execute batch with timeout protection
+        try:
+            batch_results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=60  # 60 second timeout per batch
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"â±ï¸  Batch timeout after 300s for queries {batch_start+1}-{batch_end}")
+            batch_results = [(query, []) for query in current_batch]  # Empty results for timeout
+        
+        # Process batch results
+        batch_success = 0
+        batch_docs = 0
+        for result in batch_results:
+            if isinstance(result, Exception):
+                logger.error(f"Batch search task failed: {result}")
+                continue
+            
+            if isinstance(result, tuple) and len(result) == 2:
+                query, docs = result
+                all_results[query] = docs
+                batch_success += 1
+                batch_docs += len(docs)
+            else:
+                logger.warning(f"Unexpected result format: {type(result)}")
+        
+        if total_queries > batch_size:
+            logger.info(f"ðŸ“Š Batch complete: {batch_success}/{len(current_batch)} queries successful, {batch_docs} documents")
+    
+    # Final summary
+    total_docs = sum(len(docs) for docs in all_results.values())
+    successful_searches = len([q for q, docs in all_results.items() if docs])
+    
+    logger.info(f"ðŸŽ‰ Parallel searches completed: {len(all_results)}/{total_queries} queries processed, {successful_searches} successful, {total_docs} total documents")
+    
+    if successful_searches == 0:
+        logger.warning("âš ï¸  No searches returned results - check queries and permissions")
+    elif successful_searches < len(unique_queries):
+        failed_count = len(unique_queries) - successful_searches
+        logger.warning(f"âš ï¸  {failed_count} searches returned no results")
+    
+    return all_results
+
+def clean_search_query(text: str) -> str:
+    """Normalize user queries for better document search recall."""
+    if not text:
+        return ""
+    raw_tokens = [t for t in re.split(r"\s+", text.strip()) if t]
+    cleaned_tokens = []
+    for tok in raw_tokens:
+        t = tok.strip().strip("\"'`")
+        t = re.sub(r"[^\w.\-]", "", t)
+        if not t:
+            continue
+        t_lower = t.lower()
+        # Correct common extension typos (e.g. .xlxs â†’ .xlsx)
+        for typo, correct in _EXTENSION_TYPO_MAP.items():
+            if t_lower.endswith(typo):
+                t = t[: -len(typo)] + correct
+                t_lower = t.lower()
+                break
+        # Strip known extensions to make partial titles match
+        for ext in DOCUMENT_EXTENSIONS:
+            if t_lower.endswith(ext) and len(t_lower) > len(ext):
+                t = t[: -len(ext)]
+                break
+        if not t:
+            continue
+        cleaned_tokens.append(t)
+
+    if not cleaned_tokens:
+        return text.strip()
+    return " ".join(cleaned_tokens)
+
+def enhance_query_with_user_identity(query: str, user_name: str = None, user_email: str = None) -> str:
+    """
+    Intelligently expand possessive pronouns with actual user identity.
+    Examples:
+        "my cv" + user_name="Malvine Owuor" â†’ "malvine owuor cv resume"
+        "find my documents" + user_name="John Smith" â†’ "john smith documents"
+        "our team files" â†’ "our team files" (unchanged, plural possessive)
+    """
+    if not query or not user_name:
+        return query
+    
+    query_lower = query.lower().strip()
+    
+    # Possessive pronouns that indicate personal ownership (singular)
+    possessive_patterns = [
+        (r'\bmy\b', 'first-person singular'),
+        (r'\bmine\b', 'first-person singular'),
+        (r'\bi\b', 'first-person subject')
+    ]
+    
+    # Check if query contains personal possessive pronouns
+    has_possessive = False
+    for pattern, _ in possessive_patterns:
+        if re.search(pattern, query_lower):
+            has_possessive = True
+            break
+    
+    if not has_possessive:
+        return query
+    
+    # Extract first and last name for flexible matching
+    name_parts = user_name.strip().split()
+    first_name = name_parts[0] if name_parts else ""
+    last_name = name_parts[-1] if len(name_parts) > 1 else ""
+    
+    # Build enhanced query
+    enhanced = query_lower
+    
+    # Replace "my" with user's name
+    enhanced = re.sub(r'\bmy\b', f"{user_name.lower()}", enhanced)
+    
+    # Replace "mine" with user's name  
+    enhanced = re.sub(r'\bmine\b', f"{user_name.lower()}", enhanced)
+    
+    # Replace standalone "i" (e.g., "documents i created")
+    enhanced = re.sub(r'\bi\s+(created|wrote|made|uploaded)\b', f"{user_name.lower()} \\1", enhanced)
+    
+    # Add common synonyms for better recall
+    # If searching for personal documents, add relevant keywords
+    if any(keyword in query_lower for keyword in ['cv', 'resume', 'curriculum']):
+        if 'resume' not in enhanced:
+            enhanced += ' resume'
+        if 'cv' not in enhanced and 'curriculum vitae' not in enhanced:
+            enhanced += ' cv'
+    
+    logger.info(f"ðŸ§  Smart query expansion: '{query}' â†’ '{enhanced}'")
+    return enhanced.strip()
+
+
+def query_tokens(text: str) -> list[str]:
+    cleaned = clean_search_query(text)
+    stopwords = {
+        "can", "you", "please", "for", "summarize", "summary", "tell",
+        "about", "overview", "explain", "document", "file", "the", "and",
+        "that", "this", "with", "from", "what", "is",
+    }
+    tokens = [t.lower() for t in re.split(r"\s+", cleaned) if len(t) > 2 and t.lower() not in stopwords]
+    # Add joined variant to match filenames like "ticketRecords" when query is "ticket records"
+    if len(tokens) > 1:
+        joined = "".join(tokens)
+        if joined and joined not in tokens:
+            tokens.append(joined)
+    return tokens
+
+
+SUMMARY_REQUEST_PATTERNS = (
+    "summarize", "summary", "overview", "tell me about",
+    "what is this document", "explain this document", "review",
+    "analyze", "analyse",
+)
+
+
+def is_document_summary_request(text: str) -> bool:
+    lower = (text or "").lower()
+    return any(p in lower for p in SUMMARY_REQUEST_PATTERNS)
+
+
+def is_document_title_list_request(text: str, recent_history: list[str] | None = None) -> bool:
+    """Detect metadata listing requests that should enumerate titles directly."""
+    lower = (text or "").lower().strip()
+    if not lower:
+        return False
+    listing_words = ("list", "show", "give me", "what are", "available", "top")
+    title_words = ("document", "documents", "file", "files", "title", "titles")
+    if any(w in lower for w in listing_words) and any(w in lower for w in title_words):
+        return True
+    if re.search(r"\btop\s+\d+\s+(document|documents|file|files|title|titles)\b", lower):
+        return True
+    history_text = " ".join(recent_history or []).lower()
+    previous_was_listing = any(w in history_text for w in ("available document", "document titles", "file titles"))
+    if previous_was_listing and any(p in lower for p in ("search for more", "find more", "show more", "list more", "more documents", "more files", "next 10", "next ten", "next page", "more")):
+        return True
+    return False
+
+
+def is_document_title_pagination_request(text: str) -> bool:
+    lower = (text or "").lower().strip()
+    return any(p in lower for p in ("next 10", "next ten", "next page", "more", "show more", "list more", "more documents", "more files", "search for more", "find more"))
+
+
+def is_document_title_summary_request(text: str) -> bool:
+    """Detect follow-ups asking to summarize the titles just listed."""
+    lower = (text or "").lower().strip()
+    if not lower:
+        return False
+    summary_words = ("summary", "summarize", "summarise", "describe", "short summary", "what is each", "what are these")
+    each_words = ("each", "all", "these", "them", "those", "listed", "above")
+    url_words = ("url", "link", "links")
+    return (
+        any(w in lower for w in summary_words)
+        and (any(w in lower for w in each_words) or any(w in lower for w in url_words))
+    )
+
+
+def requested_title_limit(text: str, default: int = 10) -> int:
+    match = re.search(r"\btop\s+(\d+)\b|\b(\d+)\s+(?:document|documents|file|files|title|titles)\b", text or "", re.IGNORECASE)
+    if not match:
+        return default
+    value = next((g for g in match.groups() if g), None)
+    try:
+        return max(1, min(int(value), 50))
+    except Exception:
+        return default
+
+
+def short_document_summary_from_content(content: str, max_chars: int = 280) -> str:
+    """Create a compact extractive summary from cached document text."""
+    text = _strip_html(content or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^(word|pdf|powerpoint|excel|csv|file)\s*:\s*[^ ]+\s*", "", text, flags=re.IGNORECASE)
+    if not text:
+        return "No cached text content is available for a summary."
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    picked: list[str] = []
+    total = 0
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if len(sentence) < 20:
+            continue
+        if total + len(sentence) > max_chars and picked:
+            break
+        picked.append(sentence)
+        total += len(sentence) + 1
+        if total >= max_chars:
+            break
+    summary = " ".join(picked).strip() or text[:max_chars].strip()
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 3].rstrip() + "..."
+    return summary
+
+
+def normalized_doc_title(text: str) -> str:
+    text = (text or "").lower()
+    text = re.sub(r"\.(docx?|pdf|pptx?|xlsx?|csv|txt|md|json|xml)$", "", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def main_query_phrase(text: str) -> str:
+    stopwords = {
+        "can", "you", "please", "for", "summarize", "summary", "tell",
+        "about", "overview", "explain", "document", "file", "the", "and",
+        "that", "this", "with", "from", "what", "is",
+    }
+    cleaned = clean_search_query(text)
+    return " ".join(
+        t.lower()
+        for t in re.split(r"\s+", cleaned)
+        if len(t) > 2 and t.lower() not in stopwords
+    )
+
+
+def title_match_strength(doc: dict, query: str) -> tuple[int, str]:
+    """Return a title-first match strength and normalized title."""
+    title = normalized_doc_title(doc.get("name") or doc.get("title") or "")
+    phrase = main_query_phrase(query)
+    terms = query_tokens(query)
+    if not title or not terms:
+        return (0, title)
+    if phrase and title == phrase:
+        return (100, title)
+    if phrase and phrase in title:
+        return (90, title)
+    matches = sum(1 for t in terms if t in title)
+    if matches == len(terms):
+        return (80, title)
+    if matches >= max(1, len(terms) - 1) and matches >= 2:
+        return (65, title)
+    if matches:
+        return (25 + matches * 10, title)
+    return (0, title)
+
+
+def is_cached_sharepoint_doc(doc: dict) -> bool:
+    url = (doc.get("webUrl") or doc.get("url") or doc.get("file_path") or "").lower()
+    metadata = doc.get("metadata") or {}
+    return bool(
+        doc.get("_from_document_cache")
+        or doc.get("_from_sharepoint")
+        or doc.get("visibility") == "shared"
+        or "sharepoint" in url
+        or doc.get("drive_id")
+        or doc.get("driveId")
+        or doc.get("item_id")
+        or doc.get("itemId")
+        or metadata.get("drive_id")
+        or metadata.get("item_id")
+    )
+
 
 def is_document_file(filename: str) -> bool:
     """Check if filename has a supported document extension (not a folder)."""
@@ -204,12 +736,12 @@ def validate_file_attachment(att) -> tuple[bool, str]:
             
             # Check blocked types first
             if ext in Config.BLOCKED_FILE_TYPES:
-                return False, f"❌ File type '{ext}' is not allowed for security reasons."
+                return False, f"âŒ File type '{ext}' is not allowed for security reasons."
             
             # Check allowed types
             if ext not in Config.ALLOWED_FILE_TYPES:
                 allowed_list = ', '.join(sorted(Config.ALLOWED_FILE_TYPES))
-                return False, f"❌ File type '{ext}' is not supported. Allowed: {allowed_list}"
+                return False, f"âŒ File type '{ext}' is not supported. Allowed: {allowed_list}"
         
         # Check file size (if available)
         content = getattr(att, "content", None)
@@ -218,12 +750,61 @@ def validate_file_attachment(att) -> tuple[bool, str]:
             if size_bytes > 0:
                 size_mb = size_bytes / (1024 * 1024)
                 if size_mb > Config.MAX_FILE_SIZE_MB:
-                    return False, f"❌ File size ({size_mb:.1f}MB) exceeds limit of {Config.MAX_FILE_SIZE_MB}MB."
+                    return False, f"âŒ File size ({size_mb:.1f}MB) exceeds limit of {Config.MAX_FILE_SIZE_MB}MB."
         
         return True, ""
     except Exception as e:
         logger.error(f"Error validating attachment: {e}")
-        return False, f"❌ Unable to validate file: {str(e)}"
+        return False, f"âŒ Unable to validate file: {str(e)}"
+
+
+# ---------------------------
+# Document Access Check - filter out inaccessible documents
+# ---------------------------
+def is_inaccessible_content(content: str) -> bool:
+    """Check if document content indicates access failure or unauthorized.
+    
+    Returns True if content is a SHORT error message indicating the user cannot access the document.
+    Only checks the first 500 chars â€” real documents can contain words like "unauthorized"
+    in their body text (e.g. employee handbooks, policy documents) which must NOT trigger this.
+    Additionally, if the content is long (>800 chars), it's almost certainly real document text,
+    not an error page.
+    """
+    if not content or not isinstance(content, str):
+        return False
+    
+    stripped = content.strip()
+    
+    # Real documents are long; error pages are short.
+    # If we got >800 chars of content, it's genuine document text â€” never reject.
+    if len(stripped) > 800:
+        return False
+    
+    content_lower = stripped.lower()
+    
+    # Check for explicit error markers (only meaningful in short error responses)
+    error_markers = [
+        "[unable to download:",
+        "[content appears to be an html viewer page",
+        "http 400",
+        "http 403",
+        "http 404",
+        "check files.read.all permission",
+        "resource not found for the segment",
+    ]
+    
+    # These markers are only checked if the content is SHORT (likely an error page)
+    if any(marker in content_lower for marker in error_markers):
+        return True
+    
+    # "access denied" and "unauthorized" only match if the ENTIRE content is an error message
+    # (short text that is basically just the error itself, not a real document body)
+    if len(stripped) < 300:
+        short_error_markers = ["access denied", "unauthorized", "403 forbidden", "401 unauthorized"]
+        if any(marker in content_lower for marker in short_error_markers):
+            return True
+    
+    return False
 
 
 # ---------------------------
@@ -392,11 +973,20 @@ def get_cached_user_profile(user_id: str, user_assertion: str | None = None) -> 
 
     # 1) In-memory
     if user_id in _user_profile_cache:
-        logger.info(f"Using cached profile for user: {_user_profile_cache[user_id].get('displayName')}")
-        return _user_profile_cache[user_id]
+        cached = _user_profile_cache[user_id]
+        # If cached entry has no email, treat as stale and re-fetch from Graph
+        if cached.get('mail') or cached.get('userPrincipalName'):
+            logger.info(f"Using cached profile for user: {cached.get('displayName')}")
+            return cached
+        else:
+            logger.info(f"Cached profile for {cached.get('displayName')} has no email â€” re-fetching from Graph")
 
     # 2) Disk-backed JSON cache
+    disk_read_started_at = time.perf_counter()
     disk_cache = _read_user_profiles_cache()
+    disk_read_elapsed = time.perf_counter() - disk_read_started_at
+    if disk_read_elapsed > 0.25:
+        logger.info(f"⏱️  User profile disk cache read took {disk_read_elapsed:.2f}s")
     entry = disk_cache.get(user_id)
     if isinstance(entry, dict) and entry:
         if "profile" in entry and isinstance(entry["profile"], dict):
@@ -404,12 +994,20 @@ def get_cached_user_profile(user_id: str, user_assertion: str | None = None) -> 
         else:
             # Back-compat: flat format
             prof = entry
-        _user_profile_cache[user_id] = prof
-        logger.info(f"Loaded user profile from disk cache: {prof.get('displayName')}")
-        return prof
+        # Only use disk cache if it has email; otherwise re-fetch
+        if prof.get('mail') or prof.get('userPrincipalName'):
+            _user_profile_cache[user_id] = prof
+            logger.info(f"Loaded user profile from disk cache: {prof.get('displayName')}")
+            return prof
+        else:
+            logger.info(f"Disk-cached profile for {prof.get('displayName')} has no email â€” re-fetching from Graph")
 
-    # 3) Graph fallback (prefer delegated via OBO when user_assertion is provided)
+    # Fetch from Graph API using app-only tokens
+    fetch_started_at = time.perf_counter()
     profile = get_user_profile(user_id, user_assertion=user_assertion)
+    fetch_elapsed = time.perf_counter() - fetch_started_at
+    if fetch_elapsed > 0.5:
+        logger.info(f"⏱️  User profile Graph fetch took {fetch_elapsed:.2f}s")
     if profile:
         _user_profile_cache[user_id] = profile
         # Persist to disk in nested format
@@ -560,7 +1158,7 @@ def add_background_task(task, task_name: str = ""):
                 logger.error(f"Task '{task_name}' failed: {t.exception()}", exc_info=t.exception())
             else:
                 result = t.result()
-                logger.info(f"✓ Task '{task_name}' completed successfully. Result: {result} pages indexed")
+                logger.info(f"âœ“ Task '{task_name}' completed successfully. Result: {result} pages indexed")
         finally:
             # Remove task from background_tasks list once it's done
             try:
@@ -631,12 +1229,17 @@ async def ensure_shared_crawl():
 # Instructions
 # ---------------------------
 def load_instructions() -> str:
-    path = os.path.join(os.path.dirname(__file__), "instructions.txt")
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return "You are a helpful assistant. Be concise and professional."
+    base_dir = os.path.dirname(__file__)
+    for filename in ("prompts/instructions.txt",):
+        path = os.path.join(base_dir, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return content
+        except FileNotFoundError:
+            continue
+    return "You are a helpful assistant. Be concise and professional."
 
 BASE_INSTRUCTIONS = load_instructions()
 
@@ -726,154 +1329,440 @@ def _strip_html(text: str) -> str:
     except Exception:
         return text
 
+# ===== STABILIZATION: Helper Functions =====
+
+def is_small_talk(text: str) -> bool:
+    """Detect greetings, acknowledgements, and light social messages.
+
+    These should NEVER trigger SharePoint, cache, Graph, or document retrieval.
+    They are conversation-management turns, not knowledge requests.
+    """
+    if not text:
+        return False
+
+    normalized = re.sub(r"[^a-z0-9' ]+", "", text.strip().lower())
+    normalized = " ".join(normalized.split())
+
+    small_talk_exact = {
+        "hi", "hello", "hey", "yo", "sup", "hola",
+        "good morning", "good afternoon", "good evening",
+        "gm", "bye", "goodbye", "see ya", "later",
+        "thanks", "thank you", "thanks a lot", "appreciate it",
+        "ok", "okay", "k", "yes", "no", "sure", "got it", "understood",
+        "cool", "nice", "great", "awesome", "wow", "lol", "haha",
+        "i love you", "love you", "ily", "you are amazing", "youre amazing",
+        "you are the best", "youre the best", "good job", "well done",
+    }
+
+    if normalized in small_talk_exact:
+        return True
+
+    small_talk_patterns = (
+        "how are you",
+        "how's it going",
+        "hows it going",
+        "what's up",
+        "whats up",
+        "thank you for",
+        "thanks for",
+        "i appreciate you",
+    )
+    return any(p in normalized for p in small_talk_patterns)
+
+
+def is_personal_advice_request(text: str) -> bool:
+    """Detect personal/life-advice requests that should be answered directly."""
+    if not text:
+        return False
+
+    normalized = re.sub(r"[^a-z0-9' ]+", " ", text.strip().lower())
+    normalized = " ".join(normalized.split())
+
+    personal_markers = (
+        "my girlfriend", "my gf", "my boyfriend", "my bf", "my partner",
+        "my wife", "my husband", "my friend", "my family", "my mom",
+        "my dad", "relationship", "dating", "breakup", "broke up",
+        "drunk", "saloon", "salon", "bar", "late at night",
+        "what would you have done", "what should i do", "please guide me",
+        "guide me through", "i feel", "i'm worried", "im worried",
+        "i am worried", "i'm upset", "im upset", "i am upset",
+    )
+    if not any(marker in normalized for marker in personal_markers):
+        return False
+
+    organizational_markers = (
+        "swope", "sharepoint", "company", "organization", "policy",
+        "procedure", "handbook", "employee", "hr", "clinic",
+        "document", "file", "report",
+    )
+    return not any(
+        re.search(r"\b" + re.escape(marker).replace(r"\ ", r"\s+") + r"\b", normalized)
+        for marker in organizational_markers
+    )
+
+
+def small_talk_response(text: str) -> str:
+    """Return a short Teams-native response for small-talk turns."""
+    normalized = re.sub(r"[^a-z0-9' ]+", "", (text or "").strip().lower())
+    normalized = " ".join(normalized.split())
+
+    if normalized in {"hi", "hello", "hey", "yo", "sup", "hola", "good morning", "good afternoon", "good evening", "gm"}:
+        return "Hi! How can I help you today?"
+    if normalized in {"thanks", "thank you", "thanks a lot", "appreciate it", "thank you for", "thanks for"} or normalized.startswith(("thanks for", "thank you for")):
+        return "You're welcome. What would you like to work on next?"
+    if normalized in {"bye", "goodbye", "see ya", "later"}:
+        return "Goodbye!"
+    if normalized in {"i love you", "love you", "ily", "you are amazing", "youre amazing", "you are the best", "youre the best", "good job", "well done"}:
+        return "Thatâ€™s kind of you, thank you. How can I help with your work today?"
+    if normalized in {"ok", "okay", "k", "yes", "sure", "got it", "understood", "cool", "nice", "great", "awesome", "wow", "lol", "haha"}:
+        return "Got it. What should we do next?"
+    return "I'm here. How can I help?"
+
+
+def safe_truncate(text: str, max_chars: int = 6000) -> str:
+    """Hard-cap any text for LLM context. Cache may store full text; prompt must use snippets only."""
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n[...TRUNCATED...]"
+
+def estimate_tokens(text: str) -> int:
+    """Quick token estimation: ~1 token per 4 chars (rough GPT-5.2 estimate)."""
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
+
+def cap_doc_content(text: str, max_chars: int = 12000) -> str:
+    """Cap document content to prevent full PDF injection into prompts."""
+    if not text:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[DOCUMENT CONTENT CAPPED - FULL CONTENT IN CACHE]"
+
+def _has_meaningful_source_content(doc: dict | None, min_chars: int = 100) -> bool:
+    """Return True if a source has enough content to justify references."""
+    if not doc:
+        return False
+    if doc.get("_access_denied"):
+        return False
+    content = (doc.get("content") or doc.get("snippet") or "").strip()
+    return len(content) >= min_chars
+
 def build_llm_input(
     user_text: str,
     attachment_texts: list[str],
     doc_items: list[dict],
-    web_text: str,
     personalization: str,
     memory_text: str = ""
 ) -> tuple[str, dict]:
-    """Construct prompt with full document content - minimal truncation.
+    """Construct a token-safe LLM prompt using priority-based compression.
+
+    Priority order:
+        1. User question          â€” never compressed
+        2. Document snippets      â€” compressed per-doc and total (Includes Web results)
+        3. Attachment snippets    â€” compressed per-file and total
+        4. Memory                 â€” compressed
 
     doc_items: [{"title": str, "url": str, "snippet": str}]
     Returns (prompt_text, log_info)
     """
-    # Config budgets - REDUCED to prevent crashes with large attachments
-    # GPT-4.1 supports 128K tokens but we limit for memory safety
-    MAX_PROMPT_TOKENS = int(getattr(Config, "MAX_PROMPT_TOKENS_APPROX", 40000))  # ~40K tokens = safe
-    MAX_PROMPT_CHARS = int(getattr(Config, "MAX_PROMPT_CHARS", 160000))  # ~160KB total
-    MAX_DOCS = int(getattr(Config, "MAX_DOCS", 20))
-    MAX_SNIPPET_CHARS = int(getattr(Config, "MAX_SNIPPET_CHARS", 100000))
-    MAX_ATTACH_CHARS = int(getattr(Config, "MAX_ATTACH_CHARS", 120000))  # ~120KB for all attachments
-    MAX_WEB_CHARS = int(getattr(Config, "MAX_WEB_CHARS", 20000))
-    MAX_MEMORY_TURNS = int(getattr(Config, "MAX_MEMORY_TURNS", 20))
+    from utils.context_budget import compress_for_llm, enforce_context_budget
 
-    # Prepare sections (HTML to text) - PRESERVE FULL CONTENT
+    # â”€â”€ Budget constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    MAX_PROMPT_CHARS  = int(getattr(Config, "MAX_PROMPT_CHARS", 80000))
+    MAX_DOCS          = int(getattr(Config, "MAX_DOCS", 8))
+    MAX_DOC_PER_DOC   = int(getattr(Config, "MAX_DOC_SNIPPET_CHARS", 6000))
+    MAX_DOC_TOTAL     = int(getattr(Config, "MAX_TOTAL_CONTEXT_CHARS", 24000))
+    # FIX: Summary/overview requests need enough cached document content to be useful.
+    # Otherwise a full handbook is reduced to a tiny excerpt and the model says
+    # it cannot summarize. Keep this bounded but larger than normal Q&A snippets.
+    if re.search(r"\b(summarize|summary|overview|tell me about|what is|explain)\b", (user_text or "").lower()):
+        MAX_DOC_PER_DOC = max(MAX_DOC_PER_DOC, int(os.getenv("SUMMARY_DOC_SNIPPET_CHARS", "18000")))
+        MAX_DOC_TOTAL = max(MAX_DOC_TOTAL, int(os.getenv("SUMMARY_TOTAL_CONTEXT_CHARS", "36000")))
+    MAX_ATTACH_CHARS  = int(getattr(Config, "MAX_ATTACH_CHARS", 40000))
+    MAX_LLM_ATTACH    = int(getattr(Config, "MAX_LLM_ATTACH_CHARS", 100000))
+    MAX_MEMORY_TURNS  = int(getattr(Config, "MAX_MEMORY_TURNS", 1))
+
+    # ISSUE 5 â€” Reduce doc count when PDFs present (token-dense)
+    _has_pdf = any(
+        (d.get("title") or d.get("name") or "").lower().endswith(".pdf")
+        for d in (doc_items or [])
+    )
+    if _has_pdf and MAX_DOCS > 2:
+        MAX_DOCS = 2
+        logger.info(f"ðŸ“„ ISSUE 5: PDFs detected in doc_items â€” limiting to {MAX_DOCS} docs")
+
+    # â”€â”€ 1. User text (priority 1 â€” never compressed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     utext = (user_text or "").strip()
     ptext = _strip_html(personalization or "")
-    web_plain = _strip_html(web_text or "")  # No truncation
-    # Attachments: concat ALL content without artificial limits
+    utext_lower_for_intent = utext.lower()
+    document_advice_intent = any(
+        phrase in utext_lower_for_intent
+        for phrase in (
+            "what do you suggest", "what should i add", "what can i add",
+            "what would you add", "suggest i add", "suggestions",
+            "recommend", "recommendations", "improve it", "improve this",
+            "improve the document", "what is missing", "what's missing",
+            "anything missing", "gaps", "make it better", "how can i improve",
+            "what else should",
+        )
+    )
+
+    # â”€â”€ 2. Documents (priority 2 â€” compressed per-doc + total) â”€â”€â”€â”€â”€â”€â”€
+    docs = []
+    doc_used = 0
     compare_intent = False
     try:
         utext_lower = (utext or "").lower()
-        compare_keywords = ("compare", "difference", "differences", "diff", "similar", "similarities", "contrast", "vs", "versus")
-        compare_intent = len(attachment_texts or []) > 1 and any(k in utext_lower for k in compare_keywords)
-        if len(attachment_texts or []) > 1 and "summarize" in utext_lower and not compare_intent:
+        compare_keywords = ("compare", "difference", "differences", "diff",
+                            "similar", "similarities", "contrast", "vs", "versus")
+        compare_intent = len(attachment_texts or []) > 1 and any(
+            k in utext_lower for k in compare_keywords
+        )
+        if (len(attachment_texts or []) > 1
+                and "summarize" in utext_lower
+                and not compare_intent):
             utext = f"{utext}\nPlease summarize each attachment separately."
     except Exception:
         compare_intent = False
 
-    # PRESERVE ALL ATTACHMENT CONTENT - no artificial per-attachment limits
-    attach_segments = [_strip_html(t) for t in (attachment_texts or []) if t]
+    for d in (doc_items or []):
+        if len(docs) >= MAX_DOCS:
+            break
+        title = (d.get("title") or d.get("name") or "Untitled").strip()
+        url   = (d.get("url") or "").strip()
+        raw   = _strip_html(d.get("snippet") or d.get("content") or "")
+        if not raw:
+            continue
+
+        # Per-doc compression â€” NEVER append raw content
+        remaining = max(0, MAX_DOC_TOTAL - doc_used)
+        per_doc_cap = MAX_DOC_PER_DOC
+        if d.get("primary") and is_document_summary_request(user_text):
+            per_doc_cap = max(per_doc_cap, int(os.getenv("SUMMARY_PRIMARY_DOC_CHARS", "20000")))
+        cap = min(per_doc_cap, remaining)
+        if cap <= 0:
+            logger.info(f"â›” Doc budget full ({doc_used:,}/{MAX_DOC_TOTAL:,}). Skipping: {title}")
+            break
+        snippet = compress_for_llm(raw, cap, label=f"doc:{title[:40]}")
+        total_chars = int(d.get("total_chars") or len(raw))
+        truncated = bool(d.get("truncated") or total_chars > len(snippet))
+        if truncated:
+            snippet += (
+                "\n\n[TRUNCATION NOTE: Only part of this document may be included in the prompt. "
+                "Do not claim the full document has no additional content unless the full document was actually included. "
+                "If summarizing, say: This summary is based on the included portion of the document.]"
+            )
+        doc_used += len(snippet)
+        docs.append({"title": title, "url": url, "snippet": snippet, "truncated": truncated, "total_chars": total_chars})
+
+    # â”€â”€ 3. Attachments (priority 3 â€” compressed per-file + total) â”€â”€â”€â”€
+    attach_segments = []
+    for i, text in enumerate(attachment_texts or []):
+        if not text:
+            continue
+        cleaned = _strip_html(text)
+        compressed = compress_for_llm(cleaned, MAX_ATTACH_CHARS,
+                                      label=f"attachment-{i+1}")
+        attach_segments.append(compressed)
+
+    # Enforce total attachment budget
+    total_attach = sum(len(s) for s in attach_segments)
+    if total_attach > MAX_LLM_ATTACH:
+        logger.info(
+            f"Total attachment chars ({total_attach:,}) > "
+            f"MAX_LLM_ATTACH_CHARS ({MAX_LLM_ATTACH:,}). Trimming."
+        )
+        trimmed, running = [], 0
+        for seg in attach_segments:
+            if running + len(seg) > MAX_LLM_ATTACH:
+                trimmed.append(seg[:MAX_LLM_ATTACH - running])
+                break
+            trimmed.append(seg)
+            running += len(seg)
+        attach_segments = trimmed
     attach_plain = "\n\n---\n\n".join(attach_segments) if attach_segments else ""
 
-    # Doc snippets: preserve FULL content from each document
-    docs = []
-    for d in (doc_items or []):
-        title = (d.get("title") or d.get("name") or "Untitled").strip()
-        url = (d.get("url") or "").strip()
-        # Convert local paths to network paths and format as non-clickable reference
-        url_reference = _convert_to_network_path(url) if url else ""
-        # FULL content - no truncation
-        snippet = _strip_html((d.get("snippet") or d.get("content") or ""))
-        if not snippet:
-            continue
-        docs.append({"title": title, "url": url_reference, "snippet": snippet})
-    # Respect MAX_DOCS hard limit initially
-    docs = docs[:MAX_DOCS]
+    # â”€â”€ 4. Memory (priority 4) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    mem_plain = ""
+    if memory_text:
+        mem_plain = compress_for_llm(_strip_html(memory_text), 4000,
+                                     label="memory")
 
-    # Build initial plain-text prompt sections
-    parts = []
-    parts.append(utext)
+    # â”€â”€ Assemble prompt blocks with priorities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    blocks = []
+    priorities = []
+
+    blocks.append(utext);                                      priorities.append(1)
     if ptext:
-        parts.append(ptext)
+        blocks.append(ptext);                                  priorities.append(1)
     if attach_plain:
-        parts.append(f"[ATTACHMENTS]\n{attach_plain}")
+        blocks.append(f"[ATTACHMENTS]\n{attach_plain}");       priorities.append(2)
     if docs:
         doc_lines = []
         for i, d in enumerate(docs, 1):
             lines = [f"[DOC {i}] {d['title']}"]
-            if d['url']:
-                lines.append(d['url'])
-            lines.append(d['snippet'])
+            if d.get("url"):
+                lines.append(f"URL: {d['url']}")
+            lines.append(d["snippet"])
             doc_lines.append("\n".join(lines))
-        parts.append("\n\n".join(doc_lines))
-    if web_plain:
-        parts.append(f"[WEB]\n{web_plain}")
-    if memory_text:
-        parts.append(f"[MEMORY (last {MAX_MEMORY_TURNS})]\n{_strip_html(memory_text)}")
+        blocks.append("\n\n".join(doc_lines));                 priorities.append(3)
+    if mem_plain:
+        blocks.append(
+            f"[MEMORY (last {MAX_MEMORY_TURNS})]\n{mem_plain}"
+        );                                                      priorities.append(4)
 
-    prompt = "\n\n".join([p for p in parts if p])
+    # Citation instructions
+    if docs:
+        if document_advice_intent:
+            blocks.append(
+                "[DOCUMENT REVIEW / RECOMMENDATION MODE]\n"
+                "The user is asking for professional suggestions about improving the document, "
+                "not asking whether the document itself contains recommendations.\n"
+                "Use the included document content to identify what is already covered, then provide "
+                "clearly labeled recommendations for additions, gaps, or improvements.\n"
+                "Cite the document when describing what it currently includes. Do not cite a recommendation "
+                "as if the document stated it. Recommendations may be uncited when clearly labeled as suggested additions.\n"
+                "If the document is truncated, say the recommendations are based on the included portion."
+            )
+            priorities.append(1)
 
-    # Section sizes for logging
+        cite_map_lines = []
+        for i, d in enumerate(docs, 1):
+            u = d.get("url") or ""
+            cite_map_lines.append(
+                f"  [{i}] {d['title']} -> {u}" if u else f"  [{i}] {d['title']}"
+            )
+        cite_map = "\n".join(cite_map_lines)
+        blocks.append(
+            "[CITATION REQUIREMENTS - MANDATORY]\n"
+            "ðŸš¨ YOU MUST cite sources inline for EVERY organizational fact.\n"
+            "Citations are MANDATORY, not optional.\n\n"
+            "Format: [[number]](URL) placed right after the sentence that uses the source.\n"
+            "Example: 'The CIO is John Smith [[1]](https://sharepoint.../doc.pdf).'\n\n"
+            f"Available sources:\n{cite_map}\n\n"
+            "CRITICAL RULES:\n"
+            "âœ… Cite EVERY fact from organizational sources\n"
+            "âœ… Use [[N]](URL) format immediately after each cited fact\n"
+            "âœ… Number citations sequentially [1], [2], [3]...\n"
+            "âŒ NEVER provide information without citations when sources are available\n"
+            "âŒ NEVER use general knowledge for any topic that triggered a search\n"
+            "âŒ NEVER cite documents you did not actually use\n\n"
+            "Do NOT include a References section at the end â€” it will be added automatically.\n"
+            "Exception: for clearly labeled document-improvement recommendations, cite only the document facts "
+            "you reviewed; do not pretend the recommendation itself appears in the source.\n\n"
+            "Only cite documents whose content you actually used in your answer."
+        )
+        priorities.append(2)
+        
+        # ZERO VAGUE REFERENCES - tie everything to extracted content
+        blocks.append(
+            "[ZERO VAGUE REFERENCES - CRITICAL]\n"
+            "ðŸš¨ EVERY statement MUST be tied to SPECIFIC extracted content above.\n\n"
+            "âŒ FORBIDDEN VAGUE PHRASES:\n"
+            "â€¢ 'According to the documents...'\n"
+            "â€¢ 'The files mention...'\n"
+            "â€¢ 'Based on the information provided...'\n"
+            "â€¢ 'It appears that...'\n"
+            "â€¢ 'The search results indicate...'\n"
+            "â€¢ 'The organization provides...'\n"
+            "â€¢ Any general statement without direct reference to specific text\n\n"
+            "âœ… REQUIRED PATTERN:\n"
+            "Every claim â†’ Quote specific text from [DOC N] above + cite [[N]](URL)\n\n"
+            "Example of WRONG:\n"
+            "'Swope Health offers various healthcare services.'\n\n"
+            "Example of CORRECT:\n"
+            "'Swope Health offers \"primary care, dental, and behavioral health services\" [[1]](URL).'\n\n"
+            "ðŸŽ¯ VERIFICATION: Before each statement, ask:\n"
+            "RECOMMENDATION EXCEPTION:\n"
+            "When the user asks what to add, improve, or what is missing from a document, you may provide "
+            "clearly labeled recommendations derived from gaps in the included content. Cite the document "
+            "for what it currently contains, and label your additions as recommendations instead of source facts.\n\n"
+            "1. Can I point to the EXACT text in [DOC N] that supports this?\n"
+            "2. Did I quote or closely paraphrase that specific text?\n"
+            "3. Did I cite the source?\n"
+            "If ANY answer is NO, rewrite or remove the statement unless it is clearly labeled as a recommendation."
+        )
+        priorities.append(1)
+    else:
+        blocks.append(
+            "[NO DOCUMENT SOURCES IN THIS PROMPT]\n"
+            "CRITICAL RULES:\n"
+            "1. If this is casual conversation, reply naturally and briefly.\n"
+            "2. If this is a general knowledge question, answer from general knowledge.\n"
+            "3. If this is an organizational/document question and no source content was retrieved, say no matching source content was found after checking all available sources.\n"
+            "4. Do not invent organizational facts.\n"
+            "5. Do not claim you searched unless the app actually performed a search.\n"
+            "6. Do NOT include a References section.\n"
+        )
+        priorities.append(1)
+    blocks.append(
+        "[CRITICAL: Source Usage Verification]\n"
+        "ðŸš¨ STRICT CONTENT TRACEABILITY:\n"
+        "1. ONLY reference information that appears in the [DOC N] blocks above\n"
+        "2. If a fact is in your answer, it MUST be quotable from [DOC N] content\n"
+        "3. Do not claim to have used web or document sources unless their actual content appears in this prompt\n"
+        "4. For all search-based questions: search all available sources first, then either provide source-based answers with citations or an explicit 'not found' statement. Nothing in between.\n\n"
+        "If you cannot find specific text in the [DOC N] blocks to support a factual claim, do NOT make that claim. "
+        "For clearly labeled document-improvement recommendations, you may suggest additions based on gaps in the included content."
+    )
+    priorities.append(1)
+
+    # Formatting rules
+    blocks.append(
+        "[FORMATTING RULES]\n"
+        "Structure every multi-point answer with **bold section headings** on their own line, "
+        "followed by bullet points (use - ) under each heading.\n"
+        "Wrap key terms, names, dates, and file names in **bold**.\n"
+        "Use numbered lists when order matters.\n"
+        "Start summaries with a 1-2 sentence overview before the headed sections.\n"
+        "Never output a flat list of dashes without section headings.\n"
+        "Keep each bullet to 1-2 sentences."
+    )
+    priorities.append(1)
+
+    # â”€â”€ Priority-aware assembly with budget enforcement â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    prompt = enforce_context_budget(
+        blocks, max_chars=MAX_PROMPT_CHARS, priorities=priorities
+    )
+
+    # Absolute hard-cap safety net
+    ABSOLUTE_MAX = 120_000
+    if len(prompt) > ABSOLUTE_MAX:
+        logger.error(
+            f"Prompt exceeded ABSOLUTE MAX ({len(prompt):,}) â†’ forcing trim"
+        )
+        prompt = prompt[:ABSOLUTE_MAX]
+
+    # â”€â”€ Logging â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     sizes = {
         "user": len(utext),
         "attachments": len(attach_plain),
-        "docs": sum(len(d['snippet']) for d in docs),
-        "web": len(web_plain),
-        "memory": len(memory_text or ""),
+        "docs": sum(len(d["snippet"]) for d in docs),
+        "memory": len(mem_plain),
     }
-
-    # Log budget values for debugging
-    logger.info(f"Budget check: MAX_PROMPT_TOKENS={MAX_PROMPT_TOKENS}, MAX_PROMPT_CHARS={MAX_PROMPT_CHARS}, MAX_ATTACH_CHARS={MAX_ATTACH_CHARS}")
-    
-    # Truncation guard - use configured limits to prevent crashes
+    est_tokens = max(1, len(prompt) // 4)
     actions = []
-    def within_budget(text: str) -> bool:
-        return len(text) <= MAX_PROMPT_CHARS
-    
-    # Truncate if content exceeds configured limit
-    if len(prompt) > MAX_PROMPT_CHARS:
-        # 1) Drop web first
-        if web_plain:
-            actions.append("drop:web")
-            web_plain = ""
-            prompt = "\n\n".join([utext, ptext, (f"[ATTACHMENTS]\n{attach_plain}" if attach_plain else ""),
-                                       ("\n\n".join([f"[DOC {i+1}] {d['title']}\n{d['url']}\n{d['snippet']}" for i, d in enumerate(docs)]) if docs else ""),
-                                       (f"[MEMORY (last {MAX_MEMORY_TURNS})]\n{_strip_html(memory_text)}" if memory_text else "")]).strip()
-    
-    if len(prompt) > MAX_PROMPT_CHARS:
-        # 2) Reduce docs count
-        if len(docs) > 1:
-            new_docs = docs[:max(1, len(docs)-1)]
-            actions.append(f"reduce:docs:{len(docs)}->{len(new_docs)}")
-            docs = new_docs
-            prompt = "\n\n".join([utext, ptext, (f"[ATTACHMENTS]\n{attach_plain}" if attach_plain else ""),
-                                       ("\n\n".join([f"[DOC {i+1}] {d['title']}\n{d['url']}\n{d['snippet']}" for i, d in enumerate(docs)]) if docs else ""),
-                                       (f"[MEMORY (last {MAX_MEMORY_TURNS})]\n{_strip_html(memory_text)}" if memory_text else "")]).strip()
-    
-    if len(prompt) > MAX_PROMPT_CHARS:
-        # 3) Shorten attachments to fit budget
-        if attach_plain and len(attach_plain) > MAX_ATTACH_CHARS:
-            available = MAX_ATTACH_CHARS
-            actions.append(f"shorten:attachments:{len(attach_plain)}->{available}")
-            attach_plain = attach_plain[:available]
-            prompt = "\n\n".join([utext, ptext, (f"[ATTACHMENTS]\n{attach_plain}" if attach_plain else ""),
-                                       ("\n\n".join([f"[DOC {i+1}] {d['title']}\n{d['url']}\n{d['snippet']}" for i, d in enumerate(docs)]) if docs else ""),
-                                       (f"[MEMORY (last {MAX_MEMORY_TURNS})]\n{_strip_html(memory_text)}" if memory_text else "")]).strip()
-    
-    if len(prompt) > MAX_PROMPT_CHARS:
-        # 4) Drop memory if still over
-        if memory_text:
-            actions.append("drop:memory")
-            memory_text = ""
-            prompt = "\n\n".join([utext, ptext, (f"[ATTACHMENTS]\n{attach_plain}" if attach_plain else ""),
-                                       ("\n\n".join([f"[DOC {i+1}] {d['title']}\n{d['url']}\n{d['snippet']}" for i, d in enumerate(docs)]) if docs else "")]).strip()
-    
-    # SAFETY: Final hard limit to prevent token limit crashes
-    if len(prompt) > MAX_PROMPT_CHARS:
-        logger.warning(f"EMERGENCY TRUNCATION: Prompt still too large ({len(prompt):,} chars) - applying hard limit")
-        actions.append(f"emergency_truncate:{len(prompt)}->{MAX_PROMPT_CHARS}")
-        prompt = prompt[:MAX_PROMPT_CHARS]
-        prompt += "\n\n⚠️ [CONTENT TRUNCATED - Input exceeded maximum size]"
+    if doc_used >= MAX_DOC_TOTAL:
+        actions.append("doc_budget_full")
+    if total_attach > MAX_LLM_ATTACH if attach_segments else False:
+        actions.append("attach_trimmed")
 
     log_info = {
         "sizes": sizes,
-        "estimated_tokens": _approx_token_count(prompt),
+        "estimated_tokens": est_tokens,
         "truncation_actions": actions,
-        "doc_count": len(docs)
+        "doc_count": len(docs),
     }
+
+    logger.info(
+        f"build_llm_input: prompt={len(prompt):,} chars "
+        f"(~{est_tokens:,} tokens) | docs={len(docs)} | "
+        f"sizes={sizes} | actions={actions}"
+    )
+
     return prompt, log_info
 
 
@@ -881,7 +1770,8 @@ def build_llm_input(
 # Token factory for Teams app
 # ---------------------------
 def create_token_factory():
-    token_url = f"https://login.microsoftonline.com/{config.APP_TENANTID}/oauth2/v2.0/token"
+    tenant_id = config.GRAPH_TENANT_ID or config.APP_TENANTID
+    token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
     client_id = config.APP_ID
     client_secret = config.APP_PASSWORD
 
@@ -938,7 +1828,7 @@ def create_token_factory():
                     pass
 
             # Client credentials fallback (requires secret). Use provided scope as-is.
-            if client_id and client_secret and config.APP_TENANTID:
+            if client_id and client_secret and tenant_id:
                 data = {
                     "client_id": client_id,
                     "client_secret": client_secret,
@@ -986,99 +1876,269 @@ llm_semaphore = asyncio.Semaphore(max(1, int(getattr(Config, "LLM_CONCURRENCY", 
 
 
 # ---------------------------
-# Conversation memory and file storage
+# Conversation memory and file storage  
 # ---------------------------
-conversation_store: dict[str, ListMemory] = {}
+# âœ… SIMPLE, CLEAN CONVERSATION MANAGEMENT
+conversation_store: dict[str, ListMemory] = {}  # in-process working copy for the current message
 conversation_files: dict[str, list] = {}  # Store uploaded files per conversation
 conversation_last_query: dict[str, str] = {}  # Store last search query per conversation
+conversation_last_sources: dict[str, list] = {}  # Store last doc sources per conversation for follow-up references
+conversation_title_list_state: dict[str, dict] = {}  # Store document title pagination state per conversation
+conversation_summaries: dict[str, dict] = {}  # Compact running brief per conversation
 background_tasks: list = []  # Track background indexing tasks
-CONVERSATION_MEMORY_PATH = os.path.join(os.path.dirname(__file__), "conversation_memory.json")
-_conversation_memory_cache = {}  # In-memory cache of conversation history for instant access
 
-def _save_conversation_memory(conversation_id: str, memory: ListMemory) -> None:
-    """Persist conversation memory to disk for instant recovery"""
-    try:
-        # Convert ListMemory items to serializable format
-        items = []
-        try:
-            # Access the internal messages list if available
-            if hasattr(memory, 'messages') and memory.messages:
-                items = [{"role": m.get("role", ""), "content": m.get("content", "")} for m in memory.messages]
-            elif hasattr(memory, 'get_messages'):
-                messages = memory.get_messages()
-                items = [{"role": m.get("role", ""), "content": m.get("content", "")} for m in (messages or [])]
-        except Exception:
-            items = []
-        
-        # Load existing memory file
-        mem_data = {}
-        if os.path.exists(CONVERSATION_MEMORY_PATH):
-            try:
-                with open(CONVERSATION_MEMORY_PATH, 'r', encoding='utf-8') as f:
-                    mem_data = json.load(f) or {}
-            except Exception:
-                mem_data = {}
-        
-        # Update with current conversation
-        mem_data[conversation_id] = {
-            "messages": items,
-            "saved_at": datetime.now().isoformat()
-        }
-        
-        # Write back to disk
-        with open(CONVERSATION_MEMORY_PATH, 'w', encoding='utf-8') as f:
-            json.dump(mem_data, f, indent=2, ensure_ascii=False)
-        
-        logger.info(f"Persisted conversation memory: {conversation_id} ({len(items)} messages)")
-    except Exception as e:
-        logger.debug(f"Failed to persist conversation memory: {e}")
+# Phase 3: durable conversation memory (turns + summary + last_sources) that survives
+# restart and can be shared across instances. Backed by Azure Table Storage when
+# AZURE_STORAGE_CONNECTION_STRING is set, else a local JSON file. The in-process dicts
+# above act as the working copy for one message: hydrated on entry, flushed on exit.
+from storage.conversation_store import ConversationStore, ConversationState  # noqa: E402
+conversation_db = ConversationStore(connection_string=os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
 
-def _load_conversation_memory(conversation_id: str) -> ListMemory:
-    """Load persisted conversation memory from disk for instant recovery"""
-    try:
-        if not os.path.exists(CONVERSATION_MEMORY_PATH):
-            return ListMemory()
-        
-        with open(CONVERSATION_MEMORY_PATH, 'r', encoding='utf-8') as f:
-            mem_data = json.load(f) or {}
-        
-        conv_mem = mem_data.get(conversation_id)
-        if not conv_mem or not conv_mem.get("messages"):
-            return ListMemory()
-        
-        # Reconstruct ListMemory with messages
-        memory = ListMemory()
-        for msg in conv_mem.get("messages", []):
-            try:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                if role and content:
-                    # Add to memory internal state
-                    if hasattr(memory, 'messages'):
-                        memory.messages.append({"role": role, "content": content})
-                    else:
-                        # Fallback: try to use public API
-                        pass
-            except Exception:
-                pass
-        
-        logger.info(f"✓ Loaded persisted conversation memory: {conversation_id} ({len(conv_mem.get('messages', []))} messages)")
-        return memory
-    except Exception as e:
-        logger.debug(f"Failed to load conversation memory: {e}")
-        return ListMemory()
 
-def memory_for(conversation_id: str) -> ListMemory:
+class _StoredTurn:
+    """Lightweight memory item with mutable role/content. The SDK send() uses
+    memory=None, so ListMemory items are only read by this module — no SDK type needed."""
+    __slots__ = ("role", "content")
+
+    def __init__(self, role: str, content: str):
+        self.role = role
+        self.content = content
+
+def _get_memory_items(memory: ListMemory) -> list:
+    """Access the actual internal storage of ListMemory (NOT .messages which doesn't exist)."""
+    storage = getattr(memory, '_storage', None)
+    if storage is not None:
+        items = getattr(storage, '_items', None)
+        if items is not None:
+            return items
+    # Fallback: try .messages just in case a future SDK version adds it
+    if hasattr(memory, 'messages') and memory.messages is not None:
+        return memory.messages
+    return []
+
+
+def _set_memory_items(memory: ListMemory, items: list) -> None:
+    """Replace the actual internal storage of ListMemory."""
+    storage = getattr(memory, '_storage', None)
+    if storage is not None and hasattr(storage, '_items'):
+        storage._items = items
+        return
+    if hasattr(memory, 'messages'):
+        memory.messages = items
+
+
+def get_or_create_conversation_memory(conversation_id: str) -> ListMemory:
+    """Get or create conversation memory with NUCLEAR automated trimming"""
     if conversation_id not in conversation_store:
-        # Load from disk if available, otherwise create new
-        memory = _load_conversation_memory(conversation_id)
-        conversation_store[conversation_id] = memory
-        _conversation_memory_cache[conversation_id] = True  # Mark as loaded
-    return conversation_store[conversation_id]
+        conversation_store[conversation_id] = ListMemory()
+        is_group_conv = 'group' in conversation_id.lower() or len(conversation_id) > 50
+        conv_type = "GROUP" if is_group_conv else "PERSONAL"
+        logger.info(f"Created new {conv_type} conversation memory for {conversation_id[:20]}...")
+    
+    # NUCLEAR FIX: Enforce HARD LIMIT on conversation memory
+    memory = conversation_store[conversation_id]
+    max_turns = int(getattr(Config, "MAX_MEMORY_TURNS", 8))
+    max_messages = max_turns * 2  # Each turn = user + assistant = 2 messages
+    
+    # NUCLEAR: ALWAYS enforce max_messages â€” uses _storage._items (the REAL storage)
+    items = _get_memory_items(memory)
+    if items:
+        message_count = len(items)
+        
+        # Hard trim if exceeded
+        if message_count > max_messages:
+            _set_memory_items(memory, items[-max_messages:])
+            logger.error(f"ðŸ”ªðŸ”ª NUCLEAR TRIM: {message_count} -> {max_messages} messages ({max_turns} turns)")
+        
+        # Always log memory state for monitoring
+        if message_count > 0:
+            logger.info(f"Memory state: {message_count}/{max_messages} messages")
+    
+    return memory
 
-def files_for(conversation_id: str) -> list:
-    """Get cached attachment files for a conversation from persistent storage."""
-    return get_conversation_attachments(conversation_id)
+def clear_conversation_memory(conversation_id: str) -> bool:
+    """Clear conversation memory - simple approach"""
+    try:
+        if conversation_id in conversation_store:
+            del conversation_store[conversation_id]
+            conversation_summaries.pop(conversation_id, None)
+            logger.info(f"âœ“ Cleared conversation memory for {conversation_id[:8]}...")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Failed to clear conversation memory: {e}")
+        return False
+    finally:
+        try:
+            conversation_db.delete(conversation_id)
+        except Exception:
+            pass
+
+
+def _serialize_turns(memory: ListMemory) -> list[dict]:
+    """ListMemory items -> [{role, content}] for durable storage."""
+    out: list[dict] = []
+    for m in _get_memory_items(memory) or []:
+        content = getattr(m, "content", None) or ""
+        if not content:
+            continue
+        out.append({"role": str(getattr(m, "role", "user") or "user"), "content": str(content)})
+    return out
+
+
+def _hydrate_turns(memory: ListMemory, turns: list[dict]) -> None:
+    """[{role, content}] -> ListMemory items."""
+    items = [
+        _StoredTurn(str(t.get("role") or "user"), str(t.get("content") or ""))
+        for t in (turns or [])
+        if t.get("content")
+    ]
+    _set_memory_items(memory, items)
+
+
+def _trim_turns_to_budget(turns: list[dict], max_messages: int, max_bytes: int = 26_000) -> list[dict]:
+    """Keep at most max_messages recent messages, and ensure the JSON payload stays
+    under max_bytes (Azure Table string property limit is 32KB). Trims oldest first."""
+    turns = turns[-max_messages:] if max_messages > 0 else []
+    while turns and len(json.dumps(turns, ensure_ascii=False).encode("utf-8")) > max_bytes:
+        turns = turns[1:]
+    return turns
+
+
+def _load_conversation_state(conversation_id: str) -> None:
+    """Hydrate the in-process working copy from the durable store (called per message)."""
+    try:
+        state = conversation_db.get(conversation_id)
+        memory = get_or_create_conversation_memory(conversation_id)
+        _hydrate_turns(memory, state.turns)
+        if state.summary:
+            conversation_summaries[conversation_id] = {
+                "summary": state.summary,
+                "turn_count": max(1, len(state.turns) // 2),
+                "updated_at": state.updated_at or "",
+            }
+        if state.last_sources:
+            conversation_last_sources[conversation_id] = state.last_sources
+    except Exception as exc:
+        logger.warning("Conversation state load failed for %s: %s", conversation_id, exc)
+
+
+def _persist_conversation_state(conversation_id: str) -> None:
+    """Flush the in-process working copy to the durable store once per message."""
+    try:
+        memory = conversation_store.get(conversation_id)
+        turns = _serialize_turns(memory) if memory is not None else []
+        max_messages = int(getattr(Config, "MAX_MEMORY_TURNS", 5)) * 2
+        turns = _trim_turns_to_budget(turns, max_messages)
+        summary = (conversation_summaries.get(conversation_id, {}) or {}).get("summary", "")
+        raw_sources = conversation_last_sources.get(conversation_id, []) or []
+        last_sources = [
+            {
+                "title": s.get("title", ""),
+                "url": s.get("url", ""),
+                "snippet": (s.get("snippet", "") or "")[:2000],
+                "truncated": bool(s.get("truncated")),
+                "primary": bool(s.get("primary")),
+                "total_chars": s.get("total_chars"),
+            }
+            for s in raw_sources[:8]
+        ]
+        conversation_db.save(
+            conversation_id,
+            ConversationState(turns=turns, summary=summary, last_sources=last_sources),
+        )
+    except Exception as exc:
+        logger.warning("Conversation state persist failed for %s: %s", conversation_id, exc)
+
+def _compact_for_conversation_summary(text: str, max_chars: int = 700) -> str:
+    """Keep a message readable while removing noisy markup."""
+    if not text:
+        return ""
+    clean = _strip_html(str(text))
+    clean = re.sub(r"\s+", " ", clean).strip()
+    clean = re.sub(r"ChatSendResult\(response=ModelMessage\(content=", "", clean)
+    if len(clean) <= max_chars:
+        return clean
+    return clean[: max_chars - 3].rstrip() + "..."
+
+
+def _merge_conversation_summary(previous: str, turn_note: str, max_chars: int = 1800) -> str:
+    """Maintain a compact rolling brief without another LLM call."""
+    merged = "\n".join(p.strip() for p in (previous, turn_note) if p and p.strip())
+    if len(merged) <= max_chars:
+        return merged
+
+    lines = [line.strip() for line in merged.splitlines() if line.strip()]
+    kept: list[str] = []
+    total = 0
+    for line in reversed(lines):
+        line_len = len(line) + 1
+        if total + line_len > max_chars:
+            break
+        kept.append(line)
+        total += line_len
+    return "\n".join(reversed(kept))
+
+
+def update_conversation_summary(
+    *,
+    conversation_id: str,
+    user_text: str,
+    assistant_text: str,
+    route: dict,
+    source_names: list[str] | None = None,
+) -> None:
+    """Update a compact running brief used as quick-reference context."""
+    try:
+        previous_state = conversation_summaries.get(conversation_id, {}) or {}
+        previous_summary = previous_state.get("summary", "")
+        action = route.get("action", "respond_direct")
+        scope = route.get("scope", "local")
+        source_part = ""
+        if source_names:
+            source_part = " Sources: " + ", ".join([s for s in source_names if s][:5]) + "."
+        turn_note = (
+            f"- User: {_compact_for_conversation_summary(user_text, 450)}\n"
+            f"  Assistant: {_compact_for_conversation_summary(assistant_text, 650)}\n"
+            f"  Route: {action}/{scope}.{source_part}"
+        )
+        summary = _merge_conversation_summary(previous_summary, turn_note)
+        conversation_summaries[conversation_id] = {
+            "summary": summary,
+            "turn_count": int(previous_state.get("turn_count", 0)) + 1,
+            "last_route": action,
+            "last_scope": scope,
+            "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+        logger.info(
+            "Conversation summary updated: turns=%s chars=%s",
+            conversation_summaries[conversation_id]["turn_count"],
+            len(summary),
+        )
+    except Exception as err:
+        logger.warning("Conversation summary update failed: %s", err)
+
+
+def get_conversation_summary_text(conversation_id: str) -> str:
+    """Return the compact running brief for prompt/router context."""
+    state = conversation_summaries.get(conversation_id, {}) or {}
+    summary = state.get("summary", "")
+    if not summary:
+        return ""
+    return (
+        "[RUNNING CONVERSATION BRIEF]\n"
+        f"Updated: {state.get('updated_at', 'unknown')} | Turns summarized: {state.get('turn_count', 0)}\n"
+        f"{summary}"
+    )
+
+# âœ… REMOVED: Complex JSON persistence - using simple in-memory approach instead
+
+# Helper functions for conversation state
+def files_for(conversation_id: str, user_id: str | None = None) -> list:
+    """Get cached attachment metadata for a conversation (never full content in chat)."""
+    return get_conversation_attachments(conversation_id, include_content=False, user_id=user_id)
+
+
 
 def last_query_for(conversation_id: str) -> str:
     return conversation_last_query.get(conversation_id, "")
@@ -1151,229 +2211,63 @@ async def call_llm_with_retry(prompt_func, max_retries: int | None = None, base_
 # ---------------------------
 # LLM router for intelligent routing decisions
 # ---------------------------
-async def llm_decide_routing(model: AIModel, user_text: str, conversation_id: str = "") -> dict:
-    """Ask the LLM to intelligently analyze user intent and decide routing.
-    Returns a dict: {"action": str, "should_search": bool, "search_query": str, "scope": "graph|local"}
-    action: "respond_direct", "search_documents", "refine_previous", "clarify"
+async def llm_decide_routing(
+    model: AIModel,
+    user_text: str,
+    conversation_id: str = "",
+    has_attachments: bool = False,
+    attachment_names: list[str] | None = None,
+    has_cached_attachments: bool = False,
+    cached_attachment_names: list[str] | None = None,
+    last_query: str = "",
+    last_source_names: list[str] | None = None,
+    recent_history: list[str] | None = None,
+) -> dict:
+    """Route user requests through the dedicated smart_router module.
+
+    This keeps app.py focused on Teams orchestration while smart_router.py owns
+    the LLM-based decision policy. The router uses deterministic hard guards for
+    casual/social messages and LLM reasoning for real work requests.
     """
-    
-    # Pre-check: If user explicitly uses search keywords, force search action
-    text_lower = user_text.lower().strip()
-    search_keywords = ["search", "find", "lookup", "look for", "summarize", "tell me about", "who is", "what is", "get info"]
-    
-    has_search_keyword = any(keyword in text_lower for keyword in search_keywords)
-    
-    # Fast-path: explicit search keywords
-    if has_search_keyword:
-        # Smart query extraction - preserve meaningful content
-        query = user_text.strip()
-        
-        # Remove search prefixes but keep the rest intact
-        removals = [
-            ("search for ", ""),
-            ("search from ", ""),
-            ("search about ", ""),
-            ("search ", ""),
-            ("find me ", ""),
-            ("find ", ""),
-            ("lookup ", ""),
-            ("look for ", ""),
-            ("summarize ", ""),
-            ("tell me about ", ""),
-            ("who is ", ""),
-            ("what is ", ""),
-            ("get info about ", ""),
-            ("get info on ", ""),
-        ]
-        
-        query_lower = query.lower()
-        for prefix, replacement in removals:
-            if query_lower.startswith(prefix):
-                query = query[len(prefix):].strip()
-                break
-        
-        # If query is too generic after extraction, use last search query as context
-        generic_terms = ["the document", "it", "that", "this", "documents", "files", "data", "information", "again", "document again", "the document again"]
-        if query.lower().strip() in generic_terms or len(query.strip()) < 3:
-            # Try to use last query from conversation
-            last_query = last_query_for(conversation_id) if conversation_id else ""
-            if last_query:
-                query = last_query
-                logger.info(f"Using last query from context: '{query}'")
-            else:
-                # Keep original text but remove just the verb
-                query = user_text.strip()
-                for verb in ["search", "find", "lookup", "look for"]:
-                    query = query.lower().replace(verb + " for", "").replace(verb + " from", "").replace(verb + " about", "").replace(verb, "").strip()
-        
-        # Final fallback - if still empty, use full text
-        if not query or len(query.strip()) < 2:
-            query = user_text
-        
-        logger.info(f"LLM Decision: action='search_documents' | search=True | query='{query}' | scope='local' (keyword)")
-        return {
-            "action": "search_documents",
-            "should_search": True,
-            "is_followup": False,
-            "query": query,
-            "scope": "local",
-            "top_k": 3
-        }
-    
-    # Fast-path: treat file-like or URL queries as search, no LLM call
-    try:
-        text_lower = user_text.lower().strip()
-        looks_like_file = any(ext in text_lower for ext in [
-            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".ppt", ".pptx", ".txt"
-        ])
-        looks_like_url = text_lower.startswith("http://") or text_lower.startswith("https://")
-        if looks_like_file or looks_like_url:
-            query = user_text.strip()
-            logger.info(f"LLM Decision: action='search_documents' | search=True | query='{query}' | scope='local' (file/url heuristic)")
-            return {
-                "action": "search_documents",
-                "should_search": True,
-                "is_followup": False,
-                "query": query,
-                "scope": "local",
-                "top_k": 3
-            }
-    except Exception:
-        pass
-
-    try:
-        router_instructions = (
-            "You are an intent analyzer. Read the user's message and determine what they want.\n"
-            "Return ONLY strict JSON with keys: action (string), should_search (bool), search_query (string), scope ('graph'|'local').\n"
-            "\n"
-            "ACTION TYPES:\n"
-            "\n"
-            "'respond_direct': Just talk/chat.\n"
-            "  When: 'hi', 'hello', 'how are you', 'thanks', general conversation WITHOUT asking for information.\n"
-            "\n"
-            "'refine_previous': Improve the last response.\n"
-            "  When: 'make it shorter', 'add details', 'explain more', 'change tone', 'fix that'.\n"
-            "\n"
-            "'search_documents': Find information in documents/SharePoint.\n"
-            "  When: User asks about ANY person, topic, or information that would be in documents.\n"
-            "  Examples:\n"
-            "    - 'search for employee data' → action='search_documents', query='employee data'\n"
-            "    - 'summarize employee data' → action='search_documents', query='employee data'\n"
-            "    - 'tell me about [person/topic]' → action='search_documents', query='[person/topic]'\n"
-            "    - 'what is [topic]' → action='search_documents', query='[topic]'\n"
-            "    - 'who is [person]' → action='search_documents', query='[person]'\n"
-            "    - 'find policies' → action='search_documents', query='policies'\n"
-            "    - Any question asking for factual information → action='search_documents'\n"
-            "\n"
-            "'clarify': Need more info (ONLY use if truly ambiguous).\n"
-            "  When: Request is genuinely vague and you cannot extract what they want.\n"
-            "\n"
-            "RULES:\n"
-            "1. If user asks ABOUT something (person, topic, data) → action='search_documents' (DO NOT use 'respond_direct').\n"
-            "2. Extract the search query from what they said (e.g., 'tell me about John' → query='John').\n"
-            "3. scope: 'graph' unless they mention 'uploaded' or 'attached' files.\n"
-            "4. Default to 'search_documents' when in doubt - better to search than to guess.\n"
-            "\n"
-            "OUTPUT FORMAT (must be valid JSON):\n"
-            "{ \"action\": \"search_documents\", \"should_search\": true, \"search_query\": \"the query\", \"scope\": \"graph\" }"
-        )
-
-        prompt = ChatPrompt(model)
-        
-        # Use retry logic for LLM call
-        async def make_llm_call():
-            async with llm_semaphore:
-                return await prompt.send(
-                input=user_text,
-                instructions=router_instructions,
-                memory=None,
-            )
-        
-        result_text = await call_llm_with_retry(make_llm_call)
-
-        # ChatPrompt may return str or object; ensure str
-        if hasattr(result_text, "text"):
-            result_text = result_text.text
-        elif hasattr(result_text, "response") and hasattr(result_text.response, "content"):
-            result_text = result_text.response.content
-        elif not isinstance(result_text, str):
-            result_text = str(result_text)
-
-        # Log the raw LLM response for debugging
-        logger.info(f"Raw LLM router response: {result_text}")
-
-        try:
-            # Clean up common LLM formatting issues
-            cleaned_text = (result_text or "").strip()
-            
-            # Remove markdown code blocks if present
-            if cleaned_text.startswith("```"):
-                # Remove opening ```json or ``` 
-                cleaned_text = cleaned_text.split("\n", 1)[1] if "\n" in cleaned_text else cleaned_text[3:]
-                # Remove closing ```
-                if cleaned_text.endswith("```"):
-                    cleaned_text = cleaned_text[:-3]
-                cleaned_text = cleaned_text.strip()
-            
-            data = json.loads(cleaned_text)
-            # Basic validation and defaults
-            if not isinstance(data, dict):
-                raise ValueError("Router output not a dict")
-            
-            action = str(data.get("action", "respond_direct")).lower()
-            should_search = action == "search_documents"
-            
-            result = {
-                "action": action,
-                "should_search": should_search,
-                "is_followup": action == "refine_previous",
-                "query": (data.get("search_query") or user_text).strip(),
-                "scope": (data.get("scope") or "graph").lower(),
-                "top_k": 3
-            }
-            
-            # Log the routing decision for debugging
-            logger.info(f"LLM Decision: action='{action}' | search={should_search} | query='{result['query']}' | scope='{result['scope']}'")
-            
-            return result
-        except Exception as parse_err:
-            # Fallback: respond directly (safe default)
-            logger.error(f"Failed to parse LLM router response. Error: {parse_err}. Response was: {result_text}")
-            logger.info(f"LLM Decision: action='respond_direct' | search=False | query='' | scope='graph' (fallback due to parse error)")
-            return {
-                "action": "respond_direct",
-                "should_search": False,
-                "is_followup": False,
-                "query": user_text.strip(),
-                "scope": "graph",
-                "top_k": 3,
-            }
-    except Exception as e:
-        logger.error(f"Router error: {e}")
-        logger.info(f"LLM Decision: action='respond_direct' | search=False | query='' | scope='graph' (fallback due to error)")
-        return {
-            "action": "respond_direct",
-            "should_search": False,
-            "is_followup": False,
-            "query": user_text.strip(),
-            "scope": "graph",
-            "top_k": 3,
-        }
+    return await smart_decide_route(
+        model=model,
+        user_text=user_text or "",
+        chat_prompt_cls=ChatPrompt,
+        llm_semaphore=llm_semaphore,
+        call_with_retry=call_llm_with_retry,
+        config=Config,
+        logger=logger,
+        conversation_id=conversation_id,
+        has_attachments=has_attachments,
+        attachment_names=attachment_names or [],
+        has_cached_attachments=has_cached_attachments,
+        cached_attachment_names=cached_attachment_names or [],
+        last_query=last_query or "",
+        last_source_names=last_source_names or [],
+        recent_history=recent_history or [],
+    )
 
 # ---------------------------
 # Typing indicator helper
 # ---------------------------
 async def send_typing_indicator(ctx: ActivityContext[MessageActivity]) -> None:
-    """Send a typing indicator to show the bot is processing the request."""
+    """Send a typing indicator to show the bot is processing the request.
+    Silently ignores 403 Forbidden errors (conversation context may be closed)."""
     try:
         typing_activity = TypingActivityInput()
         await ctx.send(typing_activity)
-        logger.info("Typing indicator sent")
+        logger.debug("Typing indicator sent")
     except Exception as e:
-        logger.warning(f"Failed to send typing indicator: {e}")
+        error_str = str(e).lower()
+        # 403 Forbidden is expected after certain operations - conversation context closed
+        if "403" in str(e) or "forbidden" in error_str:
+            logger.debug(f"Typing indicator skipped - conversation context closed (403)")
+        else:
+            logger.warning(f"Failed to send typing indicator: {e}")
 
-async def send_typing_with_status(ctx: ActivityContext[MessageActivity], status: str) -> None:
-    """Send typing indicator with a brief status message for long operations."""
+async def send_typing_with_status(ctx: ActivityContext[MessageActivity], status: str) -> Optional[str]:
+    """Send typing indicator with a brief status message for long operations.
+    Returns the activity ID of the status message so it can be deleted later."""
     try:
         # Send typing indicator first
         typing_activity = TypingActivityInput()
@@ -1384,15 +2278,18 @@ async def send_typing_with_status(ctx: ActivityContext[MessageActivity], status:
         await asyncio.sleep(0.1)  # Brief delay to ensure typing shows first
         
         status_activity = MessageActivityInput(
-            text=f"🔄 {status}",
+            text=f"ðŸ”„ {status}",
             type="message"
         )
-        await ctx.send(status_activity)
-        logger.info(f"Typing indicator with status sent: {status}")
+        response = await ctx.send(status_activity)
+        activity_id = response.id if response else None
+        logger.info(f"Typing indicator with status sent: {status} (activity_id={activity_id})")
+        return activity_id
     except Exception as e:
         logger.warning(f"Failed to send typing indicator with status: {e}")
         # Fallback to regular typing indicator
         await send_typing_indicator(ctx)
+        return None
 
 class TypingIndicatorManager:
     """Manages periodic typing indicators during long operations to prevent timeout."""
@@ -1402,11 +2299,18 @@ class TypingIndicatorManager:
         self.refresh_task = None
         self.should_refresh = False
     
-    async def start_periodic_refresh(self, interval: float = 5.0):
-        """Start sending typing indicators every `interval` seconds (default 5s to prevent Teams timeout)."""
+    async def start_periodic_refresh(self, interval: float = 2.0):
+        """Start sending typing indicators every `interval` seconds (default 2s for consistency).
+        Teams shows typing for ~10-15s, so 2s interval ensures continuous visibility."""
         self.should_refresh = True
+        # Send initial typing indicator immediately
+        try:
+            await send_typing_indicator(self.ctx)
+        except Exception as e:
+            logger.debug(f"Initial typing indicator failed: {e}")
+        
         self.refresh_task = asyncio.create_task(self._refresh_loop(interval))
-        logger.info(f"Started periodic typing indicator refresh (every {interval}s)")
+        logger.info(f"ðŸ”„ Started persistent typing indicator (every {interval}s until response ready)")
     
     async def stop_refresh(self):
         """Stop the periodic refresh."""
@@ -1420,12 +2324,33 @@ class TypingIndicatorManager:
         logger.info("Stopped periodic typing indicator refresh")
     
     async def _refresh_loop(self, interval: float):
-        """Internal loop that sends typing indicators periodically."""
+        """Internal loop that sends typing indicators periodically.
+        Silently stops if conversation context becomes invalid (403 Forbidden)."""
+        consecutive_errors = 0
+        max_consecutive_errors = 3
+        
         try:
             while self.should_refresh:
                 await asyncio.sleep(interval)
                 if self.should_refresh:  # Check again after sleep
-                    await send_typing_indicator(self.ctx)
+                    try:
+                        await send_typing_indicator(self.ctx)
+                        consecutive_errors = 0  # Reset on successful send
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        # If we get 403, the conversation is closed - stop sending
+                        if "403" in str(e) or "forbidden" in error_str:
+                            logger.debug("Conversation context closed (403) - stopping typing indicators")
+                            self.should_refresh = False
+                            break
+                        else:
+                            consecutive_errors += 1
+                            logger.debug(f"Typing indicator send failed ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                            # Stop if we have too many consecutive errors
+                            if consecutive_errors >= max_consecutive_errors:
+                                logger.warning(f"Stopping typing indicators after {max_consecutive_errors} consecutive errors")
+                                self.should_refresh = False
+                                break
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -1449,7 +2374,7 @@ async def send_typing_with_message(ctx: ActivityContext[MessageActivity], messag
         
         # Send status message
         status_activity = MessageActivityInput(
-            text=f"🔄 {message}",
+            text=f"ðŸ”„ {message}",
             type="message"
         )
         await ctx.send(status_activity)
@@ -1459,7 +2384,7 @@ async def send_typing_with_message(ctx: ActivityContext[MessageActivity], messag
 
 async def process_attachments_with_typing(ctx: ActivityContext[MessageActivity], attachments: list, conversation_id: str, cache_user_id: str) -> tuple:
     """Process attachments with periodic typing indicators to prevent timeout."""
-    MAX_ATTACHMENTS = 5
+    MAX_ATTACHMENTS = len(attachments)
     parts = []
     extracted_for_aggregation = []  # For multi-file comparison
     
@@ -1473,10 +2398,7 @@ async def process_attachments_with_typing(ctx: ActivityContext[MessageActivity],
         att_name = getattr(att, "name", "unknown")
         
         # Send typing indicator before each attachment to keep connection alive
-        if total_attachments > 1:
-            await send_typing_with_message(ctx, f"Processing attachment {i}/{total_attachments}: {att_name}")
-        else:
-            await send_typing_indicator(ctx)
+        await send_typing_indicator(ctx)
         
         # Validate file before processing
         is_valid, validation_error = validate_file_attachment(att)
@@ -1494,20 +2416,20 @@ async def process_attachments_with_typing(ctx: ActivityContext[MessageActivity],
                 file_content = await asyncio.to_thread(process_attachment, att, conversation_id, user_id=cache_user_id)
         except MemoryError:
             logger.error(f"Memory error processing '{att_name}' - file too large")
-            error_msg = f"""❌ **Memory Error**: {att_name}
+            error_msg = f"""âŒ **Memory Error**: {att_name}
 
-⚠️ File is too large to process in available memory.
+âš ï¸ File is too large to process in available memory.
 
 **Solutions:**
-• Upload a smaller file (< 50 MB recommended)
-• Split large files into sections
-• Use compressed formats
-• Share specific pages/sections instead"""
+â€¢ Upload a smaller file (< 50 MB recommended)
+â€¢ Split large files into sections
+â€¢ Use compressed formats
+â€¢ Share specific pages/sections instead"""
             parts.append(error_msg)
             continue
         except Exception as proc_err:
             logger.error(f"Error processing '{att_name}': {proc_err}", exc_info=True)
-            parts.append(f"❌ Error processing {att_name}: {str(proc_err)[:200]}")
+            parts.append(f"âŒ Error processing {att_name}: {str(proc_err)[:200]}")
             continue
         
         # Send another typing indicator after processing (before caching)
@@ -1515,7 +2437,7 @@ async def process_attachments_with_typing(ctx: ActivityContext[MessageActivity],
             await send_typing_indicator(ctx)
 
         if file_content:
-            if file_content.startswith("❌"):
+            if file_content.startswith("âŒ"):
                 # Surface the failure to the LLM so it doesn't say "no attachment".
                 parts.append(file_content)
                 continue
@@ -1531,23 +2453,34 @@ async def process_attachments_with_typing(ctx: ActivityContext[MessageActivity],
             extracted_for_aggregation.append((att_name, file_content))
             
             # Cache attachment to disk for follow-up questions with FULL content preserved
-            try:
-                cache_attachment(conversation_id, att_name, file_content)
-                logger.info(f"Attachment '{att_name}' processed and cached - {len(file_content):,} chars (FULL content preserved)")
-            except Exception as cache_err:
-                logger.warning(f"Failed to cache attachment '{att_name}': {cache_err}")
-                logger.info(f"Attachment '{att_name}' processed (cache failed) - {len(file_content):,} chars")
+            # PERFORMANCE: Run in thread pool to avoid blocking
+            # SECURITY: Include user ID for proper isolation
+            if cache_user_id:
+                try:
+                    await asyncio.to_thread(
+                        cache_attachment,
+                        conversation_id,
+                        att_name,
+                        file_content,
+                        cache_user_id  # User ID for security
+                    )
+                    logger.info(f"Attachment '{att_name}' processed and cached - {len(file_content):,} chars (FULL content preserved)")
+                except Exception as cache_err:
+                    logger.warning(f"Failed to cache attachment '{att_name}': {cache_err}")
+                    logger.info(f"Attachment '{att_name}' processed (cache failed) - {len(file_content):,} chars")
+            else:
+                logger.warning(f"Attachment '{att_name}' not cached: no stable user id")
         else:
             # No content returned; provide mobile-friendly guidance
-            mobile_guidance = f"""❌ Unable to read attachment '{att_name}'.
+            mobile_guidance = f"""âŒ Unable to read attachment '{att_name}'.
 
 **If using Teams mobile app:**
-• **Wait 30-60 seconds** after selecting files before sending
-• Use the **paperclip button** (not drag-and-drop)
-• Try **desktop/web Teams** for more reliable file uploads
-• Ensure **strong network connection**
+â€¢ **Wait 30-60 seconds** after selecting files before sending
+â€¢ Use the **paperclip button** (not drag-and-drop)
+â€¢ Try **desktop/web Teams** for more reliable file uploads
+â€¢ Ensure **strong network connection**
 
-• Make sure file has proper extension (.pdf, .docx, etc.)"""
+â€¢ Make sure file has proper extension (.pdf, .docx, etc.)"""
             
             parts.append(mobile_guidance)
     
@@ -1559,7 +2492,50 @@ async def process_attachments_with_typing(ctx: ActivityContext[MessageActivity],
 async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[MessageActivity]) -> None:
     conversation_id = ctx.activity.conversation.id
     user_text = (ctx.activity.text or "").strip()
+    
+    # STABILIZATION: Guard against duplicate LLM calls with TTL auto-expiry.
+    # Uses a dict {conversation_id: timestamp} instead of a set so that
+    # stuck requests auto-expire after GUARD_TTL_SECONDS and never
+    # permanently block a conversation.
+    GUARD_TTL_SECONDS = 90  # Max time a single request can hold the lock
+    if not hasattr(handle_stateful_conversation, 'active_llm_calls'):
+        handle_stateful_conversation.active_llm_calls: dict[str, float] = {}
+    
+    import time as _time
+    _now = _time.time()
+    # Auto-expire any guard older than TTL (prevents permanent blocking)
+    expired = [
+        cid for cid, ts in handle_stateful_conversation.active_llm_calls.items()
+        if _now - ts > GUARD_TTL_SECONDS
+    ]
+    for cid in expired:
+        logger.warning(f"â° Guard TTL expired for conversation {cid[:20]} â€” auto-clearing after {GUARD_TTL_SECONDS}s")
+        handle_stateful_conversation.active_llm_calls.pop(cid, None)
+    
+    if conversation_id in handle_stateful_conversation.active_llm_calls:
+        elapsed = _now - handle_stateful_conversation.active_llm_calls[conversation_id]
+        logger.warning(f"âš ï¸ DUPLICATE LLM CALL GUARD: Conversation {conversation_id[:20]} already processing ({elapsed:.0f}s ago) - skipping")
+        return
+    
+    handle_stateful_conversation.active_llm_calls[conversation_id] = _now
+    try:  # STABILIZATION FIX 6: Wrap entire handler in try/finally to always clear the guard
+        await _handle_stateful_conversation_inner(model, ctx, conversation_id)
+    finally:
+        handle_stateful_conversation.active_llm_calls.pop(conversation_id, None)
+        logger.info(f"ðŸ”“ LLM call guard cleared for conversation {conversation_id[:20]}")
+
+
+async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityContext[MessageActivity], conversation_id: str) -> None:
+    """Inner implementation of handle_stateful_conversation (wrapped in try/finally by caller)."""
+    user_text = (ctx.activity.text or "").strip()
     attachments_raw = ctx.activity.attachments or []
+    status_activity_ids = []  # Track status messages to delete after final response
+
+    # ENHANCED LOGGING: Detect conversation type for group chat debugging
+    conversation_type = getattr(ctx.activity.conversation, 'conversation_type', 'unknown')
+    is_group = conversation_type in ['groupChat', 'channel'] or 'group' in conversation_id.lower()
+    
+    logger.info(f"ðŸ” CONVERSATION DEBUG - ID: {conversation_id[:20]}... Type: {conversation_type} IsGroup: {is_group}")
     
     # Log raw attachments BEFORE filtering
     logger.info(f"Raw attachments received: {len(attachments_raw)}")
@@ -1567,6 +2543,7 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
         logger.info(f"  Raw attachment {idx}: type={type(raw_att).__name__}")
     
     attachments = [a for a in attachments_raw if is_file_attachment(a)]
+    web_results = []  # Initialize to avoid NameError if search is skipped
 
     logger.info(
         f"User: '{user_text[:60]}...' | Attachments: {len(attachments)} (raw: {len(attachments_raw)})"
@@ -1579,82 +2556,465 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
             logger.info(f"Attachments detected ({len(attachments_raw)}) but none were valid - sending guidance")
             await ctx.send(
                 MessageActivityInput(
-                    text="🤔 I detected an attachment, but couldn't recognize it as a file.\n\n"
+                    text="ðŸ¤” I detected an attachment, but couldn't recognize it as a file.\n\n"
                          "**This usually happens because:**\n"
-                         "• Teams sent a link preview or rich message embed (not a file)\n"
-                         "• Mobile file upload hasn't finished yet\n"
-                         "• File metadata is missing\n\n"
+                         "â€¢ Teams sent a link preview or rich message embed (not a file)\n"
+                         "â€¢ Mobile file upload hasn't finished yet\n"
+                         "â€¢ File metadata is missing\n\n"
                          "**To fix this:**\n"
-                         "1️⃣ **Wait 10-30 seconds** after selecting your file, then send\n"
-                         "2️⃣ **Use the paperclip button** (📎) to attach files\n"
-                         "3️⃣ **Try desktop or web Teams** for best results\n"
-                         "4️⃣ **Make sure it's a supported file**: PDF, Word, Excel, PowerPoint, CSV, TXT\n\n"
-                         "💡 *Tip: You can also just ask me a question or search your documents without attachments!*"
+                         "1ï¸âƒ£ **Wait 10-30 seconds** after selecting your file, then send\n"
+                         "2ï¸âƒ£ **Use the paperclip button** (ðŸ“Ž) to attach files\n"
+                         "3ï¸âƒ£ **Try desktop or web Teams** for best results\n"
+                         "4ï¸âƒ£ **Make sure it's a supported file**: PDF, Word, Excel, PowerPoint, CSV, TXT\n\n"
+                         "ðŸ’¡ *Tip: You can also just ask me a question or search your documents without attachments!*"
                 ).add_ai_generated()
             )
         else:
             logger.info("Empty message detected (no text, no attachments) - sending clarification")
             await ctx.send(
                 MessageActivityInput(
-                    text="👋 Hi! I'm here to help. You can:\n\n"
-                         "📎 **Upload documents** (PDF, Word, Excel, PowerPoint, CSV)\n"
-                         "💬 **Ask questions** about your files or information\n"
-                         "🔍 **Search** your OneDrive/SharePoint documents\n\n"
-                         "💡 *Tip: If you tried to upload a file from mobile, wait 10-30 seconds after selecting it before sending your message, or use the desktop/web app for best results.*"
+                    text="ðŸ‘‹ Hi! I'm here to help. You can:\n\n"
+                         "ðŸ“Ž **Upload documents** (PDF, Word, Excel, PowerPoint, CSV)\n"
+                         "ðŸ’¬ **Ask questions** about your files or information\n"
+                         "ðŸ” **Search** configured SharePoint library documents\n\n"
+                         "ðŸ’¡ *Tip: If you tried to upload a file from mobile, wait 10-30 seconds after selecting it before sending your message, or use the desktop/web app for best results.*"
                 ).add_ai_generated()
             )
         return
 
+    # FAST PATH: greetings, thanks, emotional/social messages, and acknowledgements.
+    # These are not document questions, so do not route, search, or inject previous sources.
+    if user_text and not attachments and is_small_talk(user_text):
+        logger.info(f"ðŸ’¬ Small-talk bypass: '{user_text[:60]}'")
+        await send_typing_indicator(ctx)
+        await ctx.send(
+            MessageActivityInput(text=small_talk_response(user_text)).add_ai_generated()
+        )
+        return
+
     # Send typing indicator IMMEDIATELY to show the bot is processing
     await send_typing_indicator(ctx)
+
+    # GROUP CHAT PERMISSIONS CHECK: Verify bot can send messages in this context
+    if is_group:
+        try:
+            # Test if we can send a message by sending typing indicator
+            await send_typing_indicator(ctx)
+            logger.info(f"âœ… Group chat permissions verified - can send activities")
+        except Exception as perm_error:
+            logger.error(f"âŒ GROUP CHAT PERMISSION ISSUE: {perm_error}")
+            try:
+                await ctx.send(MessageActivityInput(text="âš ï¸ I seem to have permission issues in this group chat. Please try:\n\n1ï¸âƒ£ Remove me from the group and add me back\n2ï¸âƒ£ Check if I have permission to send messages\n3ï¸âƒ£ Try mentioning me with @").add_ai_generated())
+            except:
+                pass  # If we can't even send this error message, there's a deeper permission issue
+            return
 
     # OPTIMIZATION: Check for cached attachments BEFORE routing
     # This avoids expensive Graph/AI searches when follow-up questions are about uploaded files
     has_cached_attachments = False
     cached_attachment_filenames = []
     try:
-        # Quick check without loading full content (faster)
-        cached_attachments_check = get_conversation_attachments(conversation_id, include_content=False)
+        # âœ… SIMPLIFIED: No complex user ID tracking needed
+        user_id = (
+            getattr(ctx.activity.from_, "aadObjectId", None)
+            or getattr(ctx.activity.from_, "aad_object_id", None)
+            or getattr(ctx.activity.from_, "id", None)
+            or f"fallback-{conversation_id[:8]}"
+        )
+        # Wrap attachment check in asyncio.to_thread() to prevent blocking
+        cached_attachments_check = await asyncio.wait_for(
+            asyncio.to_thread(
+                get_conversation_attachments,
+                conversation_id,
+                False,
+                user_id
+            ),
+            timeout=Config.ATTACHMENT_CHECK_TIMEOUT
+        )
         if cached_attachments_check:
             has_cached_attachments = True
             cached_attachment_filenames = [f.get("filename") or f.get("name", "unknown") for f in cached_attachments_check]
             logger.info(f"Found {len(cached_attachments_check)} cached attachment(s) in conversation: {', '.join(cached_attachment_filenames)}")
+    except asyncio.TimeoutError:
+        logger.debug("Cached attachment check TIMED OUT - skipping")
     except Exception:
         pass
 
-    # --- FIX: ensure all variables are defined before use and routing is done at the start ---
+    # Add simple conversation reset functionality
+    if user_text and user_text.lower().strip() in ["reset", "clear conversation", "debug conversation"]:
+        if user_text.lower().strip() in ["reset", "clear conversation"]:
+            cleared = clear_conversation_memory(conversation_id)
+            await ctx.send(
+                MessageActivityInput(
+                    text=f"ðŸ”§ **Conversation Reset**\n\n"
+                         f"ðŸ†• Starting fresh conversation.\n"
+                         f"**Status:** {'âœ… Memory cleared' if cleared else 'âŒ Nothing to clear'}\n\n"
+                         f"ðŸ’¬ Previous messages have been cleared. How can I help you?"
+                ).add_ai_generated()
+            )
+            return
+        else:
+            # Debug info
+            memory = get_or_create_conversation_memory(conversation_id)
+            msg_count = len(_get_memory_items(memory))
+            summary_state = conversation_summaries.get(conversation_id, {}) or {}
+            summary_chars = len(summary_state.get("summary", "") or "")
+            await ctx.send(
+                MessageActivityInput(
+                    text=f"ðŸ”§ **Conversation Debug**\n\n"
+                         f"**Conversation ID:** `{conversation_id[:20]}...`\n"
+                         f"**Messages in memory:** {msg_count}\n\n"
+                         f"**Running summary:** {summary_chars} chars across {summary_state.get('turn_count', 0)} summarized turns\n\n"
+                         f"Type `reset` to clear this conversation."
+                ).add_ai_generated()
+            )
+            return
     # LLM router: decide routing and extract action, route, etc.
-    # Keep connection alive during LLM call
-    async with TypingIndicatorManager(ctx):
-        route = await llm_decide_routing(model, user_text, conversation_id)
-    action = route.get("action", "respond_direct")
-
-    # OPTIMIZATION OVERRIDE: For follow-up questions when cached attachments exist, skip external searches
-    # This reduces latency from ~8-10s to <2s by avoiding Graph API and AI Search calls
-    # Can be disabled via SKIP_SEARCH_FOR_CACHED_FOLLOWUPS=false config
-    if (has_cached_attachments 
-        and action == "search_documents" 
-        and not attachments 
-        and getattr(Config, "SKIP_SEARCH_FOR_CACHED_FOLLOWUPS", True)):
-        
-        # Check if this looks like a follow-up question about the uploaded files
-        user_text_lower = (user_text or "").lower()
-        
-        # Simple heuristic: short questions without external indicators are likely follow-ups
-        is_likely_followup = (
-            len(user_text.split()) < 15  # Short question
-            and not any(keyword in user_text_lower for keyword in ["sharepoint", "onedrive", "find", "search for", "look for", "document", "file"])  # No external search intent
-            and any(keyword in user_text_lower for keyword in ["what", "who", "how", "show", "list", "tell", "any", "which"])  # Typical question words
+    # Keep connection alive during ALL processing (routing, token extraction, search, response)
+    # Wrap conversation history lookups in asyncio.to_thread()
+    try:
+        _prev_query = await asyncio.wait_for(
+            asyncio.to_thread(last_query_for, conversation_id),
+            timeout=Config.CONVERSATION_HISTORY_TIMEOUT
         )
+    except (asyncio.TimeoutError, Exception):
+        _prev_query = None
+    
+    _prev_sources = conversation_last_sources.get(conversation_id, [])
+    _prev_source_names = [s.get("title") or s.get("name") or "" for s in _prev_sources]
+    
+    # Gather recent conversation history for the LLM router (last 3 turns)
+    _recent_history: list[str] = []
+    try:
+        mem = get_or_create_conversation_memory(conversation_id)
+        # Access internal storage directly (ListMemory._storage._items)
+        raw_items = getattr(getattr(mem, '_storage', None), '_items', None) or []
+        for m in raw_items[-6:]:
+            role = getattr(m, 'role', 'user') or 'user'
+            content = getattr(m, 'content', '') or ''
+            if content:
+                _recent_history.append(f"{role}: {content[:200]}")
+        _running_summary_for_router = get_conversation_summary_text(conversation_id)
+        if _running_summary_for_router:
+            _recent_history.insert(0, _running_summary_for_router[:800])
+    except Exception:
+        pass
+
+    _conversation_source_summary = ""
+    try:
+        _summary_parts: list[str] = []
+        _running_summary = get_conversation_summary_text(conversation_id)
+        if _running_summary:
+            _summary_parts.append(_running_summary)
+        if _prev_query:
+            _summary_parts.append(f"Previous search query: {_prev_query}")
+        if _prev_source_names:
+            _summary_parts.append("Previous source documents: " + ", ".join(_prev_source_names[:5]))
+        if _recent_history:
+            _summary_parts.append("Recent conversation:\n" + "\n".join(_recent_history[-4:]))
+        _conversation_source_summary = "\n".join(_summary_parts)
+    except Exception:
+        _conversation_source_summary = ""
+    
+    # â”€â”€ Fast pre-check: bot self-knowledge questions (skip LLM â€” respond_direct per bot instructions) â”€â”€
+    # These match the 'respond_direct' cases defined in the router: questions about the bot ITSELF,
+    # not about external topics, documents, or organizational content.
+    _user_text_lower = user_text.lower().strip().rstrip("?!.")
+    _BOT_SELF_PATTERNS = [
+        "how can you help", "how can you help me", "how do you help",
+        "what can you do", "what do you do", "what are you",
+        "what are your capabilities", "what are your features",
+        "tell me about yourself", "tell me what you can do",  # EXACT: only "yourself", not general topics
+        "what is your purpose", "what's your purpose",
+        "how do you work", "what can this bot do", "what can the bot do",
+        "what kind of questions can i ask", "what questions can i ask",
+        "what should i ask", "how does this work",
+        "what kind of help can you", "what type of help can you",
+    ]
+    
+    # CRITICAL FIX: Match ONLY exact phrases or those specifically about the BOT
+    # NOT phrases like "tell me about [topic]" which are organizational queries
+    def _is_bot_self_question(text: str) -> bool:
+        """Check if this is a question about the BOT itself, not a general organizational query."""
+        # Exact matches or starts-with for bot-specific questions
+        for pattern in _BOT_SELF_PATTERNS:
+            if text == pattern or (text.startswith(pattern) and (
+                # Allow follow-ups ONLY to bot-specific patterns
+                pattern in ["what can you do", "what kind of help can you", "what type of help can you", "how can you help"] or
+                # STOP: "tell me about yourself" should NOT match "tell me about X" for any X
+                pattern == "tell me about yourself" and text == pattern
+            )):
+                return True
+        return False
+    
+    def _is_general_knowledge_question(text: str) -> bool:
+        """Detect general knowledge questions to answer without searching.
+        These are questions about universal facts, not organization-specific info."""
+        text_lower = text.lower().strip()
+
+        org_terms = [
+            "armely", "swope", "sharepoint", "company", "organization", "our ", "we ", "us ",
+            "internal", "employee", "hr", "policy", "procedure", "handbook",
+            "document", "file", "report", "pdf", "docx", "spreadsheet",
+            " llc", " inc", " corp", " corporation", " ltd", " vendor", " client",
+            " customer",
+        ]
+        if any(org in text_lower for org in org_terms):
+            return False
+
+        general_starters = (
+            "what is ", "what are ", "who is ", "who are ", "where is ",
+            "where are ", "when was ", "when did ", "why is ", "why do ",
+            "how does ", "how do ", "how can ", "explain ", "define ",
+            "tell me about ", "give me facts about ",
+        )
+        if text_lower.startswith(general_starters):
+            return True
         
-        if is_likely_followup:
-            logger.info(f"⚡ FAST PATH: Follow-up detected with {len(cached_attachment_filenames)} cached attachment(s) - skipping Graph/AI Search")
-            logger.info(f"   Cached files: {', '.join(cached_attachment_filenames)}")
-            action = "respond_direct"
-            route["action"] = "respond_direct"
-            # Clear search query to prevent fallthrough
-            route["query"] = ""
-            route["should_search"] = False
+        # Pattern: geography/location questions
+        if any(phrase in text_lower for phrase in [
+            "where is", "where are", "location of", "country is", "city is",
+            "capital of", "located in", "found at", "situated in"
+        ]):
+            # But exclude org-specific: "where is swope", "where is our office"
+            if not any(org in text_lower for org in ["swope", "our office", "our location", "company office"]):
+                return True
+        
+        # Pattern: definition questions (what is/are)
+        if any(phrase in text_lower for phrase in [
+            "what is python", "what is ai", "what is machine learning", "what is covid",
+            "what is a virus", "what is photosynthesis", "what is gravity", "what is dna",
+            "what is climate change", "what are atoms", "what are cells"
+        ]):
+            return True
+        
+        # Pattern: general science/facts
+        if any(phrase in text_lower for phrase in [
+            "how does photosynthesis", "how do plants", "how does gravity", "how do vaccines",
+            "explain physics", "explain chemistry", "tell me about", "facts about"
+        ]):
+            if not any(org in text_lower for org in [
+                "swope", "company", "organization", "our", "sharepoint",
+                "document", "file", "handbook", "policy", "procedure",
+                "employee", "it", "this", "that",
+            ]):
+                return True
+        
+        # Pattern: math/calculation
+        if any(phrase in text_lower for phrase in [
+            "what is", "calculate", "solve", "equals", "plus", "minus", "times"
+        ]):
+            # Only if it looks like pure math (numbers + operators)
+            import re
+            if re.search(r'\d+\s*[\+\-\*/]\s*\d+', text):
+                return True
+        
+        # Pattern: trivia/general questions
+        if any(phrase in text_lower for phrase in [
+            "who won", "who is the", "when was", "what year", "which president",
+            "who discovered", "who invented", "what is the meaning"
+        ]):
+            # Exclude org-related: "who is our ceo", "what is our mission"
+            if not any(org in text_lower for org in ["swope", "our ", "company ", "organization "]):
+                return True
+        
+        return False
+
+    def _is_org_or_document_request(text: str) -> bool:
+        """Default to organizational/document retrieval for any substantive turn.
+
+        For a SharePoint-backed assistant the safe default is to search: answering
+        organizational questions from the model's general knowledge produces empty,
+        unsourced replies. We therefore SEARCH unless the message is confirmed small
+        talk, a greeting/acknowledgement, or a trivially short non-question input.
+
+        Follow-ups ("tell me more about it", "summarize that") are intentionally NOT
+        skipped here — they are handled by the previous-document / refine gates in the
+        routing tree below, which run before the search branch.
+        """
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+        if is_small_talk(t) or is_smalltalk(t):
+            return False
+        # Greetings / acknowledgements / emoji-only / ultra-short inputs never search.
+        small_talk_only = (
+            r"^(hi|hello|hey|yo|hiya|good\s?(morning|afternoon|evening|day)|"
+            r"thanks?|thank you|thx|ty|cheers|bye|goodbye|see ya|"
+            r"ok|okay|kk|sure|fine|cool|great|nice|yes|yeah|yep|yup|no|nope|nah|"
+            r"lol|haha|hehe|hmm|oh|ah)[\s!.?]*$"
+        )
+        if re.match(small_talk_only, t, re.IGNORECASE):
+            return False
+        if len(t) <= 2:  # stray single chars / lone emoji
+            return False
+        return True  # default: substantive input searches the index
+
+    def _is_previous_document_followup(text: str) -> bool:
+        """Detect follow-ups that should reuse the last document context."""
+        t = text.lower().strip()
+        if not t or not (_prev_sources or _recent_history):
+            return False
+        if is_small_talk(t):
+            return False
+
+        explicit_new_search = (
+            "search sharepoint", "search again", "find another", "find other",
+            "look up", "look in sharepoint", "new document", "different document",
+            "another document", "other documents", "new search", "search for",
+            "find a document", "find document", "retrieve",
+        )
+        if any(p in t for p in explicit_new_search):
+            return False
+
+        list_style_followups = (
+            "just list", "list the names", "list names", "show the names",
+            "employees names", "employee names", "people names",
+            "nicely", "bullet list", "bullets", "make it a list",
+            "format it as a list", "put it in a list", "list them",
+        )
+        if any(p in t for p in list_style_followups):
+            return True
+
+        improvement_followups = (
+            "what do you suggest", "what should i add", "what can i add",
+            "what would you add", "suggest i add", "suggestions",
+            "recommend", "recommendations", "improve it", "improve this",
+            "improve the document", "what is missing", "what's missing",
+            "missing from it", "anything missing", "gaps", "add to the document",
+            "add to it", "make it better", "how can i improve", "what else should",
+            "based on this", "based on that", "based on the document",
+            "from this document", "for this document", "about this document",
+            "the handbook", "this handbook", "that handbook",
+            "its contact", "their contact", "contact details", "phone number",
+            "email address", "website", "address", "contact info",
+        )
+        if any(p in t for p in improvement_followups):
+            return True
+
+        followup_starters = (
+            "what about", "how about", "and what", "also", "then", "now",
+            "i mean", "i meant", "i'm referring", "im referring",
+            "can you also", "can you explain", "can you expand", "can you give",
+            "give me more", "more details", "tell me more", "expand on",
+            "continue", "go on", "does it", "do they", "is there", "are there",
+            "where does it", "why does it", "how does it",
+        )
+        if any(t.startswith(p) for p in followup_starters):
+            return True
+
+        # Short, context-dependent questions after a sourced answer usually refer
+        # to the previous result. Keep them local unless the user asks for a new search.
+        if _prev_sources and len(t.split()) <= 8 and re.search(r"\b(what|which|who|where|when|why|how|does|do|is|are|can|should)\b", t):
+            return True
+
+        return bool(re.search(r"\b(it|its|their|this|that|above|previous|the document|the file|contact|phone|email|website)\b", t))
+
+    _needs_org_search = _is_org_or_document_request(user_text)
+    _force_respond_direct = (
+        is_small_talk(user_text)
+        or is_personal_advice_request(user_text)
+        or _is_bot_self_question(_user_text_lower)
+        or (_is_general_knowledge_question(user_text) and not _needs_org_search)
+    )
+
+    _refine_phrases = (
+        "make it shorter", "shorter", "summarize that", "bullet points",
+        "add more detail", "expand on that", "rephrase", "rewrite that",
+    )
+    _looks_like_refine = any(p in _user_text_lower for p in _refine_phrases)
+    _looks_like_previous_doc_followup = _is_previous_document_followup(user_text)
+
+    # Route decision. In SharePoint-only mode, skip the router LLM for normal
+    # knowledge questions so typing starts quickly and search begins immediately.
+    if _force_respond_direct:
+        route = {"action": "respond_direct", "should_search": False, "search_query": "", "scope": "local"}
+        logger.info(f"âš¡ Short-circuited to respond_direct (bot self-knowledge): '{user_text[:60]}'")
+    elif _looks_like_previous_doc_followup:
+        route = {
+            "action": "refine_previous",
+            "should_search": False,
+            "is_followup": True,
+            "query": "",
+            "scope": "local",
+            "top_k": 3,
+            "reason": "follow-up about previous document/source",
+        }
+        logger.info(f"Fast-routed to previous document follow-up: '{user_text[:80]}'")
+    elif (
+        Config.DATA_SOURCE_MODE in ("sharepoint", "sharepoint_uploads_only", "sharepoint_ai_search_uploads_only")
+        and _needs_org_search
+        and not attachments
+        and not has_cached_attachments
+        and not _looks_like_refine
+        and not _looks_like_previous_doc_followup
+    ):
+        route = {
+            "action": "search_documents",
+            "should_search": True,
+            "is_followup": False,
+            "query": user_text.strip(),
+            "scope": "ai_search",
+            "top_k": 6,
+        }
+        logger.info(f"Fast-routed to Azure AI Search: '{user_text[:80]}'")
+    elif _looks_like_refine:
+        route = {
+            "action": "refine_previous",
+            "should_search": False,
+            "is_followup": True,
+            "query": user_text.strip(),
+            "scope": "local",
+            "top_k": 3,
+        }
+        logger.info(f"Fast-routed to refine_previous: '{user_text[:80]}'")
+    else:
+        route = await llm_decide_routing(
+            model,
+            user_text,
+            conversation_id,
+            has_attachments=bool(attachments),
+            attachment_names=[getattr(a, "name", "unknown") for a in attachments],
+            has_cached_attachments=has_cached_attachments,
+            cached_attachment_names=cached_attachment_filenames,
+            last_query=_prev_query,
+            last_source_names=_prev_source_names,
+            recent_history=_recent_history,
+        )
+    # Final safety gate: casual/social messages must never call retrieval tools.
+    if user_text and (is_small_talk(user_text) or is_personal_advice_request(user_text)):
+        route = {"action": "respond_direct", "should_search": False, "search_query": "", "scope": "local"}
+
+    # Final follow-up guard: previous-context questions must not trigger any
+    # SharePoint/Graph/cache search. They should reuse prior sources/history.
+    if _looks_like_previous_doc_followup and not attachments:
+        route = {
+            "action": "refine_previous",
+            "should_search": False,
+            "is_followup": True,
+            "query": "",
+            "scope": "local",
+            "top_k": 3,
+            "reason": "final guard: follow-up uses previous context without search",
+        }
+        logger.info(f"Follow-up guard forced refine_previous with no search: '{user_text[:80]}'")
+
+    action = route.get("action", "respond_direct")
+    if action == "refine_previous" and _prev_source_names:
+        followup_note = (
+            "Current user message is a follow-up. Reuse the previous source document(s) "
+            "unless the user explicitly asks for a new search."
+        )
+        _conversation_source_summary = (
+            f"{_conversation_source_summary}\n{followup_note}"
+            if _conversation_source_summary else followup_note
+        )
+    search_attempted = False
+    search_yielded_results = False
+    
+    # CRITICAL: When attachments are present with analysis intent, skip ALL searches
+    # User uploaded files should be analyzed immediately, not searched for
+    # External sources are searched only when the LLM routes to search.
 
     # Extract and remember user identity
     # Use 'from_' attribute (Python renames 'from' to 'from_' since 'from' is a reserved keyword)
@@ -1673,19 +3033,95 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
     except Exception:
         aad_id = None
 
-    # Capture user assertion (not used for app-only tokens, kept for profile caching logic)
-    user_assertion = _extract_user_assertion_from_activity(ctx)
-    # Prefer a stable user key: AAD object ID, else UPN/email, else conversation id
-    extracted_upn_initial = _extract_user_upn_from_activity(ctx) or ""
+    # Using app-only Graph tokens only
+    user_assertion = None
+    _deferred_sign_in = None
+    
+    logger.info("Using app-only Graph tokens")
+    logger.debug("ðŸ” About to extract user key")
+    
+    # Wrap UPN extraction in asyncio.to_thread() to prevent blocking
+    try:
+        extracted_upn_initial = await asyncio.wait_for(
+            asyncio.to_thread(_extract_user_upn_from_activity, ctx),
+            timeout=Config.USER_DETAILS_TIMEOUT
+        ) or ""
+    except (asyncio.TimeoutError, Exception):
+        logger.debug("UPN extraction TIMED OUT or failed - using empty")
+        extracted_upn_initial = ""
+
+    # â”€â”€ ATTACHMENT ANALYSIS GATEKEEPER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # If the LLM wanted to search, but we have new OR cached attachments, and it's an analysis request,
+    # skip the external search. Requirement: "Newlyuploaded attachment must always be processed... and must not call graph or ai search at all."
+    if action == "search_documents":
+        user_key_for_cache = aad_id or extracted_upn_initial or conversation_id
+        
+        # Load cached attachment names to see if current query overlaps
+        cached_fnames = []
+        try:
+            cached_files = await asyncio.to_thread(get_conversation_attachments, conversation_id, False, user_key_for_cache)
+            cached_fnames = [f.get("name", "").lower() for f in cached_files]
+        except Exception:
+            pass
+
+        analysis_keywords = [
+            "calculate", "compute", "sum", "total", "analyze", "analyse",
+            "summarize", "summarise", "review", "check", "what is in",
+            "what's in", "tell me about", "explain", "describe",
+            "compare", "comparison", "difference", "similar", "diff", "list",
+            "parse", "extract", "read", "process"
+        ]
+        user_text_lower = user_text.lower()
+        # Intent based on keywords OR if message is just attachments with no/brief text
+        is_analysis_intent = any(keyword in user_text_lower for keyword in analysis_keywords) or len(user_text.split()) < 3
+        
+        # Also check if searching specifically for the filenames of what was just uploaded or cached
+        filename_overlap = False
+        if not is_analysis_intent:
+            att_names = " ".join([getattr(a, "name", "").lower() for a in attachments] + cached_fnames)
+            search_q = (route.get("query") or user_text).lower()
+            if search_q:
+                # If any significant query terms (length > 3) appear in attached filenames
+                query_terms = [t for t in search_q.split() if len(t) > 3]
+                if query_terms and any(t in att_names for t in query_terms):
+                    filename_overlap = True
+        
+        if (attachments or cached_fnames) and (is_analysis_intent or filename_overlap):
+            _src = "Newly uploaded" if attachments else "Cached"
+            logger.info(f"ðŸŽ¯ ATTACHMENT ANALYSIS GATEKEEPER: Prioritizing {_src} file(s) - skipping external search")
+            action = "respond_direct"
+            route["action"] = "respond_direct"
+            route["should_search"] = False
+            if attachments:
+                logger.info(f"   Attachment(s): {', '.join([getattr(a, 'name', 'Unknown') for a in attachments])}")
+            if cached_fnames:
+                logger.info(f"   Cached file(s): {', '.join(cached_fnames)}")
+
+    # Send typing indicator after routing decision to keep connection alive during user profile resolution
+    await send_typing_indicator(ctx)
+    
     user_key = aad_id or extracted_upn_initial or conversation_id
-    # Only use remembered details under stable identifiers (AAD object ID or UPN/email)
     stable_lookup_key = aad_id or extracted_upn_initial
-    remembered = get_remembered_user_details(stable_lookup_key) if stable_lookup_key else {}
+    
+    logger.debug("ðŸ” About to load remembered user details")
+    # Wrap disk I/O in asyncio.to_thread() to prevent blocking event loop
+    remembered = {}
+    if stable_lookup_key:
+        try:
+            remembered = await asyncio.wait_for(
+                asyncio.to_thread(get_remembered_user_details, stable_lookup_key),
+                timeout=Config.USER_DETAILS_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.debug("Remembered user details load TIMED OUT - skipping")
+        except Exception as e:
+            logger.debug(f"Error loading remembered user details: {e}")
+    logger.debug("âœ… Remembered user details loaded")
     user_name = remembered.get("displayName") or ""
     user_email = remembered.get("mail") or remembered.get("userPrincipalName") or extracted_upn_initial or ""
 
-    # Early cache access (used for optional inference path below)
-    cache = get_cache()
+    logger.debug("Document cache disabled for runtime SharePoint search")
+    cache = None
 
     # Identity snapshot logging for diagnostics
     try:
@@ -1715,38 +3151,64 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
         except Exception:
             pass
 
-    # Enrich via Graph if we have AAD id. Prefer delegated (OBO) using Teams SSO token when available.
-    # Skip Graph entirely when we already have cached profile data
-    if aad_id and not (user_name or user_email):
+    # Enrich user profile via Graph API if we have AAD id
+    # Always try to resolve email â€” even when name is already known from cache
+    # CRITICAL: Wrap Graph calls in asyncio.to_thread() to prevent blocking
+    if aad_id and not user_email:
         try:
-            if user_assertion:
-                logger.info("Profile lookup: token=obo, endpoint=/me")
-            else:
-                logger.info("Profile lookup: token=app-only, endpoint=/users/{id}")
-            profile = get_cached_user_profile(aad_id, user_assertion=user_assertion) or {}
+            logger.info("Profile lookup: token=app-only, endpoint=/users/{id}")
+            
+            # Wrap in asyncio.to_thread() + timeout to prevent blocking on Graph API
+            try:
+                profile_start = time.time()
+                profile = await asyncio.wait_for(
+                    asyncio.to_thread(get_cached_user_profile, aad_id, user_assertion),
+                    timeout=Config.PROFILE_LOOKUP_TIMEOUT  # Configurable timeout for profile lookup
+                ) or {}
+                profile_elapsed = time.time() - profile_start
+                if profile_elapsed > 0.5:
+                    logger.info(f"â±ï¸  Profile lookup took {profile_elapsed:.2f}s")
+            except asyncio.TimeoutError:
+                logger.debug(f"Profile lookup TIMED OUT after {Config.PROFILE_LOOKUP_TIMEOUT}s - skipping")
+                profile = {}
+            
             if profile:
                 user_name = profile.get("displayName") or user_name
                 user_email = profile.get("mail") or profile.get("userPrincipalName") or user_email
                 logger.info(f"Profile fetched: name={user_name}, email={user_email}")
             else:
-                logger.warning(f"Profile lookup returned None for aad_id={aad_id[:8]}...")
+                logger.debug(f"Profile lookup returned None/empty for aad_id={aad_id[:8]}...")
         except Exception as e:
-            logger.error(f"Error fetching profile for aad_id={aad_id[:8] if aad_id else 'None'}...: {e}", exc_info=True)
-        # Persist only Graph-derived profile
+            logger.debug(f"Error fetching profile: {type(e).__name__}")
+        # Persist only Graph-derived profile (non-blocking)
         if user_name or user_email:
-            remember_user_details(user_key, {
-                "displayName": user_name,
-                "mail": user_email,
-                "userPrincipalName": user_email,
-                "aadObjectId": aad_id,
-            })
+            await asyncio.to_thread(
+                remember_user_details,
+                user_key,
+                {
+                    "displayName": user_name,
+                    "mail": user_email,
+                    "userPrincipalName": user_email,
+                    "aadObjectId": aad_id,
+                }
+            )
     else:
         # Fallback: if we have a sender.id that looks like a GUID, use it to fetch Graph profile
         try:
             from_id = getattr(sender, "id", None)
             if not aad_id and from_id and len(str(from_id)) > 30 and '-' in str(from_id) and not (user_name or user_email):
                 logger.info("Profile lookup (fallback): using from.id as AAD object id for app-only /users/{id}")
-                profile = get_cached_user_profile(str(from_id), user_assertion=user_assertion) or {}
+                
+                # Wrap in asyncio.to_thread() + timeout to prevent blocking
+                try:
+                    profile = await asyncio.wait_for(
+                        asyncio.to_thread(get_cached_user_profile, str(from_id), user_assertion),
+                        timeout=Config.PROFILE_LOOKUP_TIMEOUT
+                    ) or {}
+                except asyncio.TimeoutError:
+                    logger.debug("Fallback profile lookup TIMED OUT - skipping")
+                    profile = {}
+                
                 if profile:
                     user_name = profile.get("displayName") or user_name
                     user_email = profile.get("mail") or profile.get("userPrincipalName") or user_email
@@ -1754,26 +3216,47 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                     user_key = aad_id
                     cache_user_id = aad_id
                     logger.info(f"Fallback profile fetched: name={user_name}, email={user_email}")
-                    remember_user_details(user_key, {
-                        "displayName": user_name,
-                        "mail": user_email,
-                        "userPrincipalName": user_email,
-                        "aadObjectId": aad_id,
-                    })
+                    await asyncio.to_thread(
+                        remember_user_details,
+                        user_key,
+                        {
+                            "displayName": user_name,
+                            "mail": user_email,
+                            "userPrincipalName": user_email,
+                            "aadObjectId": aad_id,
+                        }
+                    )
                 else:
                     logger.warning(f"Fallback profile lookup returned None for from.id={from_id[:8]}...")
         except Exception as e:
             logger.error(f"Error in fallback profile lookup: {e}", exc_info=True)
         # Safety: do NOT infer identity from cache unless explicitly enabled
         try:
-            if getattr(Config, "ALLOW_CACHE_USER_INFERENCE", False):
+            if cache and getattr(Config, "ALLOW_CACHE_USER_INFERENCE", False):
                 users_map = (cache.cache or {}).get("users", {})
                 user_ids = [uid for uid in users_map.keys() if uid]
                 if not aad_id and len(user_ids) == 1 and not (user_name or user_email):
                     inferred_id = user_ids[0]
                     logger.info(f"Inferring user id from document cache: {inferred_id}")
-                    user_assertion = _extract_user_assertion_from_activity(ctx)
-                    prof = get_cached_user_profile(inferred_id, user_assertion=user_assertion) or {}
+                    # Wrap in asyncio.to_thread() to prevent blocking
+                    try:
+                        user_assertion = await asyncio.wait_for(
+                            asyncio.to_thread(_extract_user_assertion_from_activity, ctx),
+                            timeout=Config.USER_DETAILS_TIMEOUT
+                        )
+                    except (asyncio.TimeoutError, Exception):
+                        user_assertion = None
+                    
+                    # Wrap in asyncio.to_thread() + timeout to prevent blocking
+                    try:
+                        prof = await asyncio.wait_for(
+                            asyncio.to_thread(get_cached_user_profile, inferred_id, user_assertion),
+                            timeout=Config.PROFILE_LOOKUP_TIMEOUT
+                        ) or {}
+                    except asyncio.TimeoutError:
+                        logger.debug("Inferred profile lookup TIMED OUT - skipping")
+                        prof = {}
+                    
                     if prof:
                         user_name = prof.get("displayName") or user_name
                         user_email = prof.get("mail") or prof.get("userPrincipalName") or user_email
@@ -1781,12 +3264,16 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                         aad_id = inferred_id
                         user_key = aad_id
                         cache_user_id = aad_id
-                        remember_user_details(user_key, {
-                            "displayName": user_name,
-                            "mail": user_email,
-                            "userPrincipalName": user_email,
-                            "aadObjectId": aad_id,
-                        })
+                        await asyncio.to_thread(
+                            remember_user_details,
+                            user_key,
+                            {
+                                "displayName": user_name,
+                                "mail": user_email,
+                                "userPrincipalName": user_email,
+                                "aadObjectId": aad_id,
+                            }
+                        )
         except Exception:
             pass
 
@@ -1801,24 +3288,45 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
     date_friendly = now.strftime("%B %d, %Y")
     if not user_email:
         # Try to extract UPN/mail directly from activity if not yet found
-        extracted_upn = _extract_user_upn_from_activity(ctx) or ""
+        try:
+            extracted_upn = await asyncio.wait_for(
+                asyncio.to_thread(_extract_user_upn_from_activity, ctx),
+                timeout=Config.USER_DETAILS_TIMEOUT
+            ) or ""
+        except (asyncio.TimeoutError, Exception):
+            extracted_upn = ""
         if extracted_upn:
             user_email = extracted_upn
-            remember_user_details(user_key, {
-                "mail": user_email,
-                "userPrincipalName": user_email,
-                "aadObjectId": aad_id or user_key,
-            })
+            await asyncio.to_thread(
+                remember_user_details,
+                user_key,
+                {
+                    "mail": user_email,
+                    "userPrincipalName": user_email,
+                    "aadObjectId": aad_id or user_key,
+                }
+            )
     # Final identity summary
     logger.info(f"Final user identity: name='{user_name or '(not set)'}', email='{user_email or '(not set)'}', aad_id={aad_id[:8] if aad_id else '(not set)'}...")
+    
+    # SECURITY: If user email is unavailable, warn about limited access
+    if not user_email:
+        logger.warning(f"ðŸ”’ SECURITY: User email unavailable - personal OneDrive access will be blocked for safety")
+    
+    memory_user_key = aad_id or user_email
     
     # DEBUG: Log the full cached profile to see what fields we have
     if aad_id:
         try:
-            full_profile = get_cached_user_profile(aad_id) or {}
-            logger.info(f"DEBUG Full cached profile: {full_profile}")
+            full_profile = await asyncio.wait_for(
+                asyncio.to_thread(get_cached_user_profile, aad_id),
+                timeout=2.0
+            ) or {}
+            logger.debug(f"DEBUG Full cached profile: {list(full_profile.keys())}")
+        except asyncio.TimeoutError:
+            logger.debug("DEBUG profile inspection TIMED OUT")
         except Exception as e:
-            logger.error(f"DEBUG profile inspection error: {e}")
+            logger.debug(f"DEBUG profile inspection error: {type(e).__name__}")
     
     if user_email:
         try:
@@ -1832,12 +3340,16 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
             if not aad_id and user_email:
                 previous_key = user_key
                 user_key = user_email
-                remember_user_details(user_key, {
-                    "displayName": user_name,
-                    "mail": user_email,
-                    "userPrincipalName": user_email,
-                    "aadObjectId": aad_id or user_email,
-                })
+                await asyncio.to_thread(
+                    remember_user_details,
+                    user_key,
+                    {
+                        "displayName": user_name,
+                        "mail": user_email,
+                        "userPrincipalName": user_email,
+                        "aadObjectId": aad_id or user_email,
+                    }
+                )
                 logger.info(f"User key updated from {previous_key} to {user_key} (stable)")
         except Exception:
             pass
@@ -1847,16 +3359,24 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
         try:
             stable_key = aad_id or user_email
             if stable_key:
-                remember_user_details(stable_key, {
-                    "displayName": user_name,
-                    "aadObjectId": aad_id or stable_key,
-                })
+                await asyncio.to_thread(
+                    remember_user_details,
+                    stable_key,
+                    {
+                        "displayName": user_name,
+                        "aadObjectId": aad_id or stable_key,
+                    }
+                )
                 logger.info(f"Persisted minimal profile: name={user_name}, key={stable_key}")
             else:
                 conv_key = f"conv:{conversation_id}"
-                remember_user_details(conv_key, {
-                    "displayName": user_name,
-                })
+                await asyncio.to_thread(
+                    remember_user_details,
+                    conv_key,
+                    {
+                        "displayName": user_name,
+                    }
+                )
                 logger.info(f"Persisted minimal profile under conversation key: {conv_key}")
         except Exception:
             pass
@@ -1865,8 +3385,209 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
     # Cache is populated only from documents actually used in responses
     logger.info("Personal crawl: DISABLED (live Graph search only)")
 
-    # Cache partition key: prefer AAD id, else UPN/email, else conversation id
-    cache_user_id = aad_id or user_email or conversation_id
+    # Cache partition key: prefer AAD id, else UPN/email (do NOT fall back to conversation id)
+    cache_user_id = aad_id or user_email
+    # Resolve UPN: try user_email first, then fall back to full profile cache
+    cache_user_upn = user_email or ""
+    if not cache_user_upn and aad_id:
+        try:
+            _prof = await asyncio.wait_for(
+                asyncio.to_thread(get_cached_user_profile, aad_id),
+                timeout=1.0
+            ) or {}
+            cache_user_upn = _prof.get("mail") or _prof.get("userPrincipalName") or ""
+            if cache_user_upn:
+                user_email = cache_user_upn
+                logger.info(f"Resolved UPN from profile cache: {cache_user_upn}")
+        except Exception:
+            pass
+    if not cache_user_id:
+        logger.warning("Attachment caching disabled: no stable user id available")
+
+    if conversation_id in conversation_title_list_state and is_document_title_summary_request(user_text):
+        await send_typing_indicator(ctx)
+        state = conversation_title_list_state.get(conversation_id, {}) or {}
+        selected_titles = state.get("last_titles") or (state.get("titles") or [])[:10]
+        if not selected_titles:
+            selected_titles = []
+
+        docs_by_title: dict[str, dict] = {}
+        try:
+            cache_obj = get_cache()
+            if cache_obj:
+                cache_key = cache_user_id or Config.SHAREPOINT_CACHE_USER_ID
+                cached_docs = await asyncio.to_thread(cache_obj.get_all_documents, cache_key, True)
+                for doc in cached_docs or []:
+                    name = (doc.get("name") or doc.get("title") or "").strip()
+                    if name and name.lower() not in docs_by_title:
+                        docs_by_title[name.lower()] = doc
+        except Exception as summary_cache_err:
+            logger.warning("Failed to load cached docs for title summaries: %s", summary_cache_err)
+
+        if selected_titles:
+            lines = []
+            for idx, item in enumerate(selected_titles, 1):
+                name = (item.get("name") or "").strip()
+                url = item.get("url") or ""
+                doc = docs_by_title.get(name.lower(), {})
+                content = doc.get("content") or doc.get("snippet") or ""
+                if not url:
+                    url = doc.get("url") or doc.get("webUrl") or doc.get("original_url") or ""
+                summary = short_document_summary_from_content(content)
+                link = f" [Open document]({url})" if url else " URL not available in cache."
+                lines.append(f"{idx}. **{name}**\n   - Summary: {summary}\n   - URL:{link}")
+            await ctx.send(
+                MessageActivityInput(
+                    text=(
+                        "Here are short summaries and URLs for the document titles I just listed:\n\n"
+                        + "\n".join(lines)
+                    )
+                ).add_ai_generated()
+            )
+        else:
+            await ctx.send(
+                MessageActivityInput(
+                    text="I do not have a previous document-title list to summarize yet. Ask me to list document titles first."
+                ).add_ai_generated()
+            )
+        return
+
+    _has_title_list_state = conversation_id in conversation_title_list_state
+    _is_title_pagination = _has_title_list_state and is_document_title_pagination_request(user_text)
+    if is_document_title_list_request(user_text, _recent_history) or _is_title_pagination:
+        await send_typing_indicator(ctx)
+        limit = requested_title_limit(user_text, default=10)
+        start_index = 0
+        if _is_title_pagination:
+            start_index = int(conversation_title_list_state.get(conversation_id, {}).get("next_index", 0) or 0)
+        titles: list[dict] = []
+        seen_titles: set[str] = set()
+
+        def _add_title(name: str, url: str = "", source: str = "cache") -> None:
+            clean_name = (name or "").strip()
+            if not clean_name:
+                return
+            key = clean_name.lower()
+            if key in seen_titles:
+                return
+            seen_titles.add(key)
+            titles.append({"name": clean_name, "url": url or "", "source": source})
+
+        try:
+            cache_obj = get_cache()
+            if cache_obj:
+                cache_key = cache_user_id or Config.SHAREPOINT_CACHE_USER_ID
+                cached_docs = await asyncio.to_thread(
+                    cache_obj.get_all_documents,
+                    cache_key,
+                    True,
+                )
+                for doc in cached_docs or []:
+                    if not is_cached_sharepoint_doc(doc):
+                        continue
+                    _add_title(
+                        doc.get("name") or doc.get("title") or "Untitled",
+                        doc.get("url") or doc.get("webUrl") or doc.get("original_url") or "",
+                        "cache",
+                    )
+                logger.info("Document title list: loaded %s cached SharePoint title(s)", len(titles))
+        except Exception as list_cache_err:
+            logger.warning("Failed to list cached document titles: %s", list_cache_err)
+
+        # Primary source: enumerate distinct documents from the Azure AI Search index.
+        # The legacy cache above is empty in the current AI-Search-based design, so this
+        # is what makes "what documents do you have" actually return real titles.
+        if len(titles) < limit:
+            try:
+                from search.ai_search_retriever import list_indexed_documents
+                indexed_docs = await asyncio.to_thread(list_indexed_documents, max(limit, 50))
+                for d in indexed_docs:
+                    _add_title(d.get("title"), d.get("url"), "ai_search")
+                logger.info("Document title list: after AI Search index=%s title(s)", len(titles))
+            except Exception as idx_list_err:
+                logger.warning("Failed to list AI Search index titles: %s", idx_list_err)
+
+        if len(titles) < limit and Config.ENABLE_SHAREPOINT_SEARCH:
+            try:
+                site_urls = (
+                    Config.get_sharepoint_sites()
+                    if hasattr(Config, "get_sharepoint_sites")
+                    else [s.strip() for s in str(Config.SHAREPOINT_SITES or "").split(",") if s.strip()]
+                )
+                live_items = await asyncio.to_thread(
+                    list_sharepoint_files,
+                    site_urls,
+                    user_assertion,
+                    max(limit, 10),
+                )
+                for item in live_items or []:
+                    _add_title(
+                        item.get("name") or "Untitled",
+                        item.get("webUrl") or "",
+                        "sharepoint",
+                    )
+                    if len(titles) >= limit:
+                        break
+                logger.info("Document title list: after live SharePoint listing=%s title(s)", len(titles))
+            except Exception as live_list_err:
+                logger.warning("Failed to list live SharePoint titles: %s", live_list_err)
+
+        if titles:
+            if start_index >= len(titles):
+                await ctx.send(
+                    MessageActivityInput(
+                        text=(
+                            f"I found {len(titles)} available document title(s), and you've reached the end of the list."
+                        )
+                    ).add_ai_generated()
+                )
+                conversation_title_list_state[conversation_id] = {
+                    "next_index": len(titles),
+                    "total": len(titles),
+                    "titles": titles,
+                    "last_titles": [],
+                }
+                return
+
+            selected = titles[start_index:start_index + limit]
+            next_index = start_index + len(selected)
+            conversation_title_list_state[conversation_id] = {
+                "next_index": next_index,
+                "total": len(titles),
+                "titles": titles,
+                "last_titles": selected,
+                "last_start_index": start_index,
+                "last_end_index": next_index,
+            }
+            lines = [f"{idx}. **{item['name']}**" for idx, item in enumerate(selected, start_index + 1)]
+            source_note = "the indexed SharePoint documents"
+            if any(item.get("source") == "sharepoint" for item in selected):
+                source_note = "indexed and live SharePoint documents"
+            more_note = (
+                f"\n\nShowing {start_index + 1}-{next_index} of {len(titles)}. Say **show more** for the next {min(limit, max(0, len(titles) - next_index))}."
+                if next_index < len(titles)
+                else f"\n\nShowing {start_index + 1}-{next_index} of {len(titles)}. That's the end of the list."
+            )
+            await ctx.send(
+                MessageActivityInput(
+                    text=(
+                        f"Here are document titles I found from {source_note}:\n\n"
+                        + "\n".join(lines)
+                        + more_note
+                    )
+                ).add_ai_generated()
+            )
+        else:
+            await ctx.send(
+                MessageActivityInput(
+                    text=(
+                        "I checked the Azure AI Search index of SharePoint documents, "
+                        "but I could not find any available document titles."
+                    )
+                ).add_ai_generated()
+            )
+        return
+
     attachment_context = ""
     attachment_texts_for_llm: list[str] = []
     search_context = ""
@@ -1874,21 +3595,55 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
     doc_summaries = []
     web_results = []
     scope = route.get("scope", "graph")
+    if Config.DATA_SOURCE_MODE in ("sharepoint", "sharepoint_uploads_only", "sharepoint_ai_search_uploads_only") and scope not in ("local",):
+        scope = "ai_search"
+        route["scope"] = scope
     # Ensure AI search results variable exists for all paths
     ai_search_results = []
+    combined_doc_results = []
+
+    # STABILIZATION: Skip attachment/source loading for small-talk.
+    skip_attachments_for_small_talk = (
+        action == "respond_direct"
+        and route.get("scope", "local") == "local"
+        and not attachments
+    )
+    if skip_attachments_for_small_talk:
+        logger.info("SMALL-TALK MODE: Skipping retrieval and attachment loading")
+        # Force direct response and bypass source retrieval.
+        if False and action == "search_documents":
+            action = "respond_direct"
+            should_search = False
+            route["action"] = "respond_direct"
+            route["should_search"] = False
+            logger.info("   â†’ Overrode search_documents â†’ respond_direct for greeting")
+    else:
+        logger.info("ðŸ“š FULL MODE: Loading attachments and documents")
 
     # On-demand cache seeding DISABLED - using purely live Graph search
     # Cache is populated ONLY from documents actually used in responses
     # This ensures no background crawling and immediate live results
     logger.info("Cache seeding: DISABLED (live Graph search only)")
 
-    # Get stored files from previous messages in this conversation
-    file_storage = files_for(conversation_id)
+    # Get stored files from previous messages in this conversation (non-blocking)
+    try:
+        file_storage = await asyncio.wait_for(
+            asyncio.to_thread(files_for, conversation_id, cache_user_id) if cache_user_id else asyncio.to_thread(lambda: []),
+            timeout=2.0
+        )
+    except asyncio.TimeoutError:
+        logger.debug("File storage lookup TIMED OUT - skipping")
+        file_storage = []
+    except Exception as e:
+        logger.debug(f"Error loading file storage: {e}")
+        file_storage = []
+    # Track current attachments for calculations in this request
+    current_attachment_files: list[dict] = []
     
     # Attachment processing - files uploaded directly to chat
-    if attachments:
+    if attachments and not skip_attachments_for_small_talk:
         await send_typing_indicator(ctx)
-        MAX_ATTACHMENTS = 5
+        MAX_ATTACHMENTS = len(attachments)
         parts = []
         extracted_for_aggregation = []  # For multi-file comparison
         
@@ -1903,7 +3658,9 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
             
             # Send typing indicator before each attachment to keep connection alive
             if total_attachments > 1:
-                await send_typing_with_status(ctx, f"Processing {att_name} ({i}/{total_attachments})")
+                status_id = await send_typing_with_status(ctx, f"Processing {att_name} ({i}/{total_attachments})")
+                if status_id:
+                    status_activity_ids.append(status_id)
             else:
                 await send_typing_indicator(ctx)
             
@@ -1929,17 +3686,17 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                     file_content = await asyncio.to_thread(process_attachment, att, conversation_id, user_id=cache_user_id)
             except MemoryError as mem_err:
                 logger.error(f"MEMORY ERROR processing '{att_name}': {mem_err}")
-                file_content = f"❌ **File too large**: {att_name}\n\nThis file caused a memory error. Try:\n• Splitting into smaller files\n• Reducing file size\n• Asking about specific sections"
+                file_content = f"âŒ **File too large**: {att_name}\n\nThis file caused a memory error. Try:\nâ€¢ Splitting into smaller files\nâ€¢ Reducing file size\nâ€¢ Asking about specific sections"
             except Exception as proc_err:
                 logger.error(f"ERROR processing attachment '{att_name}': {proc_err}", exc_info=True)
-                file_content = f"❌ **Processing failed**: {att_name}\n\nError: {str(proc_err)[:200]}"
+                file_content = f"âŒ **Processing failed**: {att_name}\n\nError: {str(proc_err)[:200]}"
             
             # Send typing indicator after processing (before caching)
             if file_content and len(file_content) > 10000:  # Large files get extra typing indicator
                 await send_typing_indicator(ctx)
 
             if file_content:
-                if file_content.startswith("❌"):
+                if file_content.startswith("âŒ"):
                     # Surface the failure to the LLM so it doesn't say "no attachment".
                     parts.append(file_content)
                     continue
@@ -1954,27 +3711,44 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                 extracted_for_aggregation.append((att_name, file_content))
                 # Note: Full content stored in cache and sent to LLM for complete analysis
                 
+                # Track current attachment for calculation path
+                current_attachment_files.append({
+                    "name": att_name,
+                    "content": file_content,
+                })
+                
                 # Cache attachment to disk for follow-up questions
-                try:
-                    cache_attachment(conversation_id, att_name, file_content)
-                    logger.info(f"Attachment '{att_name}' processed and cached - {len(file_content)} chars (FULL content)")
-                except Exception as cache_err:
-                    logger.warning(f"Failed to cache attachment '{att_name}': {cache_err}")
-                    logger.info(f"Attachment '{att_name}' processed (cache failed) - {len(file_content)} chars")
+                # PERFORMANCE: Async caching to avoid blocking
+                # SECURITY: User ID for isolation
+                if cache_user_id:
+                    try:
+                        await asyncio.to_thread(
+                            cache_attachment,
+                            conversation_id,
+                            att_name,
+                            file_content,
+                            cache_user_id
+                        )
+                        logger.info(f"Attachment '{att_name}' processed and cached - {len(file_content)} chars (FULL content)")
+                    except Exception as cache_err:
+                        logger.warning(f"Failed to cache attachment '{att_name}': {cache_err}")
+                        logger.info(f"Attachment '{att_name}' processed (cache failed) - {len(file_content)} chars")
+                else:
+                    logger.warning(f"Attachment '{att_name}' not cached: no stable user id")
             else:
                 # No content returned; provide mobile-friendly guidance
-                mobile_guidance = f"""❌ Unable to read attachment '{att_name}'.
+                mobile_guidance = f"""âŒ Unable to read attachment '{att_name}'.
 
 **If using Teams mobile app:**
-• **Wait 30-60 seconds** after selecting files before sending
-• Use the **paperclip button** (not drag-and-drop)
-• Try **desktop/web Teams** for more reliable file uploads
-• Ensure **strong network connection**
+â€¢ **Wait 30-60 seconds** after selecting files before sending
+â€¢ Use the **paperclip button** (not drag-and-drop)
+â€¢ Try **desktop/web Teams** for more reliable file uploads
+â€¢ Ensure **strong network connection**
 
 **File troubleshooting:**
-• Check file size (keep under 250 MB)
-• Verify file isn't corrupted or password-protected
-• Make sure file has proper extension (.pdf, .docx, etc.)"""
+â€¢ Check file size (keep under 250 MB)
+â€¢ Verify file isn't corrupted or password-protected
+â€¢ Make sure file has proper extension (.pdf, .docx, etc.)"""
                 
                 parts.append(mobile_guidance)
         
@@ -2000,29 +3774,38 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
     # FOLLOW-UP SUPPORT: Include previously uploaded files from this conversation
     # First check disk cache, then fall back to in-memory storage
     # This enables questions like "top paid players" after uploading a FIFA dataset
-    if not attachments:
+    # PERFORMANCE: Use asyncio.to_thread for non-blocking I/O
+    doc_cache_match = False
+    if not attachments and not skip_attachments_for_small_talk:
         # Try to load from persistent disk cache first (survives restarts, avoids memory limits)
         cached_attachments = []
         try:
-            cached_attachments = get_conversation_attachments(conversation_id)
+            # NON-BLOCKING: Run cache I/O in thread pool
+            cached_attachments = await asyncio.to_thread(
+                get_conversation_attachments, conversation_id, True, cache_user_id or None
+            )
         except Exception as cache_err:
             logger.warning(f"Failed to load cached attachments: {cache_err}")
         
         if cached_attachments:
             logger.info(f"Loading {len(cached_attachments)} attachment(s) from disk cache for follow-up")
             parts = []
-            for cached_file in cached_attachments:
+            max_cached_files = len(cached_attachments)
+            for cached_file in cached_attachments[:max_cached_files]:
                 fname = cached_file.get("name", "unknown")
                 fcontent = cached_file.get("content", "")
                 if fcontent:
-                    # Include FULL cached content - no truncation for complete analysis
-                    parts.append(f"[Previously uploaded: {fname}]\n{fcontent}")
-                    logger.info(f"Loaded full cached content for {fname}: {len(fcontent)} chars")
-                    # Content already in cache - no need to store in memory
+                    # STABILIZATION: Chunk+compress cached content (ISSUE 1+2+6)
+                    from utils.context_budget import select_relevant_chunks
+                    _cap = int(getattr(Config, 'MAX_ATTACH_CHARS', 40000))
+                    capped = select_relevant_chunks(fcontent, user_text or "", max_chars=_cap, label=fname[:30])
+                    parts.append(f"[Previously uploaded: {fname}]\n{capped}")
+                    logger.info(f"Loaded cached content for {fname}: {len(fcontent):,} chars -> {len(capped):,} chars (chunked+compressed)")
             if parts:
                 attachment_context = "\n\n" + "\n---\n".join(parts)
                 attachment_texts_for_llm = parts
-                logger.info(f"Loaded {len(parts)} cached file(s) with {sum(len(p) for p in parts)} total chars")
+                total_size = sum(len(p) for p in parts)
+                logger.info(f"Loaded {len(parts)} cached file(s) with {total_size:,} total chars")
         elif file_storage:
             # Use cached attachments as primary source (file_storage is now cache-based)
             logger.info(f"Including {len(file_storage)} previously uploaded file(s) from cache")
@@ -2031,125 +3814,132 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                 fname = stored_file.get("name", "unknown")
                 fcontent = stored_file.get("content", "")
                 if fcontent:
-                    # Include FULL cached content - no truncation for complete analysis  
-                    parts.append(f"[Previously uploaded: {fname}]\n{fcontent}")
-                    logger.info(f"Including full cached file {fname}: {len(fcontent)} chars")
+                    # STABILIZATION: Chunk+compress cached content (ISSUE 1+2+6)
+                    from utils.context_budget import select_relevant_chunks
+                    _cap = int(getattr(Config, 'MAX_ATTACH_CHARS', 40000))
+                    capped = select_relevant_chunks(fcontent, user_text or "", max_chars=_cap, label=fname[:30])
+                    parts.append(f"[Previously uploaded: {fname}]\n{capped}")
+                    logger.info(f"Including chunked+compressed cached file {fname}: {len(fcontent):,} -> {len(capped):,} chars")
             if parts:
                 attachment_context = "\n\n" + "\n---\n".join(parts)
                 attachment_texts_for_llm = parts
                 logger.info(f"Loaded {len(parts)} stored file(s) with {sum(len(p) for p in parts)} total chars")
 
-    # If user provided no instruction but sent attachments, default to summarization
-    try:
-        if (not (user_text and user_text.strip())) and attachments and attachment_context:
-            plural = "s" if len(attachments) > 1 else ""
-            user_text = f"Summarize the attached document{plural}."
-            logger.info("No instruction provided; defaulting to summarization of attachments")
-            # Update routing intent to reflect summarization context
-            route["action"] = "respond_direct"
-            route["should_search"] = False
-    except Exception:
-        pass
-
-    # Skip external search/Graph for greetings or small-talk
-    smalltalk = False
-    try:
-        smalltalk = is_smalltalk(user_text or "")
-        if smalltalk:
-            logger.info("Small-talk detected; responding directly without search/Graph")
-            route["action"] = "respond_direct"
-            route["should_search"] = False
-    except Exception:
-        pass
-
-    # Force search when ALWAYS_CALL_AI_SEARCH is enabled (override router decision)
-    try:
-        if getattr(Config, "ALWAYS_CALL_AI_SEARCH", False) and action == "respond_direct" and not smalltalk:
-            # Only force search if there's actual query content (not just attachments)
-            has_query = bool((user_text or "").strip())
-            is_attachment_only = (attachments and not has_query)
-            
-            if has_query and not is_attachment_only:
-                logger.info("ALWAYS_CALL_AI_SEARCH enabled: overriding 'respond_direct' to 'search_documents'")
-                action = "search_documents"  # Update local variable
-                route["action"] = "search_documents"
-                route["should_search"] = True
-                # Use user text as query if no explicit query was set
-                if not route.get("query"):
-                    route["query"] = user_text.strip()
-    except Exception as e:
-        logger.error(f"Error applying ALWAYS_CALL_AI_SEARCH override: {e}")
-        pass
+    # No hard-coded intent overrides; rely on LLM routing.
 
     # Re-sync action variable with route after any overrides
     action = route.get("action", action)
+
+    # File listing intent handling removed to avoid keyword-based flow.
+    list_files_intent = False
+    random_list_intent = False
+
+    # No keyword-based routing overrides; rely on LLM decision only.
+
+    # List-files handler removed to keep conversation flow consistent.
+
+    # LLM is the sole decision-maker â€” no rule-based overrides here.
+                # Handle clarify action: Force search instead of asking questions
+    if False and action == "clarify":
+        # NEVER ask clarifying questions - always search instead
+        search_terms = user_text.strip()
+        if len(search_terms) > 2:  # Any meaningful input
+            action = "search_documents"
+            should_search = True
+            search_query = search_terms
+            logger.info(f"Converting clarify to SharePoint search: '{search_query}'")
+        else:
+            # Even for very vague input, provide search guidance without asking questions
+            search_msg = (
+                "I'll search across all available documents and sources. "
+                "What specific topic, person, or information would help you most?"
+            )
+            await ctx.send(MessageActivityInput(text=search_msg).add_ai_generated())
+            return
 
     # Route based on intent
     if action == "refine_previous":
         logger.info("Refinement detected; using conversation memory")
     elif action == "search_documents":
-        # Never skip search when the router decided to search.
-        # Even with attachments and summarization language, proceed if any explicit query exists.
-        try:
-            explicit_query = (route.get("query") or "").strip()
-            if attachments and explicit_query:
-                logger.info("Attachments present with explicit query; proceeding with document search")
-            elif attachments and not explicit_query:
-                # No explicit query and attachments-only with generic summarization → respond direct
-                user_text_lower = (user_text or "").lower()
-                generic_phrases = {"this doc", "this document", "the doc", "the document"}
-                if ("summarize" in user_text_lower) or (user_text_lower.strip() in generic_phrases):
-                    logger.info("Attachments present with summarization intent and no explicit query; responding directly")
-                    action = "respond_direct"
-        except Exception:
-            pass
+        # Normalize action for downstream logging
+        action = "search_documents"
+        search_attempted = True
+
+    # â”€â”€ ATTACHMENT GATEKEEPER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # If newly uploaded attachments OR cached files are present, and the router said 'search', 
+    # we double-check if the search is actually necessary. 
+    # Requirement: "Newlyuploaded attachment must always be processed... and must not call graph or ai search at all."
+    _explicit_attachment_org_compare = bool(
+        attachments
+        and re.search(
+            r"\b(company|organizational|organisation|policy|procedure|handbook|sharepoint|hr|employee)\b",
+            user_text or "",
+            flags=re.I,
+        )
+    )
+    if attachments and action == "search_documents" and not _explicit_attachment_org_compare:
+        # Force respond_direct to prioritize the uploaded/cached files
+        _src_type = "Newly uploaded" if attachments else "Cached"
+        logger.info(f"ðŸ›¡ï¸ ATTACHMENT GATEKEEPER: {_src_type} files found. Forcing bypass of external search to focus on document analysis.")
+        action = "respond_direct"
+        should_search = False
+        search_attempted = False
+    elif attachment_texts_for_llm and action == "search_documents":
+        logger.info("ATTACHMENT GATEKEEPER: Cached files present, but preserving universal document search.")
+        attachment_context = ""
+        attachment_texts_for_llm = []
 
     if action == "search_documents":
         q = route.get("query", user_text).strip()
 
-        # If user attached files and is asking to summarize, prefer the attachments only.
-        try:
-            q_lower = q.lower()
-            wants_attachment_summary = (
-                attachments
-                and attachment_context
-                and (
-                    "summarize" in q_lower
-                    or "summary" in q_lower
-                    or q_lower in {"summarize this", "summarize the document", "summarize the doc"}
-                )
-            )
-            if wants_attachment_summary:
-                logger.info("Attachments present with summarization intent; skipping search and responding with attachments only")
-                action = "respond_direct"
-        except Exception:
-            pass
-
     if action == "search_documents":
         set_last_query(conversation_id, q)
         if q:
+            # Use the LLM router's search_query directly â€” no stopword filtering
+            llm_search_query = (route.get("query") or "").strip()
+            search_query = llm_search_query if llm_search_query and llm_search_query != user_text else q
+            
+            # ðŸ§  INTELLIGENT QUERY ENHANCEMENT: Expand possessive pronouns with user identity
+            # This makes "my cv" â†’ "malvine owuor cv resume" for better search recall
+            original_query = search_query
+            search_query = enhance_query_with_user_identity(search_query, user_name, user_email)
+            
+            if search_query != q:
+                if search_query != original_query:
+                    logger.info(f"LLM + Identity enhancement: '{q[:80]}' -> '{original_query[:80]}' -> '{search_query[:100]}'")
+                else:
+                    logger.info(f"Using LLM search query: '{q[:120]}' -> '{search_query[:120]}'")
+            else:
+                if search_query != original_query:
+                    logger.info(f"Identity-enhanced query: '{original_query[:80]}' -> '{search_query[:100]}'")
+                else:
+                    logger.info(f"Search query (passthrough): '{search_query[:120]}'")
+
+            is_summary_request = is_document_summary_request(user_text)
+            strong_title_match_doc = None
+            logger.info(f"Detected document summary request: {is_summary_request}")
+
             # Send typing indicator for search operations
             await send_typing_indicator(ctx)
             
-            # Increase aggregation breadth when ALWAYS_CALL_AI_SEARCH is enabled
-            default_top_k = 5 if getattr(Config, "ALWAYS_CALL_AI_SEARCH", False) else 3
-            top_k = int(route.get("top_k", default_top_k))
+            top_k = int(route.get("top_k", 10))
             
             # Initialize result containers before searching
             doc_entries = []
             sources_refs = []
             full_contents = []
+            cached_attachment_parts = []  # Track cached attachments for search optimization
             
             # STEP 0: Search cached attachments if no current attachments in context
             # This allows follow-up questions to access previously uploaded files
             # NOTE: Full content is preserved in cache (no truncation) to ensure all data is available
-            if not attachment_context and not attachments:
-                logger.info(f"No current attachments - searching cached attachments for: {q}")
+            if not attachment_context and not attachments and not list_files_intent:
+                logger.info(f"No current attachments - searching cached attachments for: {search_query}")
                 try:
-                    cached_search_results = search_attachment_contents(conversation_id, q, limit=3)
+                    # FIX: search_attachment_contents now correctly accepts user_id
+                    cached_search_results = search_attachment_contents(conversation_id, search_query, limit=5, user_id=cache_user_id)
                     if cached_search_results:
                         logger.info(f"Found {len(cached_search_results)} relevant cached attachment(s)")
-                        cached_attachment_parts = []
                         for result in cached_search_results:
                             filename = result.get("filename", "Unknown")
                             snippet = result.get("content_snippet", "")
@@ -2157,10 +3947,17 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                             full_content = result.get("full_content", "")
                             content_size = len(full_content)
                             
-                            logger.info(f"Including cached attachment: {filename} (relevance: {score}, size: {content_size:,} chars)")
-                            # Add full content to context for thorough analysis
-                            # Full content is available regardless of original file size
-                            cached_attachment_parts.append(f"[Cached attachment: {filename}]\n{full_content}")
+                            # SEPARATION OF CONCERNS: Use full content for calculations, truncated for LLM conversations
+                            # Full content is always preserved in cache for accurate calculations
+                            # Only apply truncation when displaying to user in conversation context
+                            
+                            if len(full_content) > 0:
+                                # For follow-up conversations, apply chat mode logic
+                                content_for_llm = get_content_for_llm_conversation(
+                                    full_content, filename, mode="chat"
+                                )
+                                logger.info(f"Including cached attachment: {filename} (relevance: {score}, size: {content_size:,} chars, conversation_size: {len(content_for_llm):,} chars)")
+                                cached_attachment_parts.append(f"[Cached attachment: {filename}]\n{content_for_llm}")
                         
                         # Add cached attachments to context
                         if cached_attachment_parts:
@@ -2172,179 +3969,278 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                     logger.warning(f"Failed to search cached attachments: {cache_search_err}")
             
             # STEP 1: Search local document cache first (fastest)
-            logger.info(f"Searching document cache for: {q}")
-            try:
-                scored = cache.search_cache_scored(q, user_id=cache_user_id, limit=top_k, include_shared=True)
-            except Exception:
-                scored = []
-            cached_results = [r.get("doc", {}) for r in scored]
-            top_score = max([int(r.get("score", 0)) for r in scored], default=0)
-            logger.info(f"Document cache returned {len(cached_results)} results (top score={top_score}) for user_id={cache_user_id}")
-            try:
-                logger.debug(
-                    "Cached result names: %s",
-                    ", ".join([d.get("name", "(no-name)") for d in cached_results])
-                )
-            except Exception:
-                pass
-            
-            # Filter out unrelated cached docs to avoid off-topic combines and speed up
-            try:
-                q_tokens = [t.lower() for t in (q or "").split() if len(t) > 2]
-                if q_tokens and cached_results:
-                    def _doc_matches(doc: dict) -> bool:
-                        text = ((doc.get("name") or "") + " " + (doc.get("snippet") or doc.get("content") or "")).lower()
-                        return any(tok in text for tok in q_tokens)
-                    before = len(cached_results)
-                    cached_results = [d for d in cached_results if _doc_matches(d)]
-                    filtered = before - len(cached_results)
-                    if filtered:
-                        logger.info(f"Filtered out {filtered} cached docs unrelated to query '{q}'")
-            except Exception:
-                pass
-
-            # Also search web cache alongside docs
-            web_indexer = get_web_indexer()
-            web_results = web_indexer.search_web_cache(q, limit=top_k)
-
-            # STEP 2: Decide whether to call AI Search too (fallback or complement)
-            ai_search_results = []
-            call_ai_search = False
-            decision_reasons = []
-            
-            # Check if ALWAYS_CALL_AI_SEARCH is enabled (force AI Search regardless of cache)
-            if getattr(Config, "ALWAYS_CALL_AI_SEARCH", False):
-                call_ai_search = True
-                decision_reasons.append("ALWAYS_CALL_AI_SEARCH=true")
-                logger.info("ALWAYS_CALL_AI_SEARCH is enabled; forcing AI Search")
-            
-            # Respect attachment-only offline mode
-            try:
-                if attachments and getattr(Config, "DISABLE_APIS_ON_ATTACHMENTS", False):
-                    call_ai_search = False
-                    decision_reasons.append("attachments_offline_mode")
-                    logger.info("Attachments detected; external APIs disabled by config. Skipping AI Search/Graph.")
-            except Exception:
-                pass
-            
-            # Only apply heuristics if ALWAYS_CALL_AI_SEARCH is not set
-            if not getattr(Config, "ALWAYS_CALL_AI_SEARCH", False):
-                # If cache score is solid, skip external search entirely
-                cache_is_solid = False
+            # Scope enforcement: skip cache for web-only OR when targeting specific source
+            skip_cache_for_scope = scope in ("web", "onedrive", "network", "drives", "ai_search")
+            if skip_cache_for_scope:
+                logger.info(f"ðŸŽ¯ SCOPE '{scope}': Skipping document cache (searching specific source only)")
+                cached_results = []
+            else:
+                logger.info(f"Searching document cache for: {search_query}")
                 try:
-                    min_graph_skip = int(getattr(Config, "MIN_CACHED_SCORE_BEFORE_GRAPH", 55))
-                    if cached_results and top_score >= min_graph_skip:
-                        cache_is_solid = True
-                        call_ai_search = False
-                        decision_reasons.append(f"solid_cache({top_score}>={min_graph_skip})")
-                except Exception:
-                    pass
-
-                if not cache_is_solid:
-                    if not cached_results and not web_results:
-                        call_ai_search = True
-                        decision_reasons.append("no_cache_or_web")
-                    try:
-                        if top_score < int(config.MIN_CACHED_SCORE_BEFORE_AI):
-                            call_ai_search = True
-                            decision_reasons.append(f"low_score({top_score}<{int(config.MIN_CACHED_SCORE_BEFORE_AI)})")
-                    except Exception:
-                        pass
-                    try:
-                        tokens = [t.lower() for t in q.split() if len(t) > 3]
-                        if cached_results and len(cached_results) < max(1, int(top_k)):
-                            call_ai_search = True
-                            decision_reasons.append("few_cached_results")
-                        elif cached_results and tokens:
-                            def _text_of(doc):
-                                name = (doc.get("name") or "").lower()
-                                snippet = (doc.get("snippet") or doc.get("content") or "").lower()
-                                return name + " " + snippet
-                            cache_hit = any(any(tok in _text_of(d) for tok in tokens) for d in cached_results)
-                            if not cache_hit:
-                                call_ai_search = True
-                                decision_reasons.append("off_topic_cache")
-                    except Exception:
-                        pass
-
-            logger.info(f"AI Search decision: call={call_ai_search} reasons={decision_reasons}")
-
-            if call_ai_search:
-                from knowledge_base import unified_search
-                ai_search_results = await asyncio.to_thread(unified_search, q, top=top_k, user_id=cache_user_id)
-                logger.info(f"✅ AI Search completed: {len(ai_search_results or [])} results returned")
-                try:
-                    if ai_search_results:
-                        result_names = [d.get("name", "(no-name)") for d in ai_search_results]
-                        logger.info(f"AI Search results: {', '.join(result_names[:3])}{'...' if len(result_names) > 3 else ''}")
-                        
-                        # Detailed logging of what AI search actually returned
-                        logger.info("📋 AI Search Results Detail:")
-                        for i, doc in enumerate(ai_search_results[:5], 1):  # Show first 5 results
-                            name = doc.get("name", "(no-name)")
-                            url = doc.get("url", doc.get("file_path", doc.get("webUrl", "(no-url)")))
-                            score = doc.get("score", "N/A")
-                            snippet = doc.get("snippet", doc.get("content", ""))[:150] + "..." if doc.get("snippet", doc.get("content", "")) else "(no content)"
-                            source = "Graph" if doc.get("driveId") else "Cache/Local"
-                            
-                            logger.info(f"  [{i}] {name} (score: {score}, source: {source})")
-                            logger.info(f"      URL: {url[:100]}{'...' if len(str(url)) > 100 else ''}")
-                            logger.info(f"      Content: {snippet}")
+                    if cache:
+                        scored = cache.search_cache_scored(search_query, user_id=cache_user_id or Config.SHAREPOINT_CACHE_USER_ID, limit=top_k, include_shared=True)
                     else:
-                        logger.info("AI Search returned no results")
-                except Exception as e:
-                    logger.warning(f"Error logging AI search details: {e}")
-            else:
-                # Heuristic: filename-style queries with attachments should prefer AI Search
+                        logger.warning("Cache is None - skipping cache search")
+                        scored = []
+                except Exception:
+                    scored = []
+                cached_results = [r.get("doc", {}) for r in scored]
+                # FIX: cached SharePoint documents must be treated as organizational
+                # SharePoint sources later in scope filters. Previously cached docs
+                # often had only `url` and no `_from_document_cache` / `webUrl`, so
+                # strict sharepoint filtering removed them even when they matched.
+                for _doc in cached_results:
+                    if isinstance(_doc, dict):
+                        _doc.setdefault("_from_document_cache", True)
+                        _doc.setdefault("_from_sharepoint", True)
+                        if _doc.get("url") and not _doc.get("webUrl"):
+                            _doc["webUrl"] = _doc.get("url")
+                        if _doc.get("content") and not _doc.get("snippet"):
+                            _doc["snippet"] = str(_doc.get("content") or "")[:1000]
+                top_score = max([int(r.get("score", 0)) for r in scored], default=0)
+                logger.info(f"Document cache returned {len(cached_results)} results (top score={top_score}) for user_id={cache_user_id}")
                 try:
-                    q_lower = q.lower()
-                    looks_filename = any(ext in q_lower for ext in (".pdf",".docx",".doc",".xlsx",".xls",".pptx",".ppt",".csv",".json",".xml"))
-                    looks_docish = any(tok in q_lower for tok in ("form","report","invoice","contract"))
-                    if attachments and (looks_filename or looks_docish) and not getattr(Config, "DISABLE_APIS_ON_ATTACHMENTS", False):
-                        logger.info("Forcing AI Search for filename-style query with attachments")
-                        from knowledge_base import unified_search
-                        ai_search_results = await asyncio.to_thread(unified_search, q, top=top_k, user_id=cache_user_id)
-                        decision_reasons.append("forced_filename_query_with_attachments")
-                        logger.info(f"AI Search decision override: call=True reasons={decision_reasons}")
-                        logger.info(f"✅ AI Search override completed: {len(ai_search_results or [])} results returned")
-                        
-                        # Detailed logging for override results too
-                        try:
-                            if ai_search_results:
-                                logger.info("📋 AI Search Override Results Detail:")
-                                for i, doc in enumerate(ai_search_results[:3], 1):  # Show first 3 results
-                                    name = doc.get("name", "(no-name)")
-                                    score = doc.get("score", "N/A")
-                                    snippet = doc.get("snippet", doc.get("content", ""))[:100] + "..." if doc.get("snippet", doc.get("content", "")) else "(no content)"
-                                    source = "Graph" if doc.get("driveId") else "Cache/Local"
-                                    logger.info(f"  [{i}] {name} (score: {score}, source: {source}): {snippet}")
-                        except Exception as e:
-                            logger.warning(f"Error logging AI search override details: {e}")
+                    logger.debug(
+                        "Cached result names: %s",
+                        ", ".join([d.get("name", "(no-name)") for d in cached_results])
+                    )
                 except Exception:
                     pass
-                # Note: Graph results are NOT cached here - they will be cached AFTER
-                # the LLM response is generated, and ONLY for documents that were actually used
-            
-            # Determine which results to use based on what was actually searched
-            # Priority: AI search results (if called) > cached results
-            if call_ai_search or ai_search_results:
-                combined_doc_results = ai_search_results or []
-                result_source = "AI Search"
-                logger.info(f"Using AI Search results: {len(combined_doc_results)} documents")
                 
-                # Log relevance assessment for debugging
-                if combined_doc_results and q:
-                    query_terms = set(q.lower().split())
-                    logger.info(f"🔍 Query terms for relevance check: {query_terms}")
-                    for i, doc in enumerate(combined_doc_results[:3], 1):
-                        name = doc.get("name", "").lower()
-                        content = doc.get("snippet", doc.get("content", "")).lower()
-                        matching_terms = [term for term in query_terms if term in name or term in content]
-                        logger.info(f"  [{i}] {doc.get('name', '(no-name)')}: matching terms = {matching_terms if matching_terms else 'NONE'}")
+                # Filter out unrelated cached docs â€” use stricter matching for typo tolerance
+                try:
+                    _stop_terms = {
+                        "can", "you", "for", "the", "a", "an", "please", "me", "to", "of", "about",
+                        "llc", "inc", "corp", "corporation", "ltd", "limited", "company",
+                    }
+                    q_tokens = [t.lower() for t in clean_search_query(search_query or "").split() if len(t) > 2 and t.lower() not in _stop_terms]
+                    if q_tokens and cached_results:
+                        def _doc_matches(doc: dict) -> bool:
+                            name = (doc.get("name") or doc.get("title") or "").lower()
+                            content = (doc.get("snippet") or doc.get("content") or "")[:5000].lower()
+                            text = name + " " + content
+                            # Strong title match should never be discarded. Example:
+                            # query "summarize employee handbook" should keep
+                            # "employee handbook.docx" even if strict token ratio fails.
+                            title_matches = sum(1 for tok in q_tokens if tok in name)
+                            if title_matches >= 1 and any(tok in name for tok in ("handbook", "policy", "manual", "guide", "procedure")):
+                                return True
+                            matches = sum(1 for tok in q_tokens if tok in text or _fuzzy_token_in_text(tok, text, threshold=0.82))
+                            threshold = 1 if len(q_tokens) <= 2 else max(2, int(len(q_tokens) * 0.5))
+                            return matches >= threshold
+                        before = len(cached_results)
+                        cached_results = [d for d in cached_results if _doc_matches(d)]
+                        filtered = before - len(cached_results)
+                        if filtered:
+                            logger.info(f"Filtered out {filtered} cached docs unrelated to query '{search_query}'")
+                except Exception:
+                    pass
+
+            web_results = []
+
+            # STEP 2: Route search to knowledge base (unified_search or parallel searches)
+            unified_search_results = []
+            parallel_results = {}
+            
+            # Send typing indicator before potentially long Graph API operations
+            await send_typing_indicator(ctx)
+            
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # STRICT SCOPE ENFORCEMENT - User specifies WHERE to search
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            # Scope:
+            #   "ai_search" = Search indexed SharePoint chunks in Azure AI Search.
+            # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+            
+            # Determine which sources to search based on scope
+            logger.info("SEARCH SCOPE | scope=%s | ai_search=%s", scope, scope == "ai_search")
+            
+            if scope == "web":
+                logger.info("Website search is disabled for this assistant")
+                unified_search_results = []
+            elif scope == "ai_search":
+                from search.ai_search_retriever import search_sharepoint_chunks
+
+                ai_search_started_at = time.perf_counter()
+                logger.info(
+                    "AI SEARCH QUERY | index=%s | query='%s' | top=%s",
+                    Config.AZURE_SEARCH_INDEX_NAME,
+                    search_query,
+                    top_k,
+                )
+                ai_docs = await asyncio.to_thread(
+                    search_sharepoint_chunks,
+                    search_query,
+                    user_email or None,
+                    top_k,
+                    aad_id,
+                )
+                logger.info(
+                    "AI SEARCH TOTAL | query='%s' | seconds=%.2f | results=%s | source=app_block",
+                    search_query,
+                    time.perf_counter() - ai_search_started_at,
+                    len(ai_docs or []),
+                )
+                unified_search_results = []
+                for doc in ai_docs or []:
+                    unified_search_results.append(
+                        {
+                            "id": f"{doc.get('document_id', '')}:{doc.get('chunk_id', '')}",
+                            "name": doc.get("title") or doc.get("file_name") or "SharePoint document",
+                            "title": doc.get("title") or doc.get("file_name") or "SharePoint document",
+                            "content": doc.get("content") or doc.get("snippet") or "",
+                            "snippet": doc.get("snippet") or doc.get("content") or "",
+                            "url": doc.get("url") or doc.get("source_url") or "",
+                            "webUrl": doc.get("url") or doc.get("source_url") or "",
+                            "source_url": doc.get("url") or doc.get("source_url") or "",
+                            "source_type": "sharepoint",
+                            "score": doc.get("score"),
+                            "_from_ai_search": True,
+                            "_from_sharepoint": True,
+                        }
+                    )
+                logger.info("AI SEARCH RESULTS | count=%s", len(unified_search_results))
+            # Check if this is a parallel search request (pipe-separated queries)
+            elif '|' in search_query:
+                logger.info(f"ðŸ”„ Detected parallel search request: {search_query}")
+                queries = [q.strip() for q in search_query.split('|') if q.strip()]
+                logger.info(f"ðŸ” Executing {len(queries)} parallel searches: {queries}")
+                
+                parallel_results = await perform_parallel_searches(
+                    queries=queries,
+                    top_k=top_k,
+                    cache_user_id=cache_user_id,
+                    user_email=user_email,
+                    user_assertion=user_assertion
+                )  # Scope filtering applied after results return
+                
+                # Flatten results for combined processing while preserving source info
+                unified_search_results = []
+                for query, results in parallel_results.items():
+                    for doc in results:
+                        # Add source query info to each document
+                        doc['_source_query'] = query
+                        unified_search_results.append(doc)
+                        
+                logger.info(f"âœ… Parallel knowledge base searches completed: {len(unified_search_results)} total results")
             else:
-                combined_doc_results = cached_results or []
-                result_source = "Document Cache"
-                logger.info(f"Using cached results: {len(combined_doc_results)} documents")
+                # Standard single search
+                from knowledge_base import unified_search
+                logger.info(f"DEBUG: Search parameters - user_id='{cache_user_id}', user_email='{user_email}', search_query='{search_query}', scope='{scope}'")
+                unified_search_results = await asyncio.to_thread(
+                    unified_search,
+                    search_query,
+                    top=top_k,
+                    user_id=cache_user_id,
+                    user_upn=user_email or "",
+                    user_assertion=user_assertion,
+                )
+                
+                # Post-filter only when an optional non-SharePoint scope is enabled.
+                if scope not in ("graph",) and unified_search_results:
+                    before_filter = len(unified_search_results)
+                    filtered_results = []
+                    for doc in unified_search_results:
+                        _doc_url = (doc.get("webUrl") or doc.get("url") or doc.get("file_path") or "").lower()
+                        is_sharepoint = (
+                            doc.get("_from_sharepoint")
+                            or doc.get("_from_document_cache")
+                            or "sharepoint" in _doc_url
+                        )
+                        is_onedrive = doc.get("_from_onedrive_search") or doc.get("_from_live_graph") or "onedrive" in (doc.get("webUrl") or "").lower() or "my.sharepoint" in (doc.get("webUrl") or "").lower()
+                        is_ai_search = doc.get("_from_ai_search")
+                        
+                        if scope == "sharepoint" and is_sharepoint:
+                            filtered_results.append(doc)
+                        elif scope == "onedrive" and is_onedrive:
+                            filtered_results.append(doc)
+                        elif scope in ("network", "drives", "ai_search") and is_ai_search:
+                            filtered_results.append(doc)
+                        elif scope == "graph":
+                            filtered_results.append(doc)
+                    
+                    unified_search_results = filtered_results
+                    logger.info(f"ðŸŽ¯ Post-filter for scope '{scope}': {before_filter} â†’ {len(unified_search_results)} results")
+                
+                logger.info(f"âœ… Knowledge base search completed: {len(unified_search_results or [])} results returned from unified search")
+            
+            # Combine Azure AI Search results only.
+            combined_doc_results = []
+            result_sources = []
+            if unified_search_results:
+                combined_doc_results.extend(unified_search_results)
+                result_sources.append(f"Azure AI Search ({len(unified_search_results)})")
+            
+            result_source = " + ".join(result_sources) if result_sources else "None"
+            logger.info(f"ðŸ“Š Combined results from {result_source}: {len(combined_doc_results)} total documents")
+
+            
+            # Strict person-name lookup: keep only docs that actually mention the
+            # requested names/terms. This prevents broad employee directories
+            # from being used to answer a specific person lookup.
+            try:
+                lookup_terms = [
+                    term
+                    for term in query_tokens(search_query)
+                    if len(term) > 3 and term not in {"about", "document", "documents", "file", "files", "please", "show", "tell", "info", "information"}
+                ]
+                specific_lookup = (
+                    bool(lookup_terms)
+                    and (
+                        " or " in (search_query or "").lower()
+                        or " and " in (search_query or "").lower()
+                        or (search_query or "").lower().startswith(("do you have", "do you know", "find", "search", "who is", "what about", "is there"))
+                        or len(lookup_terms) >= 3
+                    )
+                )
+                if specific_lookup and combined_doc_results:
+                    def _doc_text(doc: dict) -> str:
+                        return " ".join(
+                            str(doc.get(field) or "") for field in ("name", "title", "file_name", "content", "snippet")
+                        ).lower()
+
+                    before_lookup_filter = len(combined_doc_results)
+                    combined_doc_results = [
+                        doc for doc in combined_doc_results
+                        if any(term in _doc_text(doc) for term in lookup_terms)
+                    ]
+                    if combined_doc_results:
+                        logger.info(
+                            "Specific lookup filter: %s -> %s docs for query '%s'",
+                            before_lookup_filter,
+                            len(combined_doc_results),
+                            search_query,
+                        )
+                    else:
+                        logger.info(
+                            "Specific lookup filter removed all docs for query '%s'",
+                            search_query,
+                        )
+            except Exception as specific_lookup_err:
+                logger.warning(f"Specific lookup filter error: {specific_lookup_err}")
+
+            # Azure AI Search answers must be grounded only in indexed chunks.
+            # Do not let stale local cache documents backfill empty AI Search results.
+            if scope != "ai_search" and not combined_doc_results and cached_results:
+                combined_doc_results.extend(cached_results)
+                result_sources.append(f"Cache ({len(cached_results)})")
+            
+            result_source = " + ".join(result_sources) if result_sources else "None"
+            logger.info(f"ðŸ“Š Combined results from {result_source}: {len(combined_doc_results)} total documents")
+
+            # Log relevance assessment for debugging
+            if combined_doc_results and search_query:
+                query_terms = set(query_tokens(search_query))
+                logger.info(f"ðŸ” Query terms for relevance check: {query_terms}")
+                for i, doc in enumerate(combined_doc_results[:3], 1):
+                    name = doc.get("name", "").lower()
+                    content = doc.get("snippet", doc.get("content", "")).lower()
+                    matching_terms = [term for term in query_terms if term in name or term in content]
+                    source_type = "ðŸŒ" if doc.get("_from_web_cache") else "ðŸ“„"
+                    logger.info(f"  {source_type}[{i}] {doc.get('name', '(no-name)')}: matching terms = {matching_terms if matching_terms else 'NONE'}")
+
+            if combined_doc_results:
+                search_yielded_results = True
             
             # Ensure variables have default values
             if 'result_source' not in locals():
@@ -2353,8 +4249,9 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
             # Format combined results (both cache and AI search)
             if combined_doc_results:
                 # Deduplicate by document name (case-insensitive) to avoid processing duplicates
+                # IMPORTANT: Keep the _from_ai_search flag from ANY matching document
                 try:
-                    seen_names = set()
+                    seen_names = {}  # name_key -> doc
                     deduped_results = []
                     for d in combined_doc_results:
                         name_key = (d.get("name") or d.get("title") or "").strip().lower()
@@ -2362,41 +4259,305 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                             deduped_results.append(d)
                             continue
                         if name_key in seen_names:
+                            # Merge flags from duplicate
+                            existing = seen_names[name_key]
+                            if d.get("_from_ai_search") and not existing.get("_from_ai_search"):
+                                existing["_from_ai_search"] = True
                             continue
-                        seen_names.add(name_key)
+                        seen_names[name_key] = d
                         deduped_results.append(d)
                     if len(deduped_results) != len(combined_doc_results):
                         logger.info(f"Deduped documents by name: {len(combined_doc_results)} -> {len(deduped_results)}")
                     combined_doc_results = deduped_results
+                except Exception as dedupe_err:
+                    logger.warning(f"Deduplication error: {dedupe_err}")
+                # â”€â”€ PRIORITY: Scope-aware ordering â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # (1) Separate documents by enabled source.
+                # Cached docs are SharePoint-library content by default.
+                web_docs = [d for d in combined_doc_results if d.get("_from_web_cache")]
+                # Organizational docs are SharePoint Graph/cache by default.
+                org_docs = []
+                other_docs = []
+                for d in combined_doc_results:
+                    if d.get("_from_web_cache"):
+                        continue
+                    if is_cached_sharepoint_doc(d) or d.get("_from_live_graph") or d.get("_from_ai_search"):
+                        d["_from_sharepoint"] = True
+                        if is_cached_sharepoint_doc(d):
+                            d["_from_document_cache"] = True
+                        org_docs.append(d)
+                    else:
+                        other_docs.append(d)
+                
+                logger.info(f"Pre-filter split: Web={len(web_docs)} | Organizational={len(org_docs)} | Other={len(other_docs)}")
+                if web_docs:
+                    logger.info(f"  Web docs: {[d.get('name', 'unknown')[:40] for d in web_docs[:5]]}")
+                if org_docs:
+                    logger.info(f"  Organizational docs (PRIMARY - SharePoint): {[d.get('name', 'unknown')[:40] for d in org_docs[:5]]}")
+                if other_docs:
+                    logger.info(f"  Other docs: {[d.get('name', 'unknown')[:40] for d in other_docs[:5]]}")
+                
+                # (2) Organizational docs are already ranked by SharePoint/cache search - keep them.
+                # FIX: Cached SharePoint docs may arrive without provider flags from older cache files.
+                # Promote them into org_docs if their URL/name indicates they are cached SharePoint docs.
+                if other_docs:
+                    promoted_docs = []
+                    remaining_other = []
+                    for _doc in other_docs:
+                        if is_cached_sharepoint_doc(_doc):
+                            _doc["_from_document_cache"] = True
+                            _doc["_from_sharepoint"] = True
+                            promoted_docs.append(_doc)
+                        else:
+                            remaining_other.append(_doc)
+                    if promoted_docs:
+                        org_docs.extend(promoted_docs)
+                        other_docs = remaining_other
+                        logger.info(f"Promoted {len(promoted_docs)} cached SharePoint doc(s) from Other â†’ Organizational")
+
+                if scope == "ai_search":
+                    org_docs = [d for d in org_docs if d.get("_from_ai_search")]
+                    other_docs = []
+                    web_docs = []
+                    logger.info(f"Azure AI Search docs ready for selection: {len(org_docs)}")
+                else:
+                    logger.info(f"Organizational docs ready from SharePoint/cache: {len(org_docs)}")
+
+                if org_docs:
+                    title_matches = sorted(
+                        ((title_match_strength(d, search_query)[0], d) for d in org_docs),
+                        key=lambda item: item[0],
+                        reverse=True,
+                    )
+                    best_strength, best_doc = title_matches[0]
+                    if best_strength >= 65:
+                        strong_title_match_doc = best_doc
+                        strong_title_match_doc["_strong_title_match"] = True
+                        strong_title_match_doc["_primary_document"] = True
+                        logger.info(
+                            "Strong title match: %s (strength=%s)",
+                            best_doc.get("name") or best_doc.get("title") or "Untitled",
+                            best_strength,
+                        )
+                        if is_summary_request:
+                            org_docs = [best_doc]
+                            logger.info(
+                                "Selected primary document: %s",
+                                best_doc.get("name") or best_doc.get("title") or "Untitled",
+                            )
+                
+                # (3) Re-rank org docs by query term matches to prioritize actually relevant results
+                # Semantic search may return docs that mention keywords in unrelated contexts
+                # (e.g., "RFP Response.pdf" mentioning "Swope Health" as a customer, not ABOUT Swope Health)
+                try:
+                    q_tokens = query_tokens(search_query)
+                    if q_tokens and org_docs:
+                        def _relevance_score(doc: dict) -> tuple:
+                            """Score doc by query term matches in title/name (higher = more relevant)"""
+                            name = (doc.get("name") or doc.get("title") or "").lower()
+                            title_strength, _ = title_match_strength(doc, search_query)
+                            # Count matching tokens in document name
+                            matches = sum(1 for tok in q_tokens if tok in name)
+                            # Also check content snippet for matches
+                            content = (doc.get("snippet") or doc.get("content") or "")[:500].lower()
+                            content_matches = sum(1 for tok in q_tokens if tok in content)
+                            # Azure relevance score (secondary tiebreaker)
+                            azure_score = float(doc.get("score") or doc.get("@search.score") or 0)
+                            # Return tuple: title match dominates body matches.
+                            return (title_strength, matches, content_matches, azure_score)
+                        
+                        # Sort by relevance: docs with query terms in name first
+                        org_docs_sorted = sorted(org_docs, key=_relevance_score, reverse=True)
+                        
+                        # Log re-ranking results
+                        top_3_before = [d.get('name', 'unknown')[:40] for d in org_docs[:3]]
+                        top_3_after = [d.get('name', 'unknown')[:40] for d in org_docs_sorted[:3]]
+                        if top_3_before != top_3_after:
+                            logger.info(f"ðŸ”„ Re-ranked org docs by query term matches:")
+                            logger.info(f"   Before: {top_3_before}")
+                            logger.info(f"   After:  {top_3_after}")
+                        org_docs = org_docs_sorted
+                except Exception as rank_err:
+                    logger.warning(f"Re-ranking error (using original order): {rank_err}")
+                
+                logger.info(f"âœ… Organizational docs ready for selection: {len(org_docs)} total")
+                
+                # Combine based on scope: Web scope puts web first, otherwise organizational docs first
+                # Priority: SharePoint/cache first, then any optional sources.
+                # âš ï¸ Dynamic allocation based on what sources returned results
+                MAX_TOTAL_DOCS = 4  # Target total docs â€” reduced for faster processing
+                
+                if scope == "web":
+                    # WEB SCOPE: Web results ONLY (strict scope enforcement)
+                    logger.info("ðŸŒ WEB SCOPE: Returning web results ONLY (strict scope)")
+                    web_to_include = web_docs[:MAX_TOTAL_DOCS]
+                    combined_doc_results = web_to_include
+                    logger.info(f"Post-filter combined (WEB SCOPE - STRICT): Web={len(web_to_include)} total")
+                elif scope in ("sharepoint", "onedrive", "network", "drives", "ai_search"):
+                    # SPECIFIC SCOPE: Return only from requested source (already filtered above)
+                    logger.info(f"ðŸŽ¯ SCOPE '{scope}': Returning organizational docs ONLY (strict scope)")
+                    org_to_include = org_docs[:MAX_TOTAL_DOCS]
+                    combined_doc_results = org_to_include
+                    logger.info(f"Post-filter combined ({scope.upper()} SCOPE - STRICT): Org={len(org_to_include)} total")
+                else:
+                    # DEFAULT/GRAPH SCOPE: Organizational docs first, then web for breadth
+                    logger.info("ðŸ“š DEFAULT SCOPE: Organizational docs first, web supplement")
+                    org_to_include = org_docs[:3]  # Top 3 org docs â€” quality over quantity
+                    remaining_slots = MAX_TOTAL_DOCS - len(org_to_include)
+                    web_to_include = web_docs[:remaining_slots] if web_docs and remaining_slots > 0 else []
+                    remaining_slots -= len(web_to_include)
+                    other_to_include = other_docs[:remaining_slots] if other_docs and remaining_slots > 0 else []
+                    combined_doc_results = org_to_include + web_to_include + other_to_include
+                    logger.info(f"Post-filter combined (DEFAULT): Org={len(org_to_include)} | Web={len(web_to_include)} | Other={len(other_to_include)} = {len(combined_doc_results)} total")
+                
+                # (3) Cap result count (now after filtering, so we keep priority docs)
+                max_combined = int(os.getenv("MAX_COMBINED_DOCS", "4"))
+                if len(combined_doc_results) > max_combined:
+                    combined_doc_results = combined_doc_results[:max_combined]
+                    org_preserved = sum(1 for d in combined_doc_results if 
+                        d.get("_from_live_graph") or d.get("_from_onedrive_search") or 
+                        d.get("_from_document_cache") or d.get("_from_ai_search") or d.get("_from_sharepoint"))
+                    logger.info(f"Capped combined document results to top {max_combined} ({org_preserved} organizational docs)")
+
+                # (4) File-type aware doc count limit â€” some formats are heavier to process
+                # Web cache results are already parsed and don't need download â€” exclude from weight calculation
+                def _get_file_weight(doc: dict) -> str:
+                    """Classify file by processing weight: heavy, medium, or light"""
+                    # Web cache results are pre-parsed, no download needed
+                    if doc.get("_from_web_cache"):
+                        return "none"  # No download cost
+                    name = (doc.get("name") or "").lower()
+                    # Heavy: PDFs (text extraction), large Office docs
+                    if name.endswith(".pdf"):
+                        return "heavy"
+                    # Medium: Office docs (docx, xlsx, pptx) - need parsing but faster than PDF
+                    if name.endswith((".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt")):
+                        return "medium"
+                    # Light: plain text, markdown, etc.
+                    return "light"
+                
+                file_weights = [_get_file_weight(d) for d in combined_doc_results]
+                heavy_count = file_weights.count("heavy")
+                medium_count = file_weights.count("medium")
+                web_count = file_weights.count("none")  # Web cache (no download)
+                
+                # STRICT LIMIT: Adjust max docs based on file complexity
+                # Web cache results don't count toward heavy limits since they're pre-parsed
+                if heavy_count >= 2:
+                    _max_docs_for_dl = 2 + web_count  # 2+ PDFs = limit to 2 downloads, but keep all web
+                elif heavy_count >= 1:
+                    _max_docs_for_dl = 3 + web_count  # 1 PDF + others
+                elif medium_count >= 3:
+                    _max_docs_for_dl = 3 + web_count  # Many Office docs
+                else:
+                    _max_docs_for_dl = 5 + web_count  # Light files only - can handle more
+                
+                if len(combined_doc_results) > _max_docs_for_dl:
+                    logger.info(
+                        f"ðŸ“„ File weights: {heavy_count} heavy, {medium_count} medium, {web_count} web (no download) â€” "
+                        f"Limiting docs from {len(combined_doc_results)} to {_max_docs_for_dl}"
+                    )
+                    combined_doc_results = combined_doc_results[:_max_docs_for_dl]
+                    org_final = sum(1 for d in combined_doc_results if 
+                        d.get("_from_live_graph") or d.get("_from_onedrive_search") or 
+                        d.get("_from_document_cache") or d.get("_from_ai_search") or d.get("_from_sharepoint"))
+                    web_final = sum(1 for d in combined_doc_results if d.get("_from_web_cache"))
+                    logger.info(f"  Final selection: {org_final} organizational docs + {web_final} web + {len(combined_doc_results) - org_final - web_final} others")
+
+                # (5) Prepare download
+                max_download = _max_docs_for_dl  # Never download more than the limit
+                max_extract = min(max_download, len(combined_doc_results))
+                logger.info(f"Preparing content for top {max_extract} document(s) (limit={_max_docs_for_dl})...")
+                
+                # Send typing indicator before document downloads (can be slow)
+                await send_typing_indicator(ctx)
+
+                # Pre-download dedupe: skip identical items and highly similar names
+                try:
+                    from difflib import SequenceMatcher
+                    def _norm_name(n: str) -> str:
+                        return " ".join((n or "").lower().replace("_", " ").replace("-", " ").split())
+
+                    deduped = []
+                    seen_ids = set()
+                    seen_names = []
+                    for doc in combined_doc_results:
+                        drive_id = doc.get("driveId") or ""
+                        item_id = doc.get("itemId") or ""
+                        web_url = doc.get("webUrl") or doc.get("url") or ""
+                        key = f"{drive_id}:{item_id}" if drive_id and item_id else web_url
+                        if key and key in seen_ids:
+                            continue
+                        name_norm = _norm_name(doc.get("name") or doc.get("title") or "")
+                        if name_norm:
+                            is_similar = any(SequenceMatcher(None, name_norm, prev).ratio() >= 0.98 for prev in seen_names)
+                            if is_similar:
+                                continue
+                            seen_names.append(name_norm)
+                        if key:
+                            seen_ids.add(key)
+                        deduped.append(doc)
+                    if len(deduped) != len(combined_doc_results):
+                        logger.info(f"Pre-download dedupe reduced {len(combined_doc_results)} -> {len(deduped)}")
+                    combined_doc_results = deduped
+                    max_extract = min(max_download, len(combined_doc_results))
                 except Exception:
                     pass
-                # Cap to top 5 documents to keep processing fast
-                if len(combined_doc_results) > 5:
-                    combined_doc_results = combined_doc_results[:5]
-                    logger.info("Capped combined document results to top 5")
-                # CRITICAL: Fetch content for Graph results (check cache first to save time)
-                # Live Graph search only returns metadata - we need actual document content
-                max_extract = min(5, len(combined_doc_results))
-                logger.info(f"Preparing content for top {max_extract} document(s)...")
+                
                 download_jobs = []
                 graph_token = None
                 download_sem = asyncio.Semaphore(3)
+
+                DOWNLOAD_TIMEOUT = int(os.getenv("DOCUMENT_DOWNLOAD_TIMEOUT", "8"))  # seconds - fast-fail per doc download
 
                 async def _download_for_doc(doc: dict, name: str, web_url: str, drive_id: str, item_id: str):
                     nonlocal graph_token
                     async with download_sem:
                         if graph_token is None:
-                            graph_token = await asyncio.to_thread(get_graph_token)
+                            graph_token = await asyncio.to_thread(get_graph_token, user_assertion)
                         if not graph_token:
                             return None
-                        return await asyncio.to_thread(download_and_extract_content, web_url, graph_token, name, drive_id, item_id)
+                        try:
+                            return await asyncio.wait_for(
+                                asyncio.to_thread(
+                                    download_and_extract_content,
+                                    web_url, graph_token, name, drive_id, item_id,
+                                ),
+                                timeout=DOWNLOAD_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.error(
+                                f"â° Download TIMED OUT after {DOWNLOAD_TIMEOUT}s: {name} "
+                                f"({web_url[:80]})"
+                            )
+                            return None
 
                 for idx_doc, doc in enumerate(combined_doc_results, 1):
                     if idx_doc > max_extract:
                         break
                     # Skip if we already have content (e.g., from cache search results)
                     if doc.get("content") and len(doc.get("content", "").strip()) > 50:
-                        logger.info(f"Using existing content for: {doc.get('name', 'unknown')} ({len(doc.get('content', ''))} chars)")
+                        # FIX: Cap existing content â€” never let raw content bypass compression
+                        _existing = doc["content"]
+                        _CAP = int(getattr(Config, 'MAX_DOC_SNIPPET_CHARS', 6000))
+                        if is_summary_request and doc.get("_primary_document"):
+                            _CAP = max(_CAP, int(os.getenv("SUMMARY_PRIMARY_DOC_CHARS", "20000")))
+                        if len(_existing) > _CAP:
+                            from utils.context_budget import select_relevant_chunks as _src
+                            if is_summary_request and doc.get("_primary_document"):
+                                doc["content"] = _existing[:_CAP]
+                            else:
+                                doc["content"] = _src(
+                                    _existing, search_query or user_text or "",
+                                    max_chars=_CAP, label=doc.get('name', 'cached')[:30]
+                                )
+                            doc["_content_truncated"] = len(_existing) > len(doc["content"])
+                            logger.info(
+                                f"Capped existing content for: {doc.get('name', 'unknown')} "
+                                f"({len(_existing):,} â†’ {len(doc['content']):,} chars)"
+                            )
+                        else:
+                            logger.info(f"Using existing content for: {doc.get('name', 'unknown')} ({len(_existing)} chars)")
                         continue
                     
                     # For Graph results without content, check cache first before downloading
@@ -2406,12 +4567,45 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                             web_url = doc.get("webUrl") or doc.get("url") or ""
                             drive_id = doc.get("driveId") or ""
                             item_id = doc.get("itemId") or ""
+                            
+                            # PRE-CHECK: Skip documents in other users' personal OneDrives (no download needed)
+                            url_lower = web_url.lower()
+                            if "/personal/" in url_lower:
+                                try:
+                                    parts = url_lower.split("/personal/")
+                                    if len(parts) > 1:
+                                        owner_part = parts[1].split("/")[0]
+                                        current_user_upn = (cache_user_upn or "").lower()
+                                        if not current_user_upn:
+                                            # Fallback: match user's display name tokens against
+                                            # the personal OneDrive owner slug.
+                                            # e.g. name="Malvine Owuor" â†’ ["malvine","owuor"]
+                                            #      owner_part="malvine_owuor_armely_com" â†’ match
+                                            _name_tokens = [t.lower() for t in (user_name or "").split() if len(t) > 1]
+                                            if _name_tokens and all(t in owner_part for t in _name_tokens):
+                                                logger.info(f"âœ“ Name-based match: user '{user_name}' appears to own /personal/{owner_part}")
+                                            else:
+                                                logger.info(f"â­ï¸  Skipping {name}: user UPN unavailable for personal OneDrive access check")
+                                                doc["_access_denied"] = True
+                                                doc["_denial_reason"] = "User UPN unavailable for personal OneDrive access check"
+                                                continue
+                                        # Skip if this personal OneDrive belongs to someone else
+                                        if owner_part and not current_user_upn.replace("@", "_").replace(".", "_").startswith(owner_part):
+                                            logger.info(f"â­ï¸  Skipping {name}: belongs to another user's OneDrive ({owner_part})")
+                                            doc["_access_denied"] = True
+                                            doc["_denial_reason"] = f"Document is in another user's personal OneDrive ({owner_part})"
+                                            continue
+                                except Exception:
+                                    pass
 
                             # OPTIMIZATION: Check cache first to avoid redundant downloads
                             doc_id = f"{drive_id}:{item_id}" if drive_id and item_id else web_url
                             cached_doc = None
                             try:
-                                all_cached = cache.get_all_documents(cache_user_id, include_shared=True)
+                                if cache:
+                                    all_cached = cache.get_all_documents(cache_user_id or Config.SHAREPOINT_CACHE_USER_ID, include_shared=True)
+                                else:
+                                    all_cached = []
                                 cached_doc = next((d for d in all_cached if d.get("id") == doc_id or d.get("url") == web_url or d.get("name") == name), None)
                             except Exception:
                                 pass
@@ -2419,7 +4613,7 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                             if cached_doc and cached_doc.get("content") and len(cached_doc.get("content", "").strip()) > 50:
                                 # Use cached content instead of downloading
                                 doc["content"] = cached_doc["content"]
-                                logger.info(f"✓ Using cached content for: {name} ({len(cached_doc['content'])} chars)")
+                                logger.info(f"âœ“ Using cached content for: {name} ({len(cached_doc['content'])} chars)")
                             else:
                                 # Download content from Graph (not in cache or cache has no content)
                                 task = asyncio.create_task(_download_for_doc(doc, name, web_url, drive_id, item_id))
@@ -2428,238 +4622,157 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                             logger.warning(f"Error preparing content for {doc.get('name', 'unknown')}: {dl_err}")
 
                 if download_jobs:
-                    results = await asyncio.gather(*(t for _, _, t in download_jobs), return_exceptions=True)
+                    GATHER_TIMEOUT = int(os.getenv("DOCUMENT_GATHER_TIMEOUT", "18"))  # Outer safety net for all downloads
+                    try:
+                        results = await asyncio.wait_for(
+                            asyncio.gather(*(t for _, _, t in download_jobs), return_exceptions=True),
+                            timeout=GATHER_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"â° ALL downloads timed out after {GATHER_TIMEOUT}s â€” skipping all {len(download_jobs)} documents")
+                        results = [TimeoutError(f"Gather timeout {GATHER_TIMEOUT}s")] * len(download_jobs)
                     for (doc, name, _task), result in zip(download_jobs, results):
+                        web_url = doc.get("webUrl") or doc.get("url") or ""
+                        
                         if isinstance(result, Exception):
                             logger.warning(f"Failed to download content for: {name}")
+                            doc["_access_denied"] = True
                             continue
                         content = result or ""
+                        
+                        # Check if content indicates access failure
+                        if is_inaccessible_content(content):
+                            # Provide detailed explanation for why access was denied
+                            url_lower = web_url.lower()
+                            reason = "Unknown reason"
+                            
+                            if "/personal/" in url_lower:
+                                # Extract the user's OneDrive identifier
+                                try:
+                                    parts = url_lower.split("/personal/")
+                                    if len(parts) > 1:
+                                        owner_part = parts[1].split("/")[0]
+                                        reason = f"Document is in another user's personal OneDrive ({owner_part})"
+                                except Exception:
+                                    reason = "Document is in another user's personal OneDrive"
+                            elif "403" in content or "unauthorized" in content.lower():
+                                reason = "Unauthorized - insufficient permissions"
+                            elif "404" in content or "not found" in content.lower():
+                                reason = "Document not found or path unavailable"
+                            else:
+                                reason = "Content download failed"
+                            
+                            logger.warning(f"âŒ Access denied for '{name}': {reason}")
+                            logger.debug(f"   URL: {web_url[:150]}...")
+                            logger.debug(f"   Error content: {content[:150]}")
+                            doc["_access_denied"] = True
+                            doc["_denial_reason"] = reason
+                            continue
+                        
                         if content and len(content.strip()) >= 10:
+                            # ISSUE 1+2+6: Chunkâ†’rankâ†’compress after download (NEVER inject raw)
+                            from utils.context_budget import select_relevant_chunks, summarize_text as _summarize
+                            LLM_DOC_CAP = int(getattr(Config, 'MAX_DOC_SNIPPET_CHARS', 6000))
+                            if is_summary_request and doc.get("_primary_document"):
+                                LLM_DOC_CAP = max(LLM_DOC_CAP, int(os.getenv("SUMMARY_PRIMARY_DOC_CHARS", "20000")))
+                            if len(content) > LLM_DOC_CAP:
+                                # For PDFs: chunk by relevance. For others: summarize.
+                                _is_pdf = (name or "").lower().endswith(".pdf")
+                                if is_summary_request and doc.get("_primary_document"):
+                                    content = content[:LLM_DOC_CAP]
+                                elif _is_pdf:
+                                    content = select_relevant_chunks(
+                                        content, search_query or user_text or "",
+                                        max_chars=LLM_DOC_CAP, label=name[:30]
+                                    )
+                                else:
+                                    content = _summarize(content, max_chars=LLM_DOC_CAP, label=name[:30])
+                                doc["_content_truncated"] = True
+                                logger.info(f"ðŸ“ Chunked/compressed downloaded content for '{name}': -> {len(content):,} chars")
                             doc["content"] = content
-                            logger.info(f"Downloaded content for: {name} ({len(content)} chars)")
+                            logger.info(f"Downloaded content for: {name} ({len(content):,} chars)")
                         else:
-                            logger.warning(f"Failed to download content for: {name}")
+                            logger.warning(f"Failed to download content for: {name} (insufficient content)")
+                            doc["_access_denied"] = True
+                            doc["_denial_reason"] = "Insufficient content returned"
                 
-                # Improve ordering: prioritize Azure Search relevance score and query token matches
+                # Filter out documents marked as inaccessible
+                before_filter = len(combined_doc_results)
+                filtered_docs = [doc for doc in combined_doc_results if doc.get("_access_denied")]
+                combined_doc_results = [doc for doc in combined_doc_results if not doc.get("_access_denied")]
+                filtered_count = before_filter - len(combined_doc_results)
+                
+                if filtered_count > 0:
+                    logger.info(f"ðŸš« Filtered out {filtered_count} inaccessible document(s) that user cannot access:")
+                    for i, doc in enumerate(filtered_docs[:5], 1):  # Show first 5 filtered docs
+                        name = doc.get("name", "Unknown")
+                        reason = doc.get("_denial_reason", "Unknown")
+                        logger.info(f"   [{i}] {name}: {reason}")
+                    if len(filtered_docs) > 5:
+                        logger.info(f"   ... and {len(filtered_docs) - 5} more")
+                
+                # Improve ordering: prioritize query token matches and any source relevance score.
                 try:
-                    q_tokens = [t.lower() for t in (q or "").split() if len(t) > 2]
                     def _rank(doc: dict) -> tuple:
-                        score = float(doc.get("score") or 0)
-                        text = ((doc.get("name") or "") + " " + (doc.get("snippet") or doc.get("content") or "")).lower()
-                        match_hits = sum(1 for tok in q_tokens if tok in text)
+                        score = float(doc.get("score") or doc.get("_cache_score") or 0)
+                        text = (doc.get("name") or "") + " " + (doc.get("snippet") or doc.get("content") or "")
+                        match_hits = sum(1 for tok in q_tokens if _fuzzy_token_in_text(tok, text))
                         # Tuple: (has_matches, score) so matches take precedence, then score
-                        return (1 if match_hits > 0 else 0, score)
+                        title_strength, _ = title_match_strength(doc, search_query)
+                        return (title_strength, 1 if match_hits > 0 else 0, score)
                     combined_doc_results.sort(key=_rank, reverse=True)
                 except Exception:
                     pass
-                logger.info(f"Formatting {len(combined_doc_results)} combined document results (cache + AI Search)")
+                logger.info(f"Formatting {len(combined_doc_results)} combined document results")
+                def _format_ref_line(idx: int, name: str, url: str) -> str:
+                    if url and (url.startswith("http://") or url.startswith("https://")):
+                        return (
+                            f"<div style=\"margin: 0.15rem 0;\">"
+                            f"<a href=\"{url}\" style=\"color: #0078d4; text-decoration: none;\">[" 
+                            f"{idx}]</a> {name}</div>"
+                        )
+                    extra = f" - {url}" if url else ""
+                    return f"<div style=\"margin: 0.15rem 0;\">[{idx}] {name}{extra}</div>"
+
                 for idx, doc in enumerate(combined_doc_results, 1):
                     name = doc.get("name") or doc.get("title") or "Untitled"
                     url = doc.get("url") or doc.get("file_path") or doc.get("webUrl") or ""
                     content = doc.get("content", "")
-                    # No truncation - use full content
+                    # STABILIZATION: Compress content to prevent token overflow
+                    from utils.context_budget import compress_for_llm as _compress_fmt
+                    content = _compress_fmt(content, 6000, label=(name or 'doc')[:30])
                     snippet = doc.get("snippet", content if content else "")
                     from urllib.parse import quote
                     clean_url = quote(url, safe=':/?#[]@!$&\'()*+,;=')
                     
                     # Mark source for clarity
                     is_cached = doc in cached_results
-                    source_label = "💾 Cached" if is_cached else "🔍 AI Search"
+                    source_label = "Cached" if is_cached else "SharePoint"
                     
                     doc_entries.append(
                         f"<div style=\"margin-bottom: 1.5rem;\">"
                         f"<h4 style=\"margin: 0.5rem 0; font-size: 1rem;\">[{idx}] {name} {source_label}</h4>"
                         f"<p style=\"margin: 0.25rem 0; font-size: 0.85rem; color: #666;\">"
                         f"<a href=\"{clean_url}\" style=\"text-decoration: none; color: #0078d4;\">View Document</a></p>"
-                        f"<p style=\"margin: 0.5rem 0; font-size: 0.9rem; line-height: 1.4;\">{snippet if len(snippet) <= 500 else snippet[:500] + '…'}</p>"
+                        f"<p style=\"margin: 0.5rem 0; font-size: 0.9rem; line-height: 1.4;\">{snippet if len(snippet) <= 500 else snippet[:500] + 'â€¦'}</p>"
                         f"</div>"
                     )
-                    sources_refs.append(
-                        f"<strong>[{idx}]</strong> "
-                        f"<a href=\"{clean_url}\" style=\"color: #0078d4; text-decoration: none;\">{name}</a>"
-                    )
+                    sources_refs.append(_format_ref_line(idx, name, clean_url))
                     full_contents.append({
                         "idx": idx,
                         "name": name,
                         "url": clean_url,
-                        "content": content
+                        "content": content  # Already capped above
                     })
 
                 # Note: Web cache results will be processed separately and included alongside document results
                 
-                # Add combined results section
-                citation_urls = [doc.get("url") or "" for doc in combined_doc_results]
-                citation_example = " ".join([f"[{i+1}]({url})" for i, url in enumerate(citation_urls)])
-                search_context += (
-                    "\n\n<!-- combined-documents -->\n"
-                    "<div style=\"font-size: 0.95rem; line-height: 1.5;\">"
-                    "<h3 style=\"margin: 1rem 0 0.5rem 0; font-size: 1.1rem;\">📚 Combined Search Results (Cache + AI Search)</h3>"
-                    + "".join(doc_entries) +
-                    "<h4 style=\"margin: 1rem 0 0.5rem 0; font-size: 0.95rem;\">📌 Sources:</h4>"
-                    "<ul style=\"margin: 0; padding-left: 1.5rem; font-size: 0.85rem;\">"
-                    + "".join(f"<li>{ref}</li>" for ref in sources_refs) +
-                    "</ul>"
-                    "<p style=\"margin: 1rem 0 0; font-size: 0.85rem; font-style: italic; color: #666;\">"
-                    "<strong>CITATION FORMAT:</strong> Use [1](URL) [2](URL) etc. "
-                    f"Example: {citation_example}</p>"
-                    "</div>"
-                )
-                # Add content without limits - no truncation
-                used = 0
-                for doc in full_contents:
-                    raw = doc.get("content", "") or ""
-                    # Use full content without any limits
-                    search_context += (
-                        f"\n\n<!-- full-document -->\n"
-                        f"[FULL CONTENT OF DOCUMENT {doc['idx']}: {doc['name']}]\n{raw}\n[END OF DOCUMENT {doc['idx']}]\n"
-                    )
+                # Prepare doc items for model
+                pass
+                pass
             
-            # Format Web cache results (if any)
-            if web_results:
-                logger.info(f"Formatting {len(web_results)} web cache results")
-                web_entries = []
-                web_refs = []
-                for idx, page in enumerate(web_results, 1):
-                    title = page.get("title") or page.get("url") or "Untitled"
-                    url = page.get("url") or ""
-                    content = page.get("content", "")
-                    from urllib.parse import quote
-                    clean_url = quote(url, safe=':/?#[]@!$&\'()*+,;=')
-                    # No truncation - use full content
-                    snippet = content
-                    web_entries.append(
-                        f"<div style=\"margin-bottom: 1.5rem;\">"
-                        f"<h4 style=\"margin: 0.5rem 0; font-size: 1rem;\">[{idx}] {title} 🌐</h4>"
-                        f"<p style=\"margin: 0.25rem 0; font-size: 0.85rem; color: #666;\">"
-                        f"<a href=\"{clean_url}\" style=\"text-decoration: none; color: #0078d4;\">Open Page</a> (Web Cache)</p>"
-                        f"<p style=\"margin: 0.5rem 0; font-size: 0.9rem; line-height: 1.4;\">{snippet}</p>"
-                        f"</div>"
-                    )
-                    web_refs.append(
-                        f"<strong>[{idx}]</strong> "
-                        f"<a href=\"{clean_url}\" style=\"color: #0078d4; text-decoration: none;\">{title}</a>"
-                    )
-                citation_urls = [p.get("url") or "" for p in web_results]
-                citation_example = " ".join([f"[{i+1}]({url})" for i, url in enumerate(citation_urls)])
-                search_context += (
-                    "\n\n<!-- web-cache -->\n"
-                    "<div style=\"font-size: 0.95rem; line-height: 1.5;\">"
-                    "<h3 style=\"margin: 1rem 0 0.5rem 0; font-size: 1.1rem;\">🌐 Web Results (Cached)</h3>"
-                    + "".join(web_entries) +
-                    "<h4 style=\"margin: 1rem 0 0.5rem 0; font-size: 0.95rem;\">📌 Sources:</h4>"
-                    "<ul style=\"margin: 0; padding-left: 1.5rem; font-size: 0.85rem;\">"
-                    + "".join(f"<li>{ref}</li>" for ref in web_refs) +
-                    "</ul>"
-                    "<p style=\"margin: 1rem 0 0; font-size: 0.85rem; font-style: italic; color: #666;\">"
-                    "<strong>CITATION FORMAT:</strong> Use [1](URL) [2](URL) etc. "
-                    f"Example: {citation_example}</p>"
-                    "</div>"
-                )
-
-            # Format AI search results (if any)
-            search_results = ai_search_results
-            if search_results:
-                doc_entries = []
-                sources_refs = []
-                full_contents = []
-                for idx, doc in enumerate(search_results, 1):
-                    name = doc.get("name") or doc.get("title") or "Untitled"
-                    url = doc.get("file_path") or doc.get("url") or doc.get("webUrl") or ""
-                    content = doc.get("content", "")
-                    from urllib.parse import quote
-                    clean_url = quote(url, safe=':/?#[]@!$&\'()*+,;=')
-                    # No truncation - use full content
-                    summary_content = content if content else "[No content extracted]"
-                    doc_entries.append(
-                        f"<div style=\"margin-bottom: 1.5rem;\">"
-                        f"<h4 style=\"margin: 0.5rem 0; font-size: 1rem;\">[{idx}] {name} 📄</h4>"
-                        f"<p style=\"margin: 0.25rem 0; font-size: 0.85rem; color: #666;\">"
-                        f"<a href=\"{clean_url}\" style=\"text-decoration: none; color: #0078d4;\">View Document</a></p>"
-                        f"<p style=\"margin: 0.5rem 0; font-size: 0.9rem; line-height: 1.4;\">{summary_content}</p>"
-                        f"</div>"
-                    )
-                    sources_refs.append(
-                        f"<strong>[{idx}]</strong> "
-                        f"<a href=\"{clean_url}\" style=\"color: #0078d4; text-decoration: none;\">{name}</a>"
-                    )
-                    full_contents.append({
-                        "idx": idx,
-                        "name": name,
-                        "url": clean_url,
-                        "content": content
-                    })
-                citation_example = " ".join([f"[{i+1}]" for i in range(len(search_results))])  # AI search: no hyperlinks
-                search_context += (
-                    "\n\n<!-- ai-search -->\n"
-                    "<div style=\"font-size: 0.95rem; line-height: 1.5;\">"
-                    "<h3 style=\"margin: 1rem 0 0.5rem 0; font-size: 1.1rem;\">📄 Retrieved Documents (AI Search)</h3>"
-                    + "".join(doc_entries) +
-                    "<h4 style=\"margin: 1rem 0 0.5rem 0; font-size: 0.95rem;\">📌 Sources:</h4>"
-                    "<ul style=\"margin: 0; padding-left: 1.5rem; font-size: 0.85rem;\">"
-                    + "".join(f"<li>{ref}</li>" for ref in sources_refs) +
-                    "</ul>"
-                    "<p style=\"margin: 1rem 0 0; font-size: 0.85rem; font-style: italic; color: #666;\">"
-                    "<strong>CITATION FORMAT:</strong> Use [1] [2] etc. (no hyperlinks for AI search)"
-                    f"Example: {citation_example}</p>"
-                    "</div>"
-                )
-            # Add trimmed AI Search content with budget limits
-            if search_results:
-                total_budget = int(getattr(Config, "MAX_TOTAL_CONTEXT_CHARS", 12000))
-                per_doc_limit = int(getattr(Config, "MAX_DOC_CONTEXT_CHARS", 3000))
-                used = 0
-                for doc in full_contents:
-                    if used >= total_budget:
-                        break
-                    raw = doc.get("content", "") or ""
-                    chosen = raw[:per_doc_limit]
-                    used += len(chosen)
-                    search_context += (
-                        f"\n\n<!-- full-document-content -->\n"
-                        f"[FULL CONTENT OF DOCUMENT {doc['idx']}: {doc['name']}]\n{chosen}\n[END OF DOCUMENT {doc['idx']}]\n"
-                    )
-
-            # Final fallback: if all sources returned 0, provide a helpful message and avoid empty responses
-            if not (cached_results or web_results or ai_search_results):
-                search_context += (
-                    "\n\n<!-- no-results -->\n"
-                    + "<div style=\"font-size: 0.95rem; line-height: 1.5;\">"
-                    + "<h3 style=\"margin: 1rem 0 0.5rem 0; font-size: 1.1rem;\">No results found</h3>"
-                    + "<p>We exhaustively searched all available sources including:"
-                    + "<ul style=\"margin: 0.5rem 0;\">"
-                    + "<li>Local document cache</li>"
-                    + "<li>Microsoft Graph API (OneDrive/SharePoint)</li>"
-                    + "<li>Azure AI Search (indexed documents)</li>"
-                    + "<li>Web search cache</li>"
-                    + "</ul>"
-                    + "No matching content was found for this query. Try rephrasing your question, including more specific terms, or check access permissions.</p>"
-                    + "</div>"
-                )
-            
-            # Only append references instruction if there are actual relevant external sources with content
-            has_external_sources = (
-                (combined_doc_results and result_source == "AI Search" and any(d.get("content") or d.get("snippet") for d in combined_doc_results)) or
-                (web_results and any(w.get("content") for w in web_results))
-                # Note: Only show references for AI search results and web results, not cached attachments
-            )
-            
-            if has_external_sources:
-                sources_searched_summary = []
-                if combined_doc_results and result_source == "AI Search":
-                    sources_searched_summary.append(f"AI Search (Azure): {len(combined_doc_results)} result(s)")
-                elif combined_doc_results and result_source == "Document Cache":
-                    sources_searched_summary.append(f"Document Cache: {len(combined_doc_results)} result(s)")
-                if web_results:
-                    sources_searched_summary.append(f"Web Cache: {len(web_results)} result(s)")
-                if call_ai_search:
-                    sources_searched_summary.append("Graph API: searched")
-                
-                search_context += (
-                    "\n\n<!-- sources-searched-summary -->\n"
-                    "[SOURCES SEARCHED - Include these in your References section]\n"
-                    + "\n".join(f"- {s}" for s in sources_searched_summary)
-                    + "\n[IMPORTANT: You MUST include a 'References:' section at the end of your response listing all sources with URLs]"
-                )
+            # Do not force references based on sources searched. References should only
+            # appear when extracted content is actually used in the response.
 
     # Add personalization context and build full input
     # Build personalization without placeholder name
@@ -2675,27 +4788,318 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
         personalization = f"\n\n[CONTEXT: Today is {weekday_name}, {date_friendly} ({current_datetime}).]"
     # Prepare inputs for model (plain text, limited)
     attachment_texts = attachment_texts_for_llm if attachment_texts_for_llm else ([] if not attachment_context else [attachment_context])
-    # Collect doc items for model (use cached + ai search snippets)
+    primary_summary_doc = locals().get("strong_title_match_doc")
+    if is_document_summary_request(user_text) and primary_summary_doc:
+        primary_title_norm = normalized_doc_title(primary_summary_doc.get("name") or primary_summary_doc.get("title") or "")
+
+        def _same_primary_doc(doc: dict) -> bool:
+            return normalized_doc_title(doc.get("name") or doc.get("title") or "") == primary_title_norm
+
+        for _doc in (cached_results or []) + (combined_doc_results or []):
+            if _same_primary_doc(_doc):
+                _doc["_primary_document"] = True
+                _doc["_strong_title_match"] = True
+        cached_results = [d for d in (cached_results or []) if _same_primary_doc(d)]
+        combined_doc_results = [d for d in (combined_doc_results or []) if _same_primary_doc(d)]
+        logger.info(
+            "Selected primary document: %s",
+            primary_summary_doc.get("name") or primary_summary_doc.get("title") or "Untitled",
+        )
+    # Collect doc items for model â€” use combined_doc_results (post access-filter)
+    # so we never expose documents the user cannot access
+    # IMPORTANT: Add search results (cached + combined) FIRST before web results
+    # This ensures high-relevance documents get priority when limiting docs (e.g., PDF limit)
     model_doc_items = []
-    for d in (cached_results or []):
-        model_doc_items.append({
-            "title": d.get("name") or "Untitled",
-            "url": d.get("url") or "",
-            "snippet": d.get("snippet") or d.get("content", "")
-        })
-    for d in (ai_search_results or []):
-        model_doc_items.append({
-            "title": d.get("name") or d.get("title") or "Untitled",
-            "url": d.get("file_path") or d.get("url") or d.get("webUrl") or "",
-            "snippet": d.get("content", "")
-        })
-    # Web plain text
-    web_plain_text = ""
-    if web_results:
+    
+    # STABILIZATION: Chunk+compress all doc snippets entering model_doc_items (ISSUE 1+2)
+    from utils.context_budget import compress_for_llm as _compress_doc, select_relevant_chunks as _chunk_doc
+    DOC_SNIPPET_CAP = int(getattr(Config, 'MAX_DOC_SNIPPET_CHARS', 6000))
+    # For document summary/overview requests, allow a larger source window so
+    # cached docs are actually useful instead of only sending a tiny excerpt.
+    if re.search(r"\b(summarize|summary|overview|tell me about|what is|explain)\b", (user_text or "").lower()):
+        DOC_SNIPPET_CAP = max(DOC_SNIPPET_CAP, int(os.getenv("SUMMARY_DOC_SNIPPET_CHARS", "18000")))
+
+    def _encode_sharepoint_url(url: str) -> str:
+        """URL-encode SharePoint paths while preserving the domain and slashes."""
+        if not url or not url.startswith("https://"):
+            return url
         try:
-            web_plain_text = "\n\n".join([(w.get("content") or "") for w in web_results if w.get("content")])
+            protocol_end = url.find("://") + 3
+            domain_end = url.find("/", protocol_end)
+            if domain_end > 0:
+                protocol_domain = url[:domain_end]
+                path = url[domain_end:]
+                # Encode spaces and special characters in path, preserving slashes
+                encoded_path = quote(path, safe="/:?&=")
+                return protocol_domain + encoded_path
         except Exception:
-            web_plain_text = ""
+            pass
+        return url
+    
+    _seen_doc_titles: set[str] = set()  # deduplicate by normalised title
+    
+    def _add_doc_item(
+        title: str,
+        url: str,
+        snippet: str,
+        *,
+        total_chars: int | None = None,
+        truncated: bool = False,
+        primary: bool = False,
+    ) -> None:
+        """Add to model_doc_items with deduplication by title."""
+        norm = title.strip().lower()
+        if norm in _seen_doc_titles:
+            return
+        _seen_doc_titles.add(norm)
+        model_doc_items.append({
+            "title": title,
+            "url": url,
+            "snippet": snippet,
+            "total_chars": total_chars if total_chars is not None else len(snippet or ""),
+            "included_chars": len(snippet or ""),
+            "truncated": truncated,
+            "primary": primary,
+        })
+    
+    # (1) Add CACHED results first for legacy/local document paths only.
+    # Azure AI Search queries use indexed chunks directly, avoiding stale cache bleed.
+    if not list_files_intent and scope != "ai_search":
+        for d in (cached_results or []):
+            if d.get("_access_denied"):
+                continue
+            raw_content = d.get("content") or ""
+            doc_snippet = raw_content if is_summary_request else (d.get("snippet") or raw_content)
+            if not doc_snippet or not doc_snippet.strip():
+                continue
+            raw_len = len(doc_snippet)
+            cap = DOC_SNIPPET_CAP
+            if is_summary_request and d.get("_primary_document"):
+                cap = max(cap, int(os.getenv("SUMMARY_PRIMARY_DOC_CHARS", "20000")))
+            # ISSUE 1+2: Hard cap â€” chunk if oversized, compress always
+            if len(doc_snippet) > cap:
+                if is_summary_request and d.get("_primary_document"):
+                    doc_snippet = doc_snippet[:cap]
+                else:
+                    doc_snippet = _chunk_doc(doc_snippet, user_text or "", max_chars=cap, label=d.get('name','cached')[:30])
+                d["_content_truncated"] = True
+            else:
+                doc_snippet = _compress_doc(doc_snippet, cap, label=d.get('name','cached')[:30])
+            _add_doc_item(
+                d.get("name") or "Untitled",
+                _encode_sharepoint_url(d.get("url") or ""),
+                doc_snippet,
+                total_chars=raw_len,
+                truncated=bool(d.get("_content_truncated") or raw_len > len(doc_snippet)),
+                primary=bool(d.get("_primary_document")),
+            )
+            logger.info(
+                "Content passed to LLM: %s %s chars of %s total chars | Truncated: %s",
+                d.get("name") or "Untitled",
+                len(doc_snippet),
+                raw_len,
+                bool(d.get("_content_truncated") or raw_len > len(doc_snippet)),
+            )
+    
+    def _hydrate_doc_from_cache_if_needed(d: dict) -> dict:
+        """Ensure search-result docs carry full cached content when available.
+
+        Graph/search results often contain title + URL + tiny preview only, while
+        the local document cache contains the extracted full text. This helper
+        hydrates by id or filename before building the LLM prompt.
+        """
+        try:
+            if not isinstance(d, dict):
+                return d
+            current = (d.get("content") or d.get("snippet") or "").strip()
+            title = (d.get("name") or d.get("title") or "").strip()
+            logger.info("Hydration check: %s before=%s chars", title or "Untitled", len(current))
+            if len(current) >= 1000 and not is_summary_request:
+                return d
+            cache_obj = get_cache()
+            if not cache_obj:
+                return d
+            # Prefer direct id lookup if the cache exposes it.
+            candidates = []
+            doc_id = d.get("id") or d.get("document_id")
+            if doc_id:
+                try:
+                    got = cache_obj.get_document(doc_id, cache_user_id or Config.SHAREPOINT_CACHE_USER_ID)
+                    if got:
+                        candidates.append(got)
+                except Exception:
+                    pass
+                try:
+                    got = cache_obj.get_shared_document(doc_id)
+                    if got:
+                        candidates.append(got)
+                except Exception:
+                    pass
+            # Fallback: search by title/name and take exact filename match.
+            if title and hasattr(cache_obj, "search_cache_scored"):
+                try:
+                    scored_docs = cache_obj.search_cache_scored(title, user_id=cache_user_id or Config.SHAREPOINT_CACHE_USER_ID, limit=5, include_shared=True)
+                    for item in scored_docs or []:
+                        cd = item.get("doc", {})
+                        if (cd.get("name") or cd.get("title") or "").strip().lower() == title.lower():
+                            candidates.append(cd)
+                except Exception:
+                    pass
+            for cd in candidates:
+                full = (cd.get("content") or "").strip()
+                if len(full) > len(current):
+                    d["content"] = full
+                    d.setdefault("snippet", full[:1000])
+                    d.setdefault("url", cd.get("url") or cd.get("webUrl") or d.get("url") or d.get("webUrl") or "")
+                    d.setdefault("webUrl", d.get("url") or cd.get("webUrl") or "")
+                    d["_from_document_cache"] = True
+                    d["_from_sharepoint"] = True
+                    logger.info("Hydrated cached content for LLM: %s before=%s after=%s chars", title, len(current), len(full))
+                    break
+        except Exception as hydrate_err:
+            logger.warning(f"Cache hydration failed for doc: {hydrate_err}")
+        return d
+
+    # (2) Add COMBINED/AI Search results (second priority - most relevant search results)
+    for d in (combined_doc_results or ai_search_results or []):
+        if scope != "ai_search":
+            d = _hydrate_doc_from_cache_if_needed(d)
+        if d.get("_access_denied"):
+            continue
+        doc_content = d.get("content", "")
+        doc_title = d.get("name") or d.get("title") or "Untitled"
+        source_query = d.get("_source_query")  # From parallel search
+        
+        if not doc_content or not doc_content.strip():
+            logger.warning(f"âš ï¸  Skipping doc without content for LLM input: {doc_title}")
+            continue
+        
+        # STABILIZATION FIX 2: Block oversized documents entirely
+        raw_len = len(doc_content)
+        if raw_len > 500_000:
+            logger.warning(f"ðŸš« BLOCKING oversized doc from LLM: {doc_title} ({raw_len:,} chars) - too large")
+            continue
+        
+        # ISSUE 1+2: Chunk+compress BEFORE prompt assembly
+        cap = DOC_SNIPPET_CAP
+        if is_summary_request and d.get("_primary_document"):
+            cap = max(cap, int(os.getenv("SUMMARY_PRIMARY_DOC_CHARS", "20000")))
+        if len(doc_content) > cap:
+            if is_summary_request and d.get("_primary_document"):
+                doc_content = doc_content[:cap]
+            else:
+                doc_content = _chunk_doc(doc_content, user_text or "", max_chars=cap, label=f"doc:{doc_title[:30]}")
+            d["_content_truncated"] = True
+        else:
+            doc_content = _compress_doc(doc_content, cap, label=f"doc:{doc_title[:30]}")
+        content_len = len(doc_content)
+        content_preview = doc_content[:100].replace("\n", " ") + ("..." if content_len > 100 else "")
+        
+        # Add source query info to title for parallel searches
+        if source_query and parallel_results:
+            display_title = f"{doc_title} (from '{source_query}' search)"
+            logger.info(f"ðŸ“ Adding to LLM input: {display_title} | {content_len} chars (capped) | {content_preview}")
+        else:
+            display_title = doc_title
+            logger.info(f"ðŸ“ Adding to LLM input: {doc_title} | {content_len} chars (capped) | {content_preview}")
+        
+        _add_doc_item(
+            display_title,
+            _encode_sharepoint_url(d.get("file_path") or d.get("url") or d.get("webUrl") or ""),
+            doc_content,
+            total_chars=raw_len,
+            truncated=bool(d.get("_content_truncated") or raw_len > content_len),
+            primary=bool(d.get("_primary_document")),
+        )
+        logger.info(
+            "Content passed to LLM: %s %s chars of %s total chars | Truncated: %s",
+            display_title,
+            content_len,
+            raw_len,
+            bool(d.get("_content_truncated") or raw_len > content_len),
+        )
+    
+    # (3) Add WEB RESULTS last (lowest priority - only if no documents found)
+    # Skip web results entirely if we have document results - they're less reliable
+    has_doc_results = bool(combined_doc_results or ([] if scope == "ai_search" else cached_results))
+    if web_results and not has_doc_results:
+        logger.info(f"âš ï¸  No documents found - adding {len(web_results)} web result(s) as fallback)")
+        for w in web_results:
+            w_content = w.get("content", "")
+            w_title = w.get("title") or w.get("url") or "Untitled Web Page"
+            if not w_content:
+                continue
+            # Chunk/Compress web content
+            from utils.context_budget import compress_for_llm as _compress_web, select_relevant_chunks as _chunk_web
+            if len(w_content) > DOC_SNIPPET_CAP:
+                w_content = _chunk_web(w_content, user_text or "", max_chars=DOC_SNIPPET_CAP, label=f"web:{w_title[:30]}")
+            else:
+                w_content = _compress_web(w_content, DOC_SNIPPET_CAP, label=f"web:{w_title[:30]}")
+            
+            _add_doc_item(f"{w_title} ðŸŒ", w.get("url") or "", w_content)
+        logger.info(f"Added {len(web_results)} web result(s) to model_doc_items (at end, low priority)")
+    elif web_results and has_doc_results:
+        logger.info(f"âœ… Document results found - skipping {len(web_results)} web result(s) to prioritize document relevance")
+    
+    # For follow-up questions, reload previous sources into context
+    # so the LLM has the data it discussed previously
+    if not model_doc_items and action == "refine_previous":
+        _prev_source_docs = conversation_last_sources.get(conversation_id, [])
+        if _prev_source_docs:
+            logger.info(f"Follow-up: reloading {len(_prev_source_docs)} previous source(s) into context")
+            for prev_doc in _prev_source_docs:
+                if prev_doc.get("snippet"):
+                    _add_doc_item(
+                        prev_doc.get("title", "Untitled"),
+                        prev_doc.get("url", ""),
+                        prev_doc.get("snippet", ""),
+                        total_chars=prev_doc.get("total_chars") or len(prev_doc.get("snippet", "") or ""),
+                        truncated=bool(prev_doc.get("truncated")),
+                        primary=bool(prev_doc.get("primary")),
+                    )
+
+    logger.info(f"model_doc_items built: {len(model_doc_items)} item(s) | titles={[d['title'] for d in model_doc_items[:5]]}")
+
+    # No last-chance search for general responses; avoid injecting documents into
+    # unrelated questions that should be answered directly.
+
+    if model_doc_items:
+        total_content_chars = sum(len(d.get('snippet', '')) for d in model_doc_items)
+        logger.info(f"ðŸ”¢ Total content for LLM: {total_content_chars} chars across {len(model_doc_items)} documents")
+    # Persist last sources so follow-up questions know what was discussed
+    # Include snippet content so follow-ups can reuse it
+    try:
+        if model_doc_items:
+            conversation_last_sources[conversation_id] = [
+                {
+                    "title": d.get("title", ""),
+                    "url": d.get("url", ""),
+                    "snippet": d.get("snippet", ""),
+                    "total_chars": d.get("total_chars") or len(d.get("snippet", "") or ""),
+                    "included_chars": d.get("included_chars") or len(d.get("snippet", "") or ""),
+                    "truncated": bool(d.get("truncated")),
+                    "primary": bool(d.get("primary")),
+                }
+                for d in model_doc_items
+            ]
+    except Exception:
+        pass
+    # Guard: if LLM requested search but no content is available, ask for the document
+    try:
+        source_required = bool(route.get("source_required") or action in ("search_documents", "refine_previous"))
+        guard = before_llm(
+            {
+                "source_required": source_required,
+                "query": route.get("query") or user_text,
+            },
+            {"sources": model_doc_items},
+            attachment_texts,
+        )
+        if not guard.allowed:
+            await ctx.send(MessageActivityInput(text=guard.response).add_ai_generated())
+            return
+    except Exception:
+        pass
 
     # Send typing indicator before LLM processing
     await send_typing_indicator(ctx)
@@ -2704,77 +5108,78 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
         user_text=user_text or "",
         attachment_texts=attachment_texts,
         doc_items=model_doc_items,
-        web_text=web_plain_text,
         personalization=personalization,
-        memory_text=""  # Not extracting SDK memory; enforce budgets via prompt only
+        memory_text=_conversation_source_summary
     )
+    
+    # â”€â”€ ISSUE 9: Log final prompt size â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    logger.info(f"Final Prompt Chars: {len(llm_input):,}")
+    logger.info(f"Estimated Tokens: {estimate_tokens(llm_input):,}")
+    logger.info(f"LLM input sizes: {llm_log['sizes']} | docs={llm_log['doc_count']} | actions={llm_log['truncation_actions']}")
+    
+    # â”€â”€ ISSUE 4+8: Token-aware gatekeeper (FINAL safety net) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # This loop iteratively removes lowest-priority blocks until
+    # prompt fits within MAX_PROMPT_TOKENS. Runs IMMEDIATELY before LLM call.
     try:
-        logger.info(f"LLM input sizes: {llm_log['sizes']} | est_tokens={llm_log['estimated_tokens']} | actions={llm_log['truncation_actions']} | docs={llm_log['doc_count']}")
-    except Exception:
-        pass
+        from utils.context_budget import token_gatekeeper
+        MAX_PROMPT_TOKENS = int(getattr(Config, "MAX_PROMPT_TOKENS_APPROX", 40000))
+        pre_gate_chars = len(llm_input)
+        llm_input = token_gatekeeper(llm_input, max_tokens=MAX_PROMPT_TOKENS)
+        if len(llm_input) != pre_gate_chars:
+            logger.warning(
+                f"ðŸš§ token_gatekeeper reduced prompt: {pre_gate_chars:,} â†’ {len(llm_input):,} chars "
+                f"(~{estimate_tokens(llm_input):,} tokens)"
+            )
+        # Final log after gatekeeper
+        logger.info(f"POST-GATEKEEPER Final Prompt Chars: {len(llm_input):,}")
+        logger.info(f"POST-GATEKEEPER Estimated Tokens: {estimate_tokens(llm_input):,}")
+    except Exception as gate_err:
+        logger.error(f"token_gatekeeper error: {gate_err}")
 
-    # CALCULATION INTERCEPTOR: Detect calculation requests and use Python instead of LLM
-    # This overcomes fundamental LLM arithmetic limitations
+    # CALCULATION INTERCEPTOR: use deterministic pandas logic for spreadsheet math.
+    # The LLM is still used for narrative/report writing, but counts, totals,
+    # averages, rankings, and categorical breakdowns should be computed first.
     calculation_result = None
     try:
-        # Check if user wants a calculation and we have file data
-        is_calc, calc_type = detect_calculation_intent(user_text or "")
-        
-        if is_calc and file_storage:
-            # Calculator mode: process cached CSV files for comparison/aggregation
-            csv_files = []
-            for stored_file in file_storage:
-                fname = stored_file.get("name", "").lower()
-                if fname.endswith('.csv') or 'csv' in fname:
-                    csv_files.append({
-                        "name": stored_file.get("name", "Unknown"),
-                        "content": stored_file.get("content", "")
-                    })
-            
-            logger.info(f"Calculator: Found {len(csv_files)} CSV files for calculation")
-            
-            if len(csv_files) >= 2:
-                # Multi-file calculation
-                logger.info(f"Calculator: Multi-file mode - processing {len(csv_files)} files")
-                calculation_result = process_multi_file_calculation(user_text, csv_files)
-                if calculation_result:
-                    logger.info(f"Calculator: Multi-file calculation successful - bypassing LLM")
-            elif len(csv_files) == 1:
-                # Single file calculation
-                logger.info(f"Calculator: Single-file mode - '{csv_files[0]['name']}'")
-                calculation_result = process_calculation_request(
-                    user_text, 
-                    csv_files[0]["content"], 
-                    csv_files[0]["name"]
-                )
-                if calculation_result:
-                    logger.info(f"Calculator: Single-file calculation successful - bypassing LLM")
-            
-            # Fallback to current attachments if no stored CSV files
-            if not calculation_result and attachment_texts:
-                for att_text in attachment_texts:
-                    if att_text and len(att_text) > 100:
-                        source_name = file_storage[-1].get("name", "Uploaded Document") if file_storage else "Uploaded Document"
-                        logger.info(f"Calculator: Using current attachment ({len(att_text)} chars)")
-                        calculation_result = process_calculation_request(user_text, att_text, source_name)
-                        if calculation_result:
-                            break
-    except Exception as calc_err:
-        logger.warning(f"Calculator error (falling back to LLM): {calc_err}")
-        calculation_result = None
+        is_calc_request, _calc_type = detect_calculation_intent(user_text or "")
+        if is_calc_request:
+            calc_files: list[dict] = []
 
-    # If calculation was successful, return it directly without LLM
-    if calculation_result:
-        ctx.stream.emit(calculation_result)
-        logger.info("Calculation response sent (bypassed LLM)")
-        
-        # Save conversation memory
-        try:
-            memory = memory_for(conversation_id)
-            _save_conversation_memory(conversation_id, memory)
-        except Exception:
-            pass
-        return
+            for f in current_attachment_files:
+                if f.get("content"):
+                    calc_files.append({"name": f.get("name", "attachment"), "content": f.get("content", "")})
+
+            if not calc_files and cache_user_id:
+                cached_calc_files = await asyncio.to_thread(
+                    get_conversation_attachments,
+                    conversation_id,
+                    True,
+                    cache_user_id,
+                )
+                for f in cached_calc_files or []:
+                    if f.get("content"):
+                        calc_files.append({"name": f.get("filename") or f.get("name", "attachment"), "content": f.get("content", "")})
+
+            if len(calc_files) >= 2:
+                calculation_result = await asyncio.to_thread(
+                    process_multi_file_calculation,
+                    user_text or "",
+                    calc_files,
+                )
+            elif len(calc_files) == 1:
+                calculation_result = await asyncio.to_thread(
+                    process_calculation_request,
+                    user_text or "",
+                    calc_files[0].get("content", ""),
+                    calc_files[0].get("name", ""),
+                )
+
+            if calculation_result:
+                logger.info("Deterministic calculation response generated before LLM")
+                await ctx.send(MessageActivityInput(text=calculation_result).add_ai_generated())
+                return
+    except Exception as calc_err:
+        logger.warning(f"Deterministic calculation interceptor failed; falling back to LLM: {calc_err}")
 
     # Skip secondary token budget enforcement - build_llm_input already handles truncation
     # Azure OpenAI will handle final token limits gracefully
@@ -2785,12 +5190,22 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
     # Throttle streaming to prevent Bot Framework 429 errors
     last_emit_time = 0
     chunk_buffer = []
+    full_response_chunks: list[str] = []  # accumulate ALL chunks to detect cited references
     MIN_CHUNK_INTERVAL = config.STREAM_CHUNK_INTERVAL  # From config (default 300ms)
     
     async def throttled_emit(chunk: str):
         """Emit chunks with rate limiting to prevent Bot Framework 429 errors"""
         nonlocal last_emit_time, chunk_buffer
         
+        full_response_chunks.append(chunk)  # always keep a copy
+        
+        # GROUP CHAT FIX: Skip streaming for group chats to avoid 405 errors
+        if is_group:
+            # For group chats, just buffer chunks - don't attempt streaming during generation
+            chunk_buffer.append(chunk)
+            return
+        
+        # For personal chats, continue with normal streaming logic
         chunk_buffer.append(chunk)
         current_time = time.time()
         time_since_last = current_time - last_emit_time
@@ -2799,32 +5214,245 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
         if time_since_last >= MIN_CHUNK_INTERVAL:
             if chunk_buffer:
                 combined = "".join(chunk_buffer)
-                ctx.stream.emit(combined)
-                chunk_buffer = []
-                last_emit_time = current_time
+                try:
+                    ctx.stream.emit(combined)
+                    chunk_buffer = []
+                    last_emit_time = current_time
+                except Exception as stream_error:
+                    # Log streaming errors but don't fail - chunks will be sent at end
+                    logger.warning(f"âš ï¸ Streaming emit failed in personal chat: {stream_error}")
+                    # Keep chunks in buffer for final emission
         # Otherwise, buffer chunks and they'll be emitted in next interval or at end
     
     # Use Teams SDK built-in streaming with retry logic and throttling
+    typing_mgr = TypingIndicatorManager(ctx)
     try:
-        # Send final typing indicator before generating response
-        await send_typing_indicator(ctx)
+        # ðŸ”„ START PERSISTENT TYPING: Keep indicator visible throughout entire response generation
+        # Using 3.0s interval (increased from 2.0s to reduce 429 rate limiting) with background refresh
+        await typing_mgr.start_periodic_refresh(interval=3.0)
+        
+        # GROUP CHAT DEBUGGING: Log before making chat call
+        logger.info(f"ðŸš€ Starting LLM call for conversation: {conversation_id[:20]}... (IsGroup: {is_group})")
+        
+        # NUCLEAR: Get memory with hardcoded enforcement BEFORE send
+        conversation_memory = get_or_create_conversation_memory(conversation_id)
+        max_turns = int(getattr(Config, "MAX_MEMORY_TURNS", 8))
+        max_messages = max_turns * 2
+        if get_conversation_summary_text(conversation_id):
+            max_messages = min(
+                max_messages,
+                int(os.getenv("MAX_MEMORY_MESSAGES_WITH_SUMMARY", "2")),
+            )
+        
+        # NUCLEAR FAILSAFE: Emergency clear if exceeded even by 1 message
+        # Uses _get_memory_items/_set_memory_items to access ListMemory's REAL storage
+        _mem_items = _get_memory_items(conversation_memory)
+        if _mem_items:
+            msg_count = len(_mem_items)
+            logger.info(f"ðŸ“Š Pre-LLM memory: {msg_count} messages (limit {max_messages})")
+            if msg_count > max_messages:
+                safe_count = max(2, max_messages // 2)  # Cut to 50% minimum 2 messages
+                logger.error(f"âŒ NUCLEAR FAILSAFE: {msg_count} > {max_messages}. Emergency cutting to {safe_count}")
+                _set_memory_items(conversation_memory, _mem_items[-safe_count:])
+                logger.error(f"âœ‚ï¸ Cut to {safe_count} messages to prevent token overflow")
+            # Also cap individual message sizes â€” each message limited to 4000 chars
+            _MEM_MSG_CAP = 4000
+            _capped_items = _get_memory_items(conversation_memory)
+            _total_mem_chars = 0
+            for _mi, _item in enumerate(_capped_items):
+                _content = getattr(_item, 'content', None) or ''
+                if len(_content) > _MEM_MSG_CAP:
+                    _item.content = _content[:_MEM_MSG_CAP] + '... [trimmed]'
+                    logger.info(f"âœ‚ï¸ Capped memory message {_mi} from {len(_content)} to {_MEM_MSG_CAP} chars")
+                _total_mem_chars += len(getattr(_item, 'content', '') or '')
+            logger.info(f"ðŸ“ Total memory chars for LLM: {_total_mem_chars:,} across {len(_capped_items)} messages")
+            
+            # TOTAL TOKEN BUDGET CHECK: instructions + memory + prompt
+            _instructions_chars = len(BASE_INSTRUCTIONS or '')
+            _prompt_chars = len(llm_input or '')
+            _grand_total_chars = _instructions_chars + _total_mem_chars + _prompt_chars
+            _grand_total_tokens = _grand_total_chars // 4
+            logger.info(
+                f"ðŸŽ¯ GRAND TOTAL estimate before LLM: {_grand_total_chars:,} chars (~{_grand_total_tokens:,} tokens) "
+                f"[instructions={_instructions_chars:,} + memory={_total_mem_chars:,} + prompt={_prompt_chars:,}]"
+            )
+            if _grand_total_tokens > 250_000:
+                logger.error(f"ðŸš¨ DANGER: Estimated {_grand_total_tokens:,} tokens > 250K limit! Emergency memory wipe!")
+                _set_memory_items(conversation_memory, [])
+                _total_mem_chars = 0
+                _grand_total_chars = _instructions_chars + _prompt_chars
+                logger.error(f"ðŸ§¹ Memory wiped. New total: {_grand_total_chars:,} chars (~{_grand_total_chars // 4:,} tokens)")
         
         async def make_chat_call():
             async with llm_semaphore:
                 return await chat_prompt.send(
                     input=llm_input,
-                memory=memory_for(conversation_id),
-                instructions=BASE_INSTRUCTIONS,
-                on_chunk=throttled_emit,
-            )
+                    memory=None,
+                    instructions=BASE_INSTRUCTIONS,
+                    on_chunk=throttled_emit,
+                )
         
+        # Make LLM call with retry logic
         chat_result = await call_llm_with_retry(make_chat_call)
         
-        # Emit any remaining buffered chunks
-        if chunk_buffer:
-            combined = "".join(chunk_buffer)
-            ctx.stream.emit(combined)
-            chunk_buffer = []
+        # CRITICAL: Guard against empty responses
+        full_response_text = "".join(full_response_chunks).strip()
+        if not full_response_text or full_response_text == "":
+            logger.error("ðŸš¨ CRITICAL: LLM returned empty response - sending fallback message")
+            empty_msg = "I encountered an issue generating a response. Please try again."
+            await ctx.send(MessageActivityInput(text=empty_msg).add_ai_generated())
+            await typing_mgr.stop_refresh()
+            return
+        
+        def _source_citation(idx: int, source: dict) -> str:
+            url = (source.get("url") or "").strip()
+            if url and url.startswith(("http://", "https://")):
+                return f"[[{idx}]]({url})"
+            return f"[[{idx}]]"
+
+        def _cited_source_indices(text: str, source_count: int) -> set[int]:
+            cited: set[int] = set()
+            for idx in range(1, source_count + 1):
+                if re.search(rf"(\[\[{idx}\]\]|\[{idx}\])", text or ""):
+                    cited.add(idx)
+            return cited
+
+        def _reference_lines(sources: list[dict], cited_indices: set[int]) -> list[str]:
+            ref_lines = []
+            for idx, d in enumerate(sources, 1):
+                if idx not in cited_indices:
+                    continue
+                title = (d.get("title") or "Untitled").strip()
+                url = (d.get("url") or "").strip()
+                if url and url.startswith(("http://", "https://")):
+                    ref_lines.append(f"[{idx}] [{title}]({url})")
+                elif url:
+                    ref_lines.append(f"[{idx}] {title}\n    URL: {url}")
+                else:
+                    ref_lines.append(f"[{idx}] {title}")
+            return ref_lines
+
+        def _ensure_source_citation(text: str, sources: list[dict]) -> tuple[str, set[int]]:
+            cited = _cited_source_indices(text, len(sources))
+            if cited or not sources:
+                return text, cited
+            return text, cited
+
+        # GROUP CHAT DEBUGGING: Log after LLM call  
+        logger.info(f"âœ… LLM call completed ({len(full_response_text)} chars), emitting final chunks for conversation: {conversation_id[:20]}...")
+        
+        # ðŸ›‘ STOP TYPING BEFORE FINAL EMISSION: Prevent 429 rate limiting from concurrent requests
+        await typing_mgr.stop_refresh()
+        # Brief pause to let Teams API catch up after stopping typing indicator
+        await asyncio.sleep(0.3)
+        
+        # GROUP CHAT FIX: Use regular messages instead of streaming for group chats
+        if is_group:
+            # For group chats, send complete response as regular message (avoid streaming 405 errors)
+            logger.info(f"ðŸ“¢ GROUP CHAT: Sending complete response as regular message (bypassing streaming)")
+            try:
+                full_text = "".join(full_response_chunks)
+                if chunk_buffer:
+                    full_text += "".join(chunk_buffer)
+                    chunk_buffer = []
+                
+                # Handle references for group chats too (before sending)
+                allow_references = bool(model_doc_items) and (
+                    action in ("search_documents", "refine_previous") or attachments or attachment_context
+                )
+                if allow_references:
+                    full_text, cited_indices = _ensure_source_citation(full_text, model_doc_items)
+                    ref_lines = _reference_lines(model_doc_items, cited_indices)
+                    
+                    if ref_lines:
+                        refs_block = "\n\n---\n**References:**\n\n" + "\n\n".join(ref_lines) + "\n"
+                        full_text += refs_block
+                        logger.info(f"Added references footer with {len(ref_lines)} source(s) to group chat message")
+                    else:
+                        logger.info("No cited references detected for group chat")
+                else:
+                    logger.info("References disabled for group chat non-document response")
+                
+                await ctx.send(MessageActivityInput(text=full_text).add_ai_generated())
+                logger.info(f"âœ… Group chat message sent successfully ({len(full_text)} chars)")
+                
+                # Log response for debugging
+                response_text = str(chat_result).strip() if chat_result else "(empty)"
+                logger.info(f"Group chat response completed | Length: {len(response_text)} chars | Preview: {response_text[:100]}...")
+                update_conversation_summary(
+                    conversation_id=conversation_id,
+                    user_text=user_text,
+                    assistant_text=full_text,
+                    route=route,
+                    source_names=[d.get("title") or d.get("name") or "" for d in model_doc_items],
+                )
+                
+                # Return early to prevent duplicate messages from normal flow
+                return
+                
+            except Exception as group_send_error:
+                if "405" in str(group_send_error) and "Method Not Allowed" in str(group_send_error):
+                    logger.error(f"ðŸš¨ GROUP CHAT 405 ERROR: {group_send_error}")
+                    logger.error(f"ðŸ’¡ Bot not properly installed in group chat. Try: Remove bot â†’ Re-add bot â†’ @mention bot")
+                logger.error(f"âŒ Group chat message failed: {group_send_error}")
+                raise
+        else:
+            # For personal chats, use normal streaming
+            if chunk_buffer:
+                combined = "".join(chunk_buffer)
+                try:
+                    # Add small delay before final emission to prevent 429 rate limiting
+                    await asyncio.sleep(0.3)
+                    ctx.stream.emit(combined)
+                    # Add delay after emission to let Teams process
+                    await asyncio.sleep(0.5)
+                    logger.info(f"âœ… Final chunks emitted successfully ({len(combined)} chars)")
+                except Exception as emit_error:
+                    logger.error(f"âŒ FAILED to emit final chunks in personal chat: {emit_error}")
+                    
+                    # Fallback: Try sending as regular message instead of streaming
+                    try:
+                        await ctx.send(MessageActivityInput(text=full_response_text).add_ai_generated())
+                        logger.info(f"âœ… Sent as regular message instead (fallback)")
+                    except Exception as fallback_error:
+                        logger.error(f"âŒ Fallback message send also failed: {fallback_error}")
+                        raise
+                chunk_buffer = []
+            else:
+                # CRITICAL: Even if chunk_buffer is empty, we MUST send the response
+                # This handles cases where streaming didn't emit or LLM didn't chunk response
+                try:
+                    logger.info(f"ðŸ“¤ No buffered chunks, sending complete response ({len(full_response_text)} chars) as regular message")
+                    await ctx.send(MessageActivityInput(text=full_response_text).add_ai_generated())
+                    logger.info(f"âœ… Complete response sent successfully")
+                except Exception as send_error:
+                    logger.error(f"âŒ FATAL: Failed to send response: {send_error}")
+                    # Last resort: send error message
+                    try:
+                        await ctx.send(MessageActivityInput(text=f"I generated a response but couldn't deliver it: {str(send_error)[:100]}").add_ai_generated())
+                    except:
+                        pass
+                    raise
+        
+        # Append numbered references footer only for document-driven responses
+        allow_references = bool(model_doc_items) and (
+            action in ("search_documents", "refine_previous") or attachments or attachment_context
+        )
+        if allow_references:
+            # Reconstruct the full LLM response to detect which [N] markers it used
+            full_response_text = "".join(full_response_chunks)
+            cited_response_text, cited_indices = _ensure_source_citation(full_response_text, model_doc_items)
+            ref_lines = _reference_lines(model_doc_items, cited_indices)
+            if ref_lines:
+                refs_block = "\n\n---\n**References:**\n\n" + "\n\n".join(ref_lines) + "\n"
+                # Add delay before references to prevent 429 rate limiting
+                await asyncio.sleep(0.5)
+                ctx.stream.emit(refs_block)
+                logger.info(f"Appended references footer with {len(ref_lines)} source(s) (cited out of {len(model_doc_items)} total)")
+            else:
+                logger.info("No cited references detected â€” skipping references footer")
+        else:
+            logger.info("References disabled for non-document response")
         
         # Log response for debugging
         try:
@@ -2832,27 +5460,90 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
             logger.info(f"Chat response completed | Length: {len(response_text)} chars | Preview: {response_text[:100]}...")
         except Exception:
             logger.info("Chat response completed")
+        update_conversation_summary(
+            conversation_id=conversation_id,
+            user_text=user_text,
+            assistant_text=full_response_text,
+            route=route,
+            source_names=[d.get("title") or d.get("name") or "" for d in model_doc_items],
+        )
         
         # CACHE DOCUMENTS POST-RESPONSE: Only cache documents from live Graph search that were used
         # Save conversation memory after response for instant recovery on next turn
-        try:
-            memory = memory_for(conversation_id)
-            _save_conversation_memory(conversation_id, memory)
-        except Exception as mem_err:
-            logger.debug(f"Failed to save conversation memory: {mem_err}")
+        # âœ… SIMPLIFIED: No manual memory saving needed with simple approach
+        # The ChatPrompt automatically handles memory management
         
         # This ensures we don't cache all searched documents, only the ones that provided value
         try:
-            # Check if we have any Graph results to potentially cache
-            graph_docs_to_cache = [d for d in (ai_search_results or []) if d.get("_from_live_graph")]
+            # SECURITY: Only cache documents that were actually included in the response AND passed security checks
+            graph_docs_to_cache = []
+            if action == "search_documents" and combined_doc_results:
+                # CRITICAL SECURITY: Only cache documents that passed initial filtering
+                # Never cache documents that were filtered out during search
+                filtered_doc_names = set()
+                try:
+                    # Track which documents were actually included in the response
+                    # Use combined_doc_results (list of dicts), NOT doc_entries (list of formatted strings)
+                    included_docs = {
+                        (d.get("name") or d.get("title"))
+                        for d in combined_doc_results
+                        if isinstance(d, dict) and (d.get("name") or d.get("title"))
+                    }
+                    
+                    # CRITICAL SECURITY: Check ALL documents in search results, not just Graph
+                    # This includes documents from cache, web, and other sources that were shown to user
+                    for doc in (ai_search_results or []):
+                        doc_name = doc.get("name") or doc.get("title")
+                        doc_url = doc.get("webUrl") or doc.get("url") or ""
+                        
+                        # Skip if not a Graph document (cache docs shouldn't be re-cached)
+                        # But DO verify permissions for documents from cache that were shown to user
+                        is_from_graph = doc.get("_from_live_graph", False)
+                        is_from_cache = doc.get("_from_cache", False)
+                        
+                        # SECURITY CHECK 1: Must have been included in actual response to user
+                        if doc_name not in included_docs:
+                            filtered_doc_names.add(doc_name or "unknown")
+                            continue
+                        
+                        # SECURITY CHECK 2: Re-verify access permissions for ALL document sources
+                        from knowledge_base import is_url_accessible_by_user
+                        if doc_url and not is_url_accessible_by_user(doc_url, user_email or "", user_context=False):
+                            logger.info(f"ðŸ”’ SECURITY: Blocking document user cannot access: {doc_name} (source: {'graph' if is_from_graph else 'cache' if is_from_cache else 'other'})")
+                            filtered_doc_names.add(doc_name or "unknown")
+                            continue
+                            
+                        # SECURITY CHECK 3: User email must be available for personal OneDrive documents
+                        if doc_url and "/personal/" in doc_url.lower() and not user_email:
+                            logger.warning(f"ðŸ”’ SECURITY: Blocking personal OneDrive due to missing user email: {doc_name}")
+                            filtered_doc_names.add(doc_name or "unknown")
+                            continue
+                        
+                        # SECURITY CHECK 4: Only cache Graph documents (don't re-cache what's already cached)
+                        if not is_from_graph:
+                            # Document from cache was shown to user and passed verification
+                            # No need to cache again, but log that it was verified
+                            if is_from_cache:
+                                logger.debug(f"âœ“ Verified cached document shown to user: {doc_name}")
+                            continue
+                            
+                        # Passed all security checks - safe to cache
+                        graph_docs_to_cache.append(doc)
+                        
+                    if filtered_doc_names:
+                        logger.info(f"ðŸ”’ Security filtered {len(filtered_doc_names)} document(s) from caching: {', '.join(list(filtered_doc_names)[:3])}")
+                        
+                except Exception as filter_err:
+                    logger.error(f"Error during cache security filtering: {filter_err}")
+                    graph_docs_to_cache = []  # Fail closed - don't cache anything if filtering fails
             
             if graph_docs_to_cache:
-                logger.info(f"Post-response caching: Found {len(graph_docs_to_cache)} Graph documents from live search")
+                logger.info(f"ðŸ“¦ Post-response caching: Found {len(graph_docs_to_cache)} Graph documents actually used in response")
                 
                 # Simple heuristic: Cache all returned documents from Graph since they were shown to user
                 # In a more sophisticated implementation, we could parse the response to see which citations were used
-                token = await asyncio.to_thread(get_graph_token)
-                if token and cache_user_id:
+                token = await asyncio.to_thread(get_graph_token, user_assertion)
+                if token and cache_user_id and user_email:  # SECURITY: Require user email for caching
                     cache = get_cache()
                     cached_count = 0
                     cache_sem = asyncio.Semaphore(3)
@@ -2870,6 +5561,31 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                             drive_id = doc.get("driveId") or ""
                             item_id = doc.get("itemId") or ""
                             existing_content = doc.get("content", "")
+                            
+                            # TRIPLE SECURITY CHECK: Re-verify all access permissions before download
+                            from knowledge_base import is_url_accessible_by_user
+                            
+                            # Check 1: General URL access permission
+                            if not is_url_accessible_by_user(web_url, user_email, user_context=False):
+                                logger.info(f"ðŸš« SECURITY: Cache blocked - user cannot access: {name}")
+                                return None, None
+                                
+                            # Check 2: Personal OneDrive strict validation
+                            if "/personal/" in web_url.lower():
+                                from knowledge_base import _extract_owner_from_personal_url
+                                owner = _extract_owner_from_personal_url(web_url)
+                                if owner:
+                                    user_normalized = user_email.lower().replace("@", ".").replace(".", "_")
+                                    owner_normalized = owner.lower().replace("@", ".").replace(".", "_")
+                                    if owner_normalized != user_normalized:
+                                        logger.warning(f"ðŸš« SECURITY: Cache blocked - personal OneDrive owner mismatch: {name} (owner: {owner}, user: {user_email})")
+                                        return None, None
+                                        
+                            # Check 3: User must be authenticated with email for any download
+                            if not user_email:
+                                logger.warning(f"ðŸš« SECURITY: Cache blocked - no user email for authentication: {name}")
+                                return None, None
+                            
                             if existing_content and len(existing_content.strip()) >= 50:
                                 return doc, existing_content
                             content = await asyncio.to_thread(download_and_extract_content, web_url, token, name, drive_id, item_id)
@@ -2882,6 +5598,8 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                         if isinstance(result, Exception):
                             logger.warning("Failed to cache document (download error)")
                             continue
+                        if result == (None, None):  # Filtered out for security
+                            continue
                         doc, content = result
                         try:
                             name = doc.get("name") or doc.get("title") or "Untitled"
@@ -2889,26 +5607,57 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                             drive_id = doc.get("driveId") or ""
                             item_id = doc.get("itemId") or ""
                             
+                            # Skip caching if content indicates access failure
+                            if is_inaccessible_content(content):
+                                logger.info(f"â­ï¸  Skipping cache for inaccessible document: {name}")
+                                continue
+                            
                             # Only cache if content is valid
-                            if content and len(content.strip()) >= 10 and "[Unable to download" not in content and "[Error extracting" not in content:
+                            if content and len(content.strip()) >= 10:
                                 # Use composite id for stability
                                 doc_id = f"{drive_id}:{item_id}" if drive_id and item_id else (web_url or name)
                                 
+                                # Extract owner info for metadata (helps identify shared documents)
+                                from knowledge_base import _extract_owner_from_personal_url
+                                doc_owner = _extract_owner_from_personal_url(web_url) if web_url else None
+                                is_teams_chat = "/microsoft teams chat files/" in (web_url or "").lower() or "/microsoft%20teams%20chat%20files/" in (web_url or "").lower()
+                                
+                                # Build metadata with ownership info and strict user isolation
+                                base_metadata = {
+                                    "source": "graph_search_used",
+                                    "owner": doc_owner if doc_owner else "unknown",
+                                    "is_teams_chat_file": is_teams_chat,
+                                    "cached_for_user": user_email,  # SECURITY: Track which user cached this
+                                    "cached_user_id": cache_user_id,  # SECURITY: Also track by user ID
+                                    "access_verified": True          # SECURITY: Mark as access-verified
+                                }
+                                
                                 # For CSV files, chunk the content for better search granularity
                                 is_csv = name.lower().endswith('.csv')
-                                if is_csv:
+                                if cache and is_csv:
                                     chunks = chunk_csv_for_cache(content, name)
                                     for chunk_id, chunk_content in chunks:
-                                        if _is_personal_url(web_url):
-                                            cache.add_document(f"{doc_id}:{chunk_id}", f"{name} (chunk)", web_url, chunk_content, user_id=cache_user_id, metadata={"source":"graph_search_used", "is_csv_chunk": True, "chunk_id": chunk_id})
-                                        else:
-                                            cache.add_shared_document(f"{doc_id}:{chunk_id}", f"{name} (chunk)", web_url, chunk_content, metadata={"source":"graph_search_used", "is_csv_chunk": True, "chunk_id": chunk_id})
+                                        chunk_metadata = {**base_metadata, "is_csv_chunk": True, "chunk_id": chunk_id}
+                                        cache.add_document(
+                                            f"{doc_id}:{chunk_id}",
+                                            f"{name} (chunk)",
+                                            web_url,
+                                            chunk_content,
+                                            user_id=cache_user_id,
+                                            metadata=chunk_metadata
+                                        )
+                                elif cache:
+                                    # Non-CSV files cached normally with strict user isolation
+                                    cache.add_document(
+                                        doc_id, 
+                                        name, 
+                                        web_url, 
+                                        content, 
+                                        user_id=cache_user_id,  # CRITICAL: User-specific cache
+                                        metadata=base_metadata
+                                    )
                                 else:
-                                    # Non-CSV files cached normally
-                                    if _is_personal_url(web_url):
-                                        cache.add_document(doc_id, name, web_url, content, user_id=cache_user_id, metadata={"source":"graph_search_used"})
-                                    else:
-                                        cache.add_shared_document(doc_id, name, web_url, content, metadata={"source":"graph_search_used"})
+                                    logger.warning("Cache is None - skipping document caching")
                                 
                                 cached_count += 1
                                 logger.info(f"Cached document: {name} (from Graph live search)")
@@ -2916,107 +5665,147 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
                             logger.warning(f"Failed to cache document {doc.get('name', 'unknown')}: {cache_err}")
                     
                     if cached_count > 0:
-                        logger.info(f"✓ Post-response caching completed: {cached_count}/{len(graph_docs_to_cache)} documents cached")
+                        logger.info(f"âœ“ Post-response caching completed: {cached_count}/{len(graph_docs_to_cache)} documents cached for user {user_email}")
+                        
+                        # SECURITY: Periodic security audit (every N cache operations)
+                        global _security_audit_counter
+                        _security_audit_counter += 1
+                        
+                        if _security_audit_counter >= _SECURITY_AUDIT_FREQUENCY:
+                            _security_audit_counter = 0  # Reset counter
+                            try:
+                                if cache:
+                                    audit = cache.security_audit()
+                                    violations = audit.get("violations", [])
+                                    if violations:
+                                        logger.warning(f"ðŸš¨ SECURITY AUDIT: Found {len(violations)} violations - auto-cleaning")
+                                        removed_count = cache.clean_security_violations()
+                                        logger.warning(f"ðŸ›¡ï¸ SECURITY: Removed {removed_count} violating documents")
+                                    else:
+                                        logger.info(f"ðŸ›¡ï¸ Periodic security audit passed: {audit.get('total_docs', 0)} documents across {audit.get('total_users', 0)} users")
+                            except Exception as audit_err:
+                                logger.error(f"Periodic security audit failed: {audit_err}")
                     else:
                         logger.info("Post-response caching: No documents were cached (all failed or already cached)")
+                elif not user_email:
+                    logger.warning("ðŸ”’ Post-response caching BLOCKED: User email unavailable (security requirement)")
                 else:
                     logger.warning("Post-response caching skipped: Graph token or user ID unavailable")
         except Exception as post_cache_err:
             logger.error(f"Post-response caching error: {post_cache_err}", exc_info=False)
+        
+        # Clean up status messages after response is sent
+        if status_activity_ids:
+            logger.info(f"Cleaning up {len(status_activity_ids)} status message(s)")
+            for activity_id in status_activity_ids:
+                try:
+                    await ctx.delete_activity(activity_id)
+                    logger.debug(f"Deleted status message: {activity_id}")
+                except Exception as del_err:
+                    logger.debug(f"Failed to delete status message {activity_id}: {del_err}")
+            logger.info("âœ“ Status messages cleaned up")
+
     except Exception as e:
+        # ðŸ›‘ STOP TYPING: Stop the persistent indicator when error occurs
+        await typing_mgr.stop_refresh()
+        
         error_msg = str(e)
         if "429" in error_msg:
-            logger.error(f"Rate limit error (Bot Framework API): {e}")
-            await ctx.send(MessageActivityInput(text="⚠️ The bot is sending messages too quickly. Please wait a moment and try again.").add_ai_generated())
+            logger.error(f"Rate limit error (Bot Framework API): {e}", exc_info=True)
+            await ctx.send(MessageActivityInput(text="âš ï¸ The bot is sending messages too quickly. Please wait a moment and try again.").add_ai_generated())
         else:
-            logger.error(f"Chat error: {e}")
+            logger.error(f"âŒ CRITICAL CHAT ERROR: {e}", exc_info=True)
+            logger.error(f"Error type: {type(e).__name__}")
+            logger.error(f"Error details: {error_msg}")
             await ctx.send(MessageActivityInput(text="Sorry, I encountered an error processing your request. Please try again in a moment.").add_ai_generated())
         return
+    finally:
+        # ðŸ›‘ FINAL CLEANUP: Ensure typing indicator stops before returning (double safety)
+        await typing_mgr.stop_refresh()
 
 
 # ---------------------------
 # Event handlers
 # ---------------------------
-async def send_welcome_message(ctx: ActivityContext):
-    """Send welcome message for new users or when requested"""
-    try:
-        welcome_message = """👋 **Welcome to SwopeAI!**
 
-I'm your intelligent assistant powered by AI. Here's what I can help you with:
-
-📄 **Document Analysis**
-• Upload and analyze PDFs, Word docs, Excel files, and more
-• Extract information and summarize content
-• Compare multiple documents
-
-🔍 **Smart Search**
-• Search your SharePoint and OneDrive files
-• Find information across your organization's documents
-• Get answers from indexed web content
-
-💬 **Natural Conversations**
-• Ask questions in plain English
-• Get detailed explanations with source citations
-• Access current date/time information
-
-🏥 **Swope Health Information**
-• Learn about services, locations, and healthcare offerings
-• Get organization-specific information
-
-**Ready to get started?** Try asking me something like:
-• "What can you help me with?"
-• "Tell me about Swope Health"
-• "Search my SharePoint files"
-
-Or simply upload a document and ask me to analyze it! 📎"""
-
-        await ctx.send(MessageActivityInput(text=welcome_message).add_ai_generated())
-        logger.info("Welcome message sent to user")
-        
-    except Exception as e:
-        logger.error(f"Error sending welcome message: {e}", exc_info=True)
-        # Fallback simple welcome message
-        try:
-            await ctx.send(MessageActivityInput(text="👋 Hello! I'm SwopeAI, your intelligent assistant. How can I help you today?").add_ai_generated())
-        except Exception as fallback_error:
-            logger.error(f"Failed to send fallback welcome message: {fallback_error}")
 
 @app.on_message
 async def handle_message(ctx: ActivityContext[MessageActivity]):
     try:
         logger.info("=" * 60)
-        logger.info(f"MESSAGE RECEIVED | Text: {ctx.activity.text[:100] if ctx.activity.text else 'None'}")
+        
+        # CRITICAL: Validate basic message structure first
+        if not ctx or not ctx.activity:
+            logger.error("âŒ CRITICAL: Received null or invalid activity context")
+            return
+        
+        user_text = (ctx.activity.text or "").strip()
+        if not user_text:
+            logger.warning("âš ï¸ Empty message received - ignoring")
+            return
+        
+        logger.info(f"MESSAGE RECEIVED | Text: {user_text[:100]}")
         logger.info(f"From: {getattr(ctx.activity.from_, 'name', 'Unknown')} | Conv: {ctx.activity.conversation.id if ctx.activity.conversation else 'Unknown'}")
+        
+        # GROUP CHAT DEBUGGING: Enhanced context logging
+        if hasattr(ctx.activity, 'conversation') and ctx.activity.conversation:
+            conv = ctx.activity.conversation
+            conv_type = getattr(conv, 'conversation_type', 'unknown')
+            conv_id = getattr(conv, 'id', 'unknown')
+            is_group_chat = '@unq.gbl.spaces' in conv_id or conv_type in ['groupChat', 'channel']
+            
+            logger.info(f"CONVERSATION DEBUG - Type: {conv_type} | IsGroup: {is_group_chat} | ConvID: {conv_id[:50]}...")
+            
+            if is_group_chat and "405" in str(getattr(ctx, '_last_error', '')):
+                logger.error(f"ðŸš¨ DETECTED GROUP CHAT PERMISSION ISSUE")
+                logger.error(f"ðŸ’¡ TROUBLESHOOTING STEPS:")
+                logger.error(f"   1. Remove bot from group chat")
+                logger.error(f"   2. Check Bot Framework registration has group chat permissions")
+                logger.error(f"   3. Re-add bot to group chat")
+                logger.error(f"   4. Try @mentioning the bot: @{getattr(ctx.activity.recipient, 'name', 'Bot')} hello")
+
+        # Check for @mentions which might be required in groups
+        mentions = getattr(ctx.activity, 'entities', []) or []
+        mention_found = any(getattr(entity, 'type', None) == 'mention' for entity in mentions)
+        logger.info(f"MENTIONS DEBUG - Has mentions: {mention_found} | Entity count: {len(mentions)}")
         logger.info("=" * 60)
-        
-        # Handle welcome for first-time users or specific welcome commands
-        user_text = (ctx.activity.text or "").strip().lower()
-        if user_text in ["hello", "hi", "start", "welcome", "help"]:
-            # This might be a first interaction, consider showing welcome
-            await send_welcome_message(ctx)
-            return  # Don't process further for welcome commands
-        
-        await handle_stateful_conversation(model, ctx)
+
+        # Phase 3: hydrate durable conversation state on entry, flush on exit. The
+        # finally clause guarantees a single save regardless of how the handler returns.
+        _conv_id = ctx.activity.conversation.id if getattr(ctx.activity, "conversation", None) else None
+        if _conv_id:
+            _load_conversation_state(_conv_id)
+        try:
+            await handle_stateful_conversation(model, ctx)
+        finally:
+            if _conv_id:
+                _persist_conversation_state(_conv_id)
+
     except Exception as e:
         error_msg = str(e)
         logger.error(f"Message handling error: {error_msg}", exc_info=True)
         
         # Provide user-friendly error messages based on error type
         if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
-            user_message = "⚠️ I'm experiencing a temporary connection issue. Please try your message again in a moment."
+            user_message = "âš ï¸ I'm experiencing a temporary connection issue. Please try your message again in a moment."
         elif "token" in error_msg.lower() or "auth" in error_msg.lower():
-            user_message = "⚠️ There was an authentication issue. Please try again. If this persists, the bot may need to be restarted."
+            user_message = "âš ï¸ There was an authentication issue. Please try again. If this persists, the bot may need to be restarted."
         elif "openai" in error_msg.lower() or "429" in error_msg:
-            user_message = "⚠️ The AI service is temporarily busy. Please wait a moment and try again."
+            user_message = "âš ï¸ The AI service is temporarily busy. Please wait a moment and try again."
         elif "graph" in error_msg.lower():
-            user_message = "⚠️ I had trouble accessing Microsoft 365 resources. Please try again."
+            user_message = "âš ï¸ I had trouble accessing Microsoft 365 resources. Please try again."
         else:
-            user_message = f"⚠️ Sorry, I encountered an unexpected error. Please try again.\n\n_Error: {error_msg[:100]}_"
+            user_message = f"âš ï¸ Sorry, I encountered an unexpected error. Please try again.\n\n_Error: {error_msg[:100]}_"
         
         try:
             await ctx.send(MessageActivityInput(text=user_message).add_ai_generated())
         except Exception as send_error:
-            logger.error(f"Failed to send error message to user: {send_error}", exc_info=True)
+            # Check if it's a group chat permission error (405 Method Not Allowed)
+            if "405" in str(send_error) and "Method Not Allowed" in str(send_error):
+                logger.error(f"âŒ GROUP CHAT PERMISSION ERROR: {send_error}")
+                logger.error(f"ðŸ’¡ FIX: Bot needs to be properly installed in group chat with messaging permissions")
+            else:
+                logger.error(f"Failed to send error message to user: {send_error}", exc_info=True)
 
 
 # Global error handler for unhandled exceptions (if supported by SDK)
@@ -3029,9 +5818,9 @@ try:
         
         try:
             if "timeout" in error_msg.lower() or "jwt" in error_msg.lower():
-                user_message = "⚠️ I'm experiencing connectivity issues. Please try your message again."
+                user_message = "âš ï¸ I'm experiencing connectivity issues. Please try your message again."
             else:
-                user_message = "⚠️ Something went wrong. Please try again in a moment."
+                user_message = "âš ï¸ Something went wrong. Please try again in a moment."
             
             await ctx.send(MessageActivityInput(text=user_message).add_ai_generated())
         except Exception as send_error:
@@ -3048,22 +5837,8 @@ async def handle_message_feedback(ctx: ActivityContext[MessageSubmitActionInvoke
 
 
 def check_web_indexing_dependencies():
-    """Check if required web indexing dependencies are available"""
-    try:
-        import aiohttp
-        logger.info("✓ aiohttp is installed")
-    except ImportError:
-        logger.error("✗ aiohttp is NOT installed - web indexing will not work. Run: pip install aiohttp")
-        return False
-    
-    try:
-        from bs4 import BeautifulSoup
-        logger.info("✓ beautifulsoup4 is installed")
-    except ImportError:
-        logger.error("✗ beautifulsoup4 is NOT installed - web indexing will not work. Run: pip install beautifulsoup4")
-        return False
-    
-    return True
+    """Website indexing is disabled for this SharePoint/uploads-only assistant."""
+    return False
 
 
 # ---------------------------
@@ -3076,81 +5851,27 @@ async def startup():
     logger.info("=" * 60)
     # Print identity context and confirm token strategy
     try:
-        logger.info(f"Configured TENANT_ID: {config.APP_TENANTID or 'not set'}")
+        graph_tenant = config.GRAPH_TENANT_ID or config.APP_TENANTID
+        logger.info(f"Configured GRAPH_TENANT_ID (fallback TENANT_ID): {graph_tenant or 'not set'}")
         logger.info(f"Configured CLIENT_ID: {config.APP_ID or 'not set'}")
         logger.info(f"Configured SENDER_UPN: {config.SENDER_UPN or 'not set'}")
-        logger.info("Token strategy: Graph app-only via OAuth2 client credentials (.default scope). No Bot Framework UserToken API.")
+        logger.info("Token strategy: app-only client credentials (delegated tokens disabled)")
+        logger.info(
+            "Effective SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN: %s (too low silently leaves later docs unindexed)",
+            config.SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN,
+        )
     except Exception:
         pass
     
-    # Check web indexing dependencies first
-    logger.info("Checking web indexing dependencies...")
-    deps_ok = check_web_indexing_dependencies()
-    
-    # Preload document cache into memory for instant access
-    logger.info("Preloading document cache into memory...")
+    # Start SharePoint -> Azure AI Search indexing in the background.
     try:
-        cache = get_cache()
-        all_cached_docs = cache.get_all_documents(None, include_shared=True)
-        total_content_size = sum(len(d.get("content", "")) for d in (all_cached_docs or []))
-        logger.info(f"✓ Cache preloaded: {len(all_cached_docs or [])} documents ({total_content_size / 1024 / 1024:.2f} MB)")
-    except Exception as cache_load_err:
-        logger.warning(f"Failed to preload cache: {cache_load_err}")
-    
-    # Start web indexing in background (don't await - let it run parallel to app)
-    try:
-        # Create web indexing tasks but don't block on them
-        logger.info("Initializing web indexer...")
-        web_indexer = get_web_indexer()
-        logger.info("✓ Web indexer singleton created")
-        
-        external_sources = Config.EXTERNAL_WEB_SOURCES or ""
-        logger.info(f"EXTERNAL_WEB_SOURCES config: {external_sources}")
-        
-        if external_sources and deps_ok:
-            urls = [url.strip() for url in external_sources.split(",") if url.strip()]
-            logger.info(f"Initiating web indexing for {len(urls)} sources: {urls}")
-            
-            for url in urls:
-                try:
-                    # Check if domain is already indexed and completed or failed
-                    from urllib.parse import urlparse
-                    domain = urlparse(url).netloc or urlparse(url).path
-                    cache = web_indexer.cache.get("websites", {}).get(domain, {})
-                    
-                    if cache.get("status") == "completed" and cache.get("pages"):
-                        logger.info(f"Domain {domain} already fully indexed ({len(cache['pages'])} pages). Skipping re-indexing.")
-                        continue
-                    
-                    if cache.get("status") == "failed":
-                        logger.info(f"Domain {domain} previously marked as failed. Skipping crawl.")
-                        continue
-                    
-                    logger.info(f"Creating indexing task for: {url}")
-                    task = asyncio.create_task(
-                        web_indexer.crawl_website(
-                            url,
-                            max_pages=Config.WEB_CRAWL_MAX_PAGES,
-                            max_depth=Config.WEB_CRAWL_MAX_DEPTH
-                        )
-                    )
-                    add_background_task(task, f"web_indexing_{domain}")
-                    logger.info(f"✓ Created background indexing task for: {url}")
-                except Exception as e:
-                    logger.error(f"✗ Failed to create indexing task for {url}: {e}", exc_info=True)
-        elif not deps_ok:
-            logger.error("✗ Web indexing dependencies missing - web crawling disabled")
-        else:
-            logger.info("No external web sources configured for indexing")
-    except Exception as e:
-        logger.error(f"✗ Error initializing web indexing: {e}", exc_info=True)
+        from search.ai_search_worker import indexing_worker
 
-    # Background SharePoint/OneDrive crawling DISABLED
-    # All searches are now purely live via Graph API
-    # Cache is only populated from documents actually used in responses
-    logger.info("SharePoint/OneDrive background crawling: DISABLED (live search only)")
-    
-    # Start the Teams app (this will run indefinitely)
+        task = asyncio.create_task(indexing_worker())
+        add_background_task(task, "sharepoint_ai_search_indexing_worker")
+    except Exception as e:
+        logger.error(f"Failed to start SharePoint AI Search indexing worker: {e}", exc_info=True)
+
     logger.info("Starting Teams AI app...")
     logger.info("=" * 60)
     await app.start()
