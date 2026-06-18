@@ -5922,9 +5922,10 @@ async def startup():
         )
         # Single-line effective-config summary — the first thing to check in any deployment log.
         logger.info(
-            "STARTUP | index=%s | security_trimming=%s | memory_turns=%s | kv=%s",
+            "STARTUP | index=%s | security_trimming=%s | graph_search=%s | memory_turns=%s | kv=%s",
             config.AZURE_SEARCH_INDEX_NAME,
             config.ENABLE_SECURITY_TRIMMING,
+            config.ENABLE_GRAPH_SEARCH,
             config.MAX_MEMORY_TURNS,
             "set" if os.environ.get("AZURE_KEY_VAULT_URL") else "not set",
         )
