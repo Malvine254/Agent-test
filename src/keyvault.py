@@ -71,13 +71,18 @@ def load_from_keyvault(vault_url: str) -> None:
                     failed.append(secret_name)
                     logger.warning("Key Vault: failed to fetch '%s': %s", secret_name, exc)
 
-        logger.info(
-            "Key Vault: loaded=%d %s | skipped=%d | failed=%s",
+        summary = "Key Vault: loaded=%d %s | skipped=%d | failed=%s" % (
             len(loaded),
             loaded,
             len(skipped),
             failed if failed else "none",
         )
+        logger.info(summary)
+        # This runs at config import time — before the app configures logging — so the
+        # INFO record above can be dropped. Print as well so the line is always visible
+        # in startup/deployment logs (App Service captures stdout).
+        if not logging.getLogger().hasHandlers():
+            print(summary, flush=True)
         if failed:
             logger.error(
                 "Key Vault: %d secret(s) failed to load: %s. The bot may fail on "
