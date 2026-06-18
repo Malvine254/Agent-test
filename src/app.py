@@ -113,6 +113,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  # Only our app logs at INFO level
+# Named audit logger — who asked what and which source answered. Routable to App
+# Insights / Log Analytics separately from debug output in deployment.
+audit_log = logging.getLogger("audit")
+audit_log.setLevel(logging.INFO)
 
 # Disable ALL third-party logging
 logging.getLogger("httpx").setLevel(logging.CRITICAL)
@@ -5067,6 +5071,20 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
                     )
 
     logger.info(f"model_doc_items built: {len(model_doc_items)} item(s) | titles={[d['title'] for d in model_doc_items[:5]]}")
+
+    # Retrieval audit trail — who asked, which source answered, how many chunks.
+    _audit_source = (
+        "upload" if (attachments or has_cached_attachments)
+        else ("none" if not model_doc_items else (scope or "ai_search"))
+    )
+    audit_log.info(
+        "RETRIEVAL | user=%s | source=%s | chunks=%d | trimming=%s | query=%s",
+        aad_id or "unknown",
+        _audit_source,
+        len(model_doc_items),
+        Config.ENABLE_SECURITY_TRIMMING,
+        (user_text or "")[:80],
+    )
 
     # No last-chance search for general responses; avoid injecting documents into
     # unrelated questions that should be answered directly.
