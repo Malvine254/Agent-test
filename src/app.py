@@ -98,10 +98,18 @@ from smart_router import (
 # ---------------------------
 # Logging (only key application events)
 # ---------------------------
+# Force UTF-8 on the log stream so emoji/Unicode render correctly instead of mojibake
+# (Windows consoles default to cp1252, which is what produced the "â€¦"/"ðŸ”’" output).
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
+if hasattr(_log_handler.stream, "reconfigure"):
+    try:
+        _log_handler.stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 logging.basicConfig(
     level=logging.WARNING,  # Set baseline to WARNING to suppress noise
-    format="%(asctime)s | %(message)s",
-    datefmt="%H:%M:%S"
+    handlers=[_log_handler],
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  # Only our app logs at INFO level
