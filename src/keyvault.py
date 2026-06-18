@@ -52,6 +52,7 @@ def load_from_keyvault(vault_url: str) -> None:
 
         loaded: list[str] = []
         failed: list[str] = []
+        skipped: list[str] = []
 
         for secret_name, env_key in SECRET_MAP.items():
             try:
@@ -60,20 +61,35 @@ def load_from_keyvault(vault_url: str) -> None:
                     os.environ[env_key] = secret.value
                     loaded.append(env_key)
                 else:
-                    logger.warning("Key Vault secret '%s' is empty", secret_name)
+                    logger.warning("Key Vault: secret '%s' exists but is empty", secret_name)
+                    skipped.append(secret_name)
             except HttpResponseError as exc:
                 if getattr(exc, "status_code", None) == 404:
-                    logger.debug("Key Vault secret '%s' not found — skipping", secret_name)
+                    logger.debug("Key Vault: secret '%s' not found — skipping", secret_name)
+                    skipped.append(secret_name)
                 else:
                     failed.append(secret_name)
                     logger.warning("Key Vault: failed to fetch '%s': %s", secret_name, exc)
 
-        logger.info(
-            "Key Vault: loaded %d secrets (%s). Failed: %s",
+        summary = "Key Vault: loaded=%d %s | skipped=%d | failed=%s" % (
             len(loaded),
-            ", ".join(loaded) if loaded else "none",
-            ", ".join(failed) if failed else "none",
+            loaded,
+            len(skipped),
+            failed if failed else "none",
         )
+        logger.info(summary)
+        # This runs at config import time — before the app configures logging — so the
+        # INFO record above can be dropped. Print as well so the line is always visible
+        # in startup/deployment logs (App Service captures stdout).
+        if not logging.getLogger().hasHandlers():
+            print(summary, flush=True)
+        if failed:
+            logger.error(
+                "Key Vault: %d secret(s) failed to load: %s. The bot may fail on "
+                "requests that need these credentials.",
+                len(failed),
+                failed,
+            )
     except ServiceRequestError as exc:
         logger.error(
             "Key Vault: network error connecting to %s: %s — falling back to env/file secrets",

@@ -98,13 +98,25 @@ from smart_router import (
 # ---------------------------
 # Logging (only key application events)
 # ---------------------------
+# Force UTF-8 on the log stream so emoji/Unicode render correctly instead of mojibake
+# (Windows consoles default to cp1252, which is what produced the "â€¦"/"ðŸ”’" output).
+_log_handler = logging.StreamHandler(sys.stdout)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
+if hasattr(_log_handler.stream, "reconfigure"):
+    try:
+        _log_handler.stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 logging.basicConfig(
     level=logging.WARNING,  # Set baseline to WARNING to suppress noise
-    format="%(asctime)s | %(message)s",
-    datefmt="%H:%M:%S"
+    handlers=[_log_handler],
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  # Only our app logs at INFO level
+# Named audit logger — who asked what and which source answered. Routable to App
+# Insights / Log Analytics separately from debug output in deployment.
+audit_log = logging.getLogger("audit")
+audit_log.setLevel(logging.INFO)
 
 # Disable ALL third-party logging
 logging.getLogger("httpx").setLevel(logging.CRITICAL)
@@ -5060,6 +5072,20 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
 
     logger.info(f"model_doc_items built: {len(model_doc_items)} item(s) | titles={[d['title'] for d in model_doc_items[:5]]}")
 
+    # Retrieval audit trail — who asked, which source answered, how many chunks.
+    _audit_source = (
+        "upload" if (attachments or has_cached_attachments)
+        else ("none" if not model_doc_items else (scope or "ai_search"))
+    )
+    audit_log.info(
+        "RETRIEVAL | user=%s | source=%s | chunks=%d | trimming=%s | query=%s",
+        aad_id or "unknown",
+        _audit_source,
+        len(model_doc_items),
+        Config.ENABLE_SECURITY_TRIMMING,
+        (user_text or "")[:80],
+    )
+
     # No last-chance search for general responses; avoid injecting documents into
     # unrelated questions that should be answered directly.
 
@@ -5859,6 +5885,14 @@ async def startup():
         logger.info(
             "Effective SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN: %s (too low silently leaves later docs unindexed)",
             config.SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN,
+        )
+        # Single-line effective-config summary — the first thing to check in any deployment log.
+        logger.info(
+            "STARTUP | index=%s | security_trimming=%s | memory_turns=%s | kv=%s",
+            config.AZURE_SEARCH_INDEX_NAME,
+            config.ENABLE_SECURITY_TRIMMING,
+            config.MAX_MEMORY_TURNS,
+            "set" if os.environ.get("AZURE_KEY_VAULT_URL") else "not set",
         )
     except Exception:
         pass
