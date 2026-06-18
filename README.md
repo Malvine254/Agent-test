@@ -16,12 +16,22 @@ Do **not** set `AZURE_KEY_VAULT_URL` locally — secrets are read from `.env` di
 cp .env.example .env   # then edit .env with your values
 ```
 
-### Deployed environments (Azure App Service / Container)
+### Deployed (Azure App Service)
 
-Set `AZURE_KEY_VAULT_URL` in App Service → Configuration → Application Settings.
-Do **not** set any other secrets in App Settings — they are loaded from Key Vault at
-startup. Assign the App Service's managed identity the **Key Vault Secrets User** role
-on the vault.
+1. Enable system-assigned managed identity on the App Service:
+   Portal → App Service → Identity → System assigned → On → Save.
+   Copy the Object ID that appears.
+2. In Key Vault (`dynamo-bot-kv`) → Access policies → Create:
+   - Permissions: Secret → Get, List (nothing else)
+   - Principal: paste the Object ID from step 1
+   - Click Create
+3. Set `AZURE_KEY_VAULT_URL=https://dynamo-bot-kv.vault.azure.net/` in
+   App Service → Configuration → Application settings.
+4. Do **not** set any other secrets in App Settings — they load from Key Vault at startup.
+
+> Note: this vault uses **access policies** (not RBAC). If you recreate it with
+> `--enable-rbac-authorization true`, grant the identity the "Key Vault Secrets User"
+> role instead of an access policy.
 
 Required Key Vault secrets (names must match exactly):
 
