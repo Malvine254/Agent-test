@@ -212,6 +212,9 @@ class Config:
     # every AI Search query is filtered to documents the requesting user may access.
     # Default OFF so the working bot is unaffected until the feature is verified.
     ENABLE_SECURITY_TRIMMING = os.environ.get("ENABLE_SECURITY_TRIMMING", "false").strip().lower() in ("1", "true", "yes")
+    # Live Graph search (mail, OneDrive) via Teams SSO + OBO delegated auth. Off until
+    # Phase 7-Pre (SSO/OBO) is verified end-to-end; otherwise /search/query returns 401.
+    ENABLE_GRAPH_SEARCH = os.environ.get("ENABLE_GRAPH_SEARCH", "false").strip().lower() in ("1", "true", "yes")
     # Disable external APIs (AI Search & Graph) when attachments are present
     DISABLE_APIS_ON_ATTACHMENTS = os.environ.get("DISABLE_APIS_ON_ATTACHMENTS", "false").strip().lower() in ("1", "true", "yes")
     
