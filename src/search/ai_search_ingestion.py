@@ -139,6 +139,40 @@ def index_sharepoint_document(item: dict) -> dict:
     return {"status": "indexed", "document_id": document_id, "chunks": len(chunks), "file_name": file_name}
 
 
+def reindex_specific_files(titles: list[str]) -> dict:
+    """Targeted re-index of specific files by name (e.g. transient-failure stragglers).
+
+    Filters the full SharePoint document list to the named titles and re-runs the
+    permission fetch + chunk upsert for only those files. Run with
+    SHAREPOINT_FORCE_REINDEX=true so existing (empty-ACL) chunks are overwritten.
+    """
+    ensure_sharepoint_index()
+    clear_permission_cache()
+    target = {t.strip().lower() for t in (titles or []) if t and t.strip()}
+    summary = {"requested": len(target), "matched": 0, "reindexed": 0, "skipped": 0, "failed": 0}
+    documents = list_sharepoint_documents(
+        max_items=Config.SHAREPOINT_INDEX_MAX_ITEMS_PER_RUN,
+        max_depth=Config.SHAREPOINT_INDEX_MAX_DEPTH,
+    )
+    for item in documents:
+        if (item.get("name") or "").strip().lower() not in target:
+            continue
+        summary["matched"] += 1
+        try:
+            result = index_sharepoint_document(item)
+            status = result.get("status")
+            if status == "indexed":
+                summary["reindexed"] += 1
+            else:
+                summary["skipped"] += 1
+            logger.info("TARGETED REINDEX | file=%s | status=%s", item.get("name"), status)
+        except Exception as exc:
+            summary["failed"] += 1
+            logger.warning("TARGETED REINDEX FAILED | file=%s | error=%s", item.get("name"), exc)
+    logger.info("TARGETED REINDEX SUMMARY | %s", summary)
+    return summary
+
+
 def index_all_sharepoint_documents() -> dict:
     ensure_sharepoint_index()
     clear_permission_cache()  # fresh per-run ACL cache
