@@ -1906,6 +1906,12 @@ background_tasks: list = []  # Track background indexing tasks
 from storage.conversation_store import ConversationStore, ConversationState  # noqa: E402
 conversation_db = ConversationStore(connection_string=os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
 
+# Phase 7-Pre: per-user Teams SSO token cache, fed by the signin/tokenExchange handler
+# and read by the OBO exchange (get_graph_token_delegated). Empty locally (Playground
+# doesn't send SSO tokens), so it's a no-op until the bot runs in real Teams.
+from storage.sso_token_cache import SSOTokenCache  # noqa: E402
+sso_token_cache = SSOTokenCache()
+
 
 class _StoredTurn:
     """Lightweight memory item with mutable role/content. The SDK send() uses
@@ -5860,6 +5866,34 @@ except AttributeError:
 async def handle_message_feedback(ctx: ActivityContext[MessageSubmitActionInvokeActivity]):
     feedback = ctx.activity.value.action_value
     logger.info(f"Feedback: {feedback}")
+
+
+# Phase 7-Pre: capture the user's Teams SSO token on each signin/tokenExchange invoke.
+# Only fires in real Teams with SSO configured; the Playground never sends it. The exact
+# response contract is verified in Step 8 (real Teams) — the SDK handles the ack envelope.
+try:
+    @app.on_signin_token_exchange
+    async def handle_signin_token_exchange(ctx: ActivityContext):
+        try:
+            value = getattr(ctx.activity, "value", None)
+            token = getattr(value, "token", None)
+            if token is None and isinstance(value, dict):
+                token = value.get("token")
+            sender = getattr(ctx.activity, "from_", None)
+            uid = (
+                getattr(sender, "aad_object_id", None)
+                or getattr(sender, "aadObjectId", None)
+                or getattr(sender, "id", None)
+            )
+            if token and uid:
+                sso_token_cache.set(str(uid), token)
+                logger.info("SSO token captured for user %s", str(uid)[:8])
+            else:
+                logger.debug("signin/tokenExchange received but token or user id missing")
+        except Exception as exc:
+            logger.warning("SSO token capture failed: %s", exc)
+except AttributeError:
+    logger.info("Note: SDK has no on_signin_token_exchange decorator; SSO capture disabled")
 
 
 def check_web_indexing_dependencies():
