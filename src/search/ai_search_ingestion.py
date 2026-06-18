@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 from config import Config
@@ -19,6 +20,23 @@ from sharepoint.graph_client import clear_permission_cache, get_item_permissions
 from sharepoint.sharepoint_reader import download_sharepoint_document, extract_document_text, list_sharepoint_documents
 
 logger = logging.getLogger(__name__)
+
+# Junk/lock/system files that should never be downloaded or indexed. These are
+# expected noise (e.g. Office "~$" lock files), not failures.
+SKIP_PATTERNS = [
+    r"^~\$",            # Office lock files
+    r"\.msixbundle$",
+    r"\.zip$",
+    r"\.tmp$",
+    r"\.lnk$",
+    r"Thumbs\.db$",
+    r"\.DS_Store$",
+    r"desktop\.ini$",
+]
+
+
+def _should_skip_file(filename: str) -> bool:
+    return any(re.search(p, filename or "", re.IGNORECASE) for p in SKIP_PATTERNS)
 
 
 def build_document_id(site_id: str, drive_id: str, item_id: str) -> str:
@@ -39,6 +57,9 @@ def should_reindex(item: dict, existing_metadata: dict | None) -> bool:
 
 def index_sharepoint_document(item: dict) -> dict:
     file_name = item.get("name") or ""
+    if _should_skip_file(file_name):
+        logger.debug("INDEXING SKIP | file=%s | reason=junk_or_lock_file", file_name)
+        return {"status": "skipped", "reason": "junk_or_lock_file", "file_name": file_name}
     ext = os.path.splitext(file_name)[1].lower().lstrip(".")
     file_bytes = download_sharepoint_document(item)
     content = extract_document_text(file_name, file_bytes)
