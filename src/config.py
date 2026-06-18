@@ -65,6 +65,12 @@ class Config:
     APP_PASSWORD = os.environ.get("SECRET_BOT_PASSWORD", "") or os.environ.get("CLIENT_SECRET", "") or os.environ.get("BOT_PASSWORD", "")
     APP_TYPE = os.environ.get("BOT_TYPE", "MultiTenant")
     APP_TENANTID = os.environ.get("TEAMS_APP_TENANT_ID") or os.environ.get("TENANT_ID", "")
+    # Bot app identity for Teams SSO + OBO delegated Graph (Phase 7-Pre). OBO MUST use
+    # the BOT app (the app the SSO token is issued for: BOT_ID/CLIENT_ID), not the
+    # Graph indexing app (GRAPH_CLIENT_ID) — otherwise OBO fails with AADSTS50013.
+    BOT_APP_ID = APP_ID
+    BOT_APP_PASSWORD = APP_PASSWORD
+    TENANT_ID = APP_TENANTID
     GRAPH_CLIENT_ID = os.environ.get("GRAPH_CLIENT_ID", APP_ID)
     GRAPH_CLIENT_SECRET = os.environ.get("GRAPH_CLIENT_SECRET", APP_PASSWORD)
     GRAPH_TENANT_ID = os.environ.get("GRAPH_TENANT_ID", APP_TENANTID)

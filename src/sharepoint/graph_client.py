@@ -162,6 +162,46 @@ def _parse_permissions(permissions: list[dict]) -> dict:
     return {"acl_users": sorted(acl_users), "acl_groups": sorted(acl_groups), "acl_everyone": acl_everyone}
 
 
+def get_graph_token_delegated(user_id: str) -> str | None:
+    """Exchange the user's Teams SSO token for a Graph token via OBO.
+
+    MUST use the BOT app credentials (Config.BOT_APP_ID) — the SSO token is issued for
+    the bot app, so the OBO confidential client must match it. Using the Graph indexing
+    app would fail with AADSTS50013 (audience mismatch). Returns None if no SSO token is
+    cached for the user (e.g. local/Playground, where Teams doesn't send SSO tokens).
+    """
+    from app import sso_token_cache  # local import avoids a circular import at module load
+
+    sso_token = sso_token_cache.get(user_id)
+    if not sso_token:
+        logger.debug("No SSO token cached for user %s — delegated Graph call skipped", (user_id or "")[:8])
+        return None
+
+    import msal
+
+    obo_client = msal.ConfidentialClientApplication(
+        client_id=Config.BOT_APP_ID,
+        client_credential=Config.BOT_APP_PASSWORD,
+        authority=f"https://login.microsoftonline.com/{Config.TENANT_ID}",
+    )
+    result = obo_client.acquire_token_on_behalf_of(
+        user_assertion=sso_token,
+        scopes=["Mail.Read", "Files.Read", "User.Read"],
+    )
+    if "access_token" in result:
+        logger.debug("OBO token acquired for user %s", (user_id or "")[:8])
+        return result["access_token"]
+
+    desc = result.get("error_description", "")[:150]
+    if "AADSTS50013" in desc:
+        logger.error("OBO failed — audience mismatch. Confirm OBO uses BOT_APP_ID (%s), not GRAPH_CLIENT_ID.", Config.BOT_APP_ID)
+    elif "AADSTS65001" in desc:
+        logger.error("OBO failed — admin consent missing for Mail.Read/Files.Read on the bot app.")
+    else:
+        logger.warning("OBO token exchange failed for user %s: %s — %s", (user_id or "")[:8], result.get("error"), desc)
+    return None
+
+
 def get_user_transitive_groups(user_object_id: str) -> list[str]:
     """All AAD group object ids the user belongs to (transitive).
 
