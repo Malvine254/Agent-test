@@ -87,6 +87,12 @@ from attachment_cache import (
     get_full_content_for_calculation,  # For accurate calculations with complete data
 )
 from grounding_guard import before_llm
+from routing.message_router import (
+    classify_message,
+    classify_intent,
+    is_bot_self_question,
+    is_general_knowledge_question,
+)
 
 from smart_router import (
     decide_route as smart_decide_route,
@@ -2738,106 +2744,6 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     # These match the 'respond_direct' cases defined in the router: questions about the bot ITSELF,
     # not about external topics, documents, or organizational content.
     _user_text_lower = user_text.lower().strip().rstrip("?!.")
-    _BOT_SELF_PATTERNS = [
-        "how can you help", "how can you help me", "how do you help",
-        "what can you do", "what do you do", "what are you",
-        "what are your capabilities", "what are your features",
-        "tell me about yourself", "tell me what you can do",  # EXACT: only "yourself", not general topics
-        "what is your purpose", "what's your purpose",
-        "how do you work", "what can this bot do", "what can the bot do",
-        "what kind of questions can i ask", "what questions can i ask",
-        "what should i ask", "how does this work",
-        "what kind of help can you", "what type of help can you",
-    ]
-    
-    # CRITICAL FIX: Match ONLY exact phrases or those specifically about the BOT
-    # NOT phrases like "tell me about [topic]" which are organizational queries
-    def _is_bot_self_question(text: str) -> bool:
-        """Check if this is a question about the BOT itself, not a general organizational query."""
-        # Exact matches or starts-with for bot-specific questions
-        for pattern in _BOT_SELF_PATTERNS:
-            if text == pattern or (text.startswith(pattern) and (
-                # Allow follow-ups ONLY to bot-specific patterns
-                pattern in ["what can you do", "what kind of help can you", "what type of help can you", "how can you help"] or
-                # STOP: "tell me about yourself" should NOT match "tell me about X" for any X
-                pattern == "tell me about yourself" and text == pattern
-            )):
-                return True
-        return False
-    
-    def _is_general_knowledge_question(text: str) -> bool:
-        """Detect general knowledge questions to answer without searching.
-        These are questions about universal facts, not organization-specific info."""
-        text_lower = text.lower().strip()
-
-        org_terms = [
-            "armely", "swope", "sharepoint", "company", "organization", "our ", "we ", "us ",
-            "internal", "employee", "hr", "policy", "procedure", "handbook",
-            "document", "file", "report", "pdf", "docx", "spreadsheet",
-            " llc", " inc", " corp", " corporation", " ltd", " vendor", " client",
-            " customer",
-        ]
-        if any(org in text_lower for org in org_terms):
-            return False
-
-        general_starters = (
-            "what is ", "what are ", "who is ", "who are ", "where is ",
-            "where are ", "when was ", "when did ", "why is ", "why do ",
-            "how does ", "how do ", "how can ", "explain ", "define ",
-            "tell me about ", "give me facts about ",
-        )
-        if text_lower.startswith(general_starters):
-            return True
-        
-        # Pattern: geography/location questions
-        if any(phrase in text_lower for phrase in [
-            "where is", "where are", "location of", "country is", "city is",
-            "capital of", "located in", "found at", "situated in"
-        ]):
-            # But exclude org-specific: "where is swope", "where is our office"
-            if not any(org in text_lower for org in ["swope", "our office", "our location", "company office"]):
-                return True
-        
-        # Pattern: definition questions (what is/are)
-        if any(phrase in text_lower for phrase in [
-            "what is python", "what is ai", "what is machine learning", "what is covid",
-            "what is a virus", "what is photosynthesis", "what is gravity", "what is dna",
-            "what is climate change", "what are atoms", "what are cells"
-        ]):
-            return True
-        
-        # Pattern: general science/facts
-        if any(phrase in text_lower for phrase in [
-            "how does photosynthesis", "how do plants", "how does gravity", "how do vaccines",
-            "explain physics", "explain chemistry", "tell me about", "facts about"
-        ]):
-            if not any(org in text_lower for org in [
-                "swope", "company", "organization", "our", "sharepoint",
-                "document", "file", "handbook", "policy", "procedure",
-                "employee", "it", "this", "that",
-            ]):
-                return True
-        
-        # Pattern: math/calculation
-        if any(phrase in text_lower for phrase in [
-            "what is", "calculate", "solve", "equals", "plus", "minus", "times"
-        ]):
-            # Only if it looks like pure math (numbers + operators)
-            import re
-            if re.search(r'\d+\s*[\+\-\*/]\s*\d+', text):
-                return True
-        
-        # Pattern: trivia/general questions
-        if any(phrase in text_lower for phrase in [
-            "who won", "who is the", "when was", "what year", "which president",
-            "who discovered", "who invented", "what is the meaning"
-        ]):
-            # Exclude org-related: "who is our ceo", "what is our mission"
-            if not any(org in text_lower for org in ["swope", "our ", "company ", "organization "]):
-                return True
-        
-        return False
-
     def _is_org_or_document_request(text: str) -> bool:
         """Default to organizational/document retrieval for any substantive turn.
 
@@ -2932,8 +2838,8 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     _force_respond_direct = (
         is_small_talk(user_text)
         or is_personal_advice_request(user_text)
-        or _is_bot_self_question(_user_text_lower)
-        or (_is_general_knowledge_question(user_text) and not _needs_org_search)
+        or is_bot_self_question(_user_text_lower)
+        or (is_general_knowledge_question(user_text) and not _needs_org_search)
     )
 
     _refine_phrases = (
@@ -2943,50 +2849,19 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     _looks_like_refine = any(p in _user_text_lower for p in _refine_phrases)
     _looks_like_previous_doc_followup = _is_previous_document_followup(user_text)
 
-    # Route decision. In SharePoint-only mode, skip the router LLM for normal
-    # knowledge questions so typing starts quickly and search begins immediately.
-    if _force_respond_direct:
-        route = {"action": "respond_direct", "should_search": False, "search_query": "", "scope": "local"}
-        logger.info(f"âš¡ Short-circuited to respond_direct (bot self-knowledge): '{user_text[:60]}'")
-    elif _looks_like_previous_doc_followup:
-        route = {
-            "action": "refine_previous",
-            "should_search": False,
-            "is_followup": True,
-            "query": "",
-            "scope": "local",
-            "top_k": 3,
-            "reason": "follow-up about previous document/source",
-        }
-        logger.info(f"Fast-routed to previous document follow-up: '{user_text[:80]}'")
-    elif (
-        Config.DATA_SOURCE_MODE in ("sharepoint", "sharepoint_uploads_only", "sharepoint_ai_search_uploads_only")
-        and _needs_org_search
-        and not attachments
-        and not has_cached_attachments
-        and not _looks_like_refine
-        and not _looks_like_previous_doc_followup
-    ):
-        route = {
-            "action": "search_documents",
-            "should_search": True,
-            "is_followup": False,
-            "query": user_text.strip(),
-            "scope": "ai_search",
-            "top_k": 6,
-        }
-        logger.info(f"Fast-routed to Azure AI Search: '{user_text[:80]}'")
-    elif _looks_like_refine:
-        route = {
-            "action": "refine_previous",
-            "should_search": False,
-            "is_followup": True,
-            "query": user_text.strip(),
-            "scope": "local",
-            "top_k": 3,
-        }
-        logger.info(f"Fast-routed to refine_previous: '{user_text[:80]}'")
-    else:
+    # Route decision — deterministic tree extracted to routing/message_router.classify_message;
+    # falls back to the LLM router (llm_decide_routing) when no deterministic rule applies.
+    route = classify_message(
+        user_text,
+        data_source_mode=Config.DATA_SOURCE_MODE,
+        force_respond_direct=_force_respond_direct,
+        looks_like_previous_doc_followup=_looks_like_previous_doc_followup,
+        needs_org_search=_needs_org_search,
+        has_attachments=bool(attachments),
+        has_cached_attachments=has_cached_attachments,
+        looks_like_refine=_looks_like_refine,
+    )
+    if route is None:
         route = await llm_decide_routing(
             model,
             user_text,
@@ -2999,6 +2874,8 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
             last_source_names=_prev_source_names,
             recent_history=_recent_history,
         )
+    # Phase 7.1 intent (app-only safe; consumed by the parallel Graph path in Step 7).
+    intent = classify_intent(user_text, route)
     # Final safety gate: casual/social messages must never call retrieval tools.
     if user_text and (is_small_talk(user_text) or is_personal_advice_request(user_text)):
         route = {"action": "respond_direct", "should_search": False, "search_query": "", "scope": "local"}
