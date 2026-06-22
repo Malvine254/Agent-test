@@ -51,3 +51,13 @@ devTools/*.log
 
 # Dev tool directories
 /devTools/
+
+# Runtime logs (never commit — can contain PII/tokens in stack traces)
+*.log
+*.log.*
+
+# Teams Toolkit generated build artifacts
+build/
+
+# Test baselines and local state
+.logbaseline
