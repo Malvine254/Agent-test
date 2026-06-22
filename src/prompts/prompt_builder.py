@@ -129,7 +129,12 @@ def build_llm_input(
             break
         title = (d.get("title") or d.get("name") or "Untitled").strip()
         url   = (d.get("url") or "").strip()
-        raw   = _strip_html(d.get("snippet") or d.get("content") or "")
+        # ACCURACY FIX: prefer the richer of snippet/content. Search docs often carry a
+        # 1000-char `snippet` alongside the full `content`; using only the snippet
+        # starved the model and caused hallucination. compress_for_llm caps size below.
+        _snip = d.get("snippet") or ""
+        _cont = d.get("content") or ""
+        raw   = _strip_html(_cont if len(_cont) > len(_snip) else _snip)
         if not raw:
             continue
 

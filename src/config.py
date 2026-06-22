@@ -171,9 +171,11 @@ class Config:
 
     # Context size limits to control prompt tokens
     # Maximum characters from any single document included in LLM context
-    MAX_DOC_CONTEXT_CHARS = int(os.environ.get("MAX_DOC_CONTEXT_CHARS", "12000"))  # reduced for faster LLM processing
+    # ACCURACY FIX: raised from 12000 — feeding more of each document to the model
+    # sharply reduces hallucination. Safe on the 272K-token deployment.
+    MAX_DOC_CONTEXT_CHARS = int(os.environ.get("MAX_DOC_CONTEXT_CHARS", "40000"))
     # Soft maximum total characters contributed by document contents
-    MAX_TOTAL_CONTEXT_CHARS = int(os.environ.get("MAX_TOTAL_CONTEXT_CHARS", "35000"))  # reduced from 100000
+    MAX_TOTAL_CONTEXT_CHARS = int(os.environ.get("MAX_TOTAL_CONTEXT_CHARS", "60000"))
     
     # Search result limits for OneDrive/SharePoint
     # Maximum results to return from Graph API search
@@ -183,17 +185,22 @@ class Config:
 
     # Approximate token budgets - GPT-5.2-chat optimized (272K token limit observed)
     # Conservative limits to prevent crashes on follow-up questions with attachments
-    MAX_PROMPT_TOKENS_APPROX = int(os.environ.get("MAX_PROMPT_TOKENS_APPROX", "30000"))  # reduced
-    MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "60000"))  # reduced from 120000 for faster LLM
-    MAX_COMPLETION_TOKENS = int(os.environ.get("MAX_COMPLETION_TOKENS", "768"))
+    # ACCURACY FIX: raised prompt budgets. The model has a 272K-token window, so a
+    # ~45K-token (180K-char) prompt is safe and lets full documents reach the model
+    # instead of being compressed to a tiny excerpt (the prior cause of hallucination).
+    MAX_PROMPT_TOKENS_APPROX = int(os.environ.get("MAX_PROMPT_TOKENS_APPROX", "90000"))
+    MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "180000"))
+    MAX_COMPLETION_TOKENS = int(os.environ.get("MAX_COMPLETION_TOKENS", "4000"))
     
     # === LLM Context/Snippet/Attachment Limits (Token Overflow Protection) ===
     # These limits prevent token overflow by controlling content injected into LLM prompts
-    MAX_LLM_CONTEXT_CHARS = int(os.environ.get("MAX_LLM_CONTEXT_CHARS", "10000"))
-    MAX_DOC_SNIPPET_CHARS = int(os.environ.get("MAX_DOC_SNIPPET_CHARS", "1500"))  # per doc in LLM
-    MAX_ATTACH_SNIPPET_CHARS = int(os.environ.get("MAX_ATTACH_SNIPPET_CHARS", "1000"))
-    MAX_TOTAL_CONTEXT_CHARS = int(os.environ.get("MAX_TOTAL_CONTEXT_CHARS", "12000"))  # Total doc budget
-    MAX_LLM_EXPOSURE_CHARS = int(os.environ.get("MAX_LLM_EXPOSURE_CHARS", "1500"))
+    MAX_LLM_CONTEXT_CHARS = int(os.environ.get("MAX_LLM_CONTEXT_CHARS", "60000"))
+    # ACCURACY FIX: 1500 chars/doc (~250 words) was the single biggest cause of
+    # hallucination — the model only saw a fragment and invented the rest.
+    MAX_DOC_SNIPPET_CHARS = int(os.environ.get("MAX_DOC_SNIPPET_CHARS", "8000"))  # per doc in LLM
+    MAX_ATTACH_SNIPPET_CHARS = int(os.environ.get("MAX_ATTACH_SNIPPET_CHARS", "8000"))
+    MAX_TOTAL_CONTEXT_CHARS = int(os.environ.get("MAX_TOTAL_CONTEXT_CHARS", "60000"))  # Total doc budget
+    MAX_LLM_EXPOSURE_CHARS = int(os.environ.get("MAX_LLM_EXPOSURE_CHARS", "8000"))
     
     # File size limits
     MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
@@ -206,10 +213,12 @@ class Config:
     MAX_CONVERSATION_ATTACHMENTS = int(os.environ.get("MAX_CONVERSATION_ATTACHMENTS", "8"))
     
     # Core LLM prompt limits (safe defaults)
-    MAX_DOCS = int(os.environ.get("MAX_DOCS", "3"))  # max docs to include in LLM context
-    MAX_SNIPPET_CHARS = int(os.environ.get("MAX_SNIPPET_CHARS", "1500"))
-    MAX_ATTACH_CHARS = int(os.environ.get("MAX_ATTACH_CHARS", "6000"))
-    MAX_LLM_ATTACH_CHARS = int(os.environ.get("MAX_LLM_ATTACH_CHARS", "12000"))
+    MAX_DOCS = int(os.environ.get("MAX_DOCS", "5"))  # max docs to include in LLM context
+    MAX_SNIPPET_CHARS = int(os.environ.get("MAX_SNIPPET_CHARS", "8000"))
+    # ACCURACY FIX: per-attachment 6000 and total 12000 meant an uploaded handbook was
+    # cut to ~1-2 pages before the model saw it. Raised so full files reach the model.
+    MAX_ATTACH_CHARS = int(os.environ.get("MAX_ATTACH_CHARS", "40000"))
+    MAX_LLM_ATTACH_CHARS = int(os.environ.get("MAX_LLM_ATTACH_CHARS", "90000"))
     MAX_MEMORY_TURNS = int(os.environ.get("MAX_MEMORY_TURNS", "5"))  # 1 turn = 2 messages
 
     # Safety: don't infer user identity from document cache unless explicitly enabled
