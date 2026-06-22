@@ -2,9 +2,9 @@
   "id": "${{BOT_OBJECT_ID}}",
   "displayName": "Armely AI",
   "identifierUris": [
-    "api://${{BOT_DOMAIN}}/${{BOT_ID}}"
+    "api://botid-${{BOT_ID}}"
   ],
-  "signInAudience": "AzureADMultipleOrgs",
+  "signInAudience": "AzureADMyOrg",
   "api": {
     "requestedAccessTokenVersion": 2,
     "oauth2PermissionScopes": [
