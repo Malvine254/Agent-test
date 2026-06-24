@@ -7,6 +7,40 @@ from config import Config
 
 logger = logging.getLogger(__name__)
 
+# Cache the AzureOpenAI client at module level so the HTTP connection pool /
+# TLS session is reused across calls. Recreating the client on every embedding
+# request added significant per-query latency (fresh TLS handshake each time).
+_embedding_client = None
+
+# Per-request timeout (seconds). After a long idle the cached client's keep-alive
+# TCP socket can go stale; without a timeout the first post-idle request blocks on
+# the dead socket for ~60s (OS TCP timeout) and Teams cancels the turn with no
+# reply. A short timeout makes the stale call fail fast so we can retry on a
+# fresh connection instead.
+_EMBED_TIMEOUT_SECONDS = 12.0
+
+
+def _get_embedding_client():
+    global _embedding_client
+    if _embedding_client is None:
+        from openai import AzureOpenAI
+
+        _embedding_client = AzureOpenAI(
+            api_key=Config.AZURE_OPENAI_API_KEY,
+            azure_endpoint=Config.AZURE_OPENAI_ENDPOINT,
+            api_version="2024-02-01",
+            timeout=_EMBED_TIMEOUT_SECONDS,
+            max_retries=0,  # we handle retries ourselves below
+        )
+    return _embedding_client
+
+
+def _reset_embedding_client() -> None:
+    """Drop the cached client so the next call builds a fresh connection pool.
+    Used after a failure that may be caused by a stale keep-alive socket."""
+    global _embedding_client
+    _embedding_client = None
+
 
 def embed_text(text: str) -> list[float]:
     """Generate one Azure OpenAI embedding vector."""
@@ -15,17 +49,11 @@ def embed_text(text: str) -> list[float]:
     if not Config.AZURE_OPENAI_ENDPOINT or not Config.AZURE_OPENAI_API_KEY:
         raise RuntimeError("Azure OpenAI embedding configuration is missing")
 
-    from openai import AzureOpenAI
-
-    client = AzureOpenAI(
-        api_key=Config.AZURE_OPENAI_API_KEY,
-        azure_endpoint=Config.AZURE_OPENAI_ENDPOINT,
-        api_version="2024-02-01",
-    )
     started_at = time.perf_counter()
     last_error: Exception | None = None
     for attempt in range(4):
         try:
+            client = _get_embedding_client()
             attempt_started_at = time.perf_counter()
             response = client.embeddings.create(
                 model=Config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
@@ -49,6 +77,14 @@ def embed_text(text: str) -> list[float]:
             return vector
         except Exception as exc:
             last_error = exc
+            # A timeout/connection error is often a stale cached socket — drop the
+            # client so the next attempt reconnects fresh.
+            _reset_embedding_client()
+            logger.warning(
+                "Embedding attempt %s/4 failed (%s) — resetting client and retrying",
+                attempt + 1,
+                type(exc).__name__,
+            )
             if attempt == 3:
                 break
             time.sleep(min(2**attempt, 8))
