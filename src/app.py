@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import os
 import sys
 import logging
@@ -87,6 +87,25 @@ from attachment_cache import (
     get_full_content_for_calculation,  # For accurate calculations with complete data
 )
 from grounding_guard import before_llm
+from routing.message_router import (
+    classify_message,
+    classify_intent,
+    is_bot_self_question,
+    is_general_knowledge_question,
+)
+from prompts.prompt_builder import build_llm_input, _strip_html
+
+# Code interpreter / document generation (Phase 1)
+try:
+    from agent.tools import InterpreterTurn, build_interpreter_tools
+    from generation.file_store import download_url as _artifact_download_url
+    _INTERPRETER_AVAILABLE = True
+except Exception as _interp_imp_err:  # pragma: no cover
+    InterpreterTurn = None  # type: ignore
+    build_interpreter_tools = None  # type: ignore
+    _INTERPRETER_AVAILABLE = False
+    logging.getLogger(__name__).warning(f"Code interpreter unavailable: {_interp_imp_err}")
+
 
 from smart_router import (
     decide_route as smart_decide_route,
@@ -99,7 +118,7 @@ from smart_router import (
 # Logging (only key application events)
 # ---------------------------
 # Force UTF-8 on the log stream so emoji/Unicode render correctly instead of mojibake
-# (Windows consoles default to cp1252, which is what produced the "â€¦"/"ðŸ”’" output).
+# (Windows consoles default to cp1252, which is what produced the "..."/"ðŸ”’" output).
 _log_handler = logging.StreamHandler(sys.stdout)
 _log_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
 if hasattr(_log_handler.stream, "reconfigure"):
@@ -528,6 +547,28 @@ SUMMARY_REQUEST_PATTERNS = (
 def is_document_summary_request(text: str) -> bool:
     lower = (text or "").lower()
     return any(p in lower for p in SUMMARY_REQUEST_PATTERNS)
+
+
+# Deictic references to a document the user is providing *right now* (i.e. an
+# attachment), as opposed to a named document in the library. Used to prevent
+# the bot from summarizing unrelated search results when an attachment the user
+# tried to share (e.g. a OneDrive cloud file) never reached the bot.
+_REFERS_TO_ATTACHED_DOC_RE = re.compile(
+    r"\b("
+    r"this (document|file|attachment|doc|pdf|spreadsheet|sheet|deck|presentation|letter|report|image)|"
+    r"the (attached|uploaded|attachment)|"
+    r"(attached|uploaded) (document|file|doc|pdf|here)|"
+    r"summari[sz]e (this|it)|"
+    r"(document|file) (i|we) (just )?(sent|shared|attached|uploaded)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def refers_to_attached_document(text: str) -> bool:
+    """True when the user is clearly referring to a document they just attached."""
+    return bool(_REFERS_TO_ATTACHED_DOC_RE.search(text or ""))
+
 
 
 def is_document_title_list_request(text: str, recent_history: list[str] | None = None) -> bool:
@@ -1323,23 +1364,6 @@ def _convert_to_network_path(path: str) -> str:
     # Unknown format - show as-is
     return f"Location: {path}"
 
-def _strip_html(text: str) -> str:
-    """Convert simple HTML to plain text by removing tags."""
-    try:
-        import re, html
-        # Remove script/style content
-        text = re.sub(r"<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>", " ", text, flags=re.IGNORECASE | re.DOTALL)
-        # Replace <br> and <p> with newlines
-        text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.IGNORECASE)
-        text = re.sub(r"<\s*/\s*p\s*>", "\n", text, flags=re.IGNORECASE)
-        # Remove remaining tags
-        text = re.sub(r"<[^>]+>", " ", text)
-        # Unescape HTML entities
-        text = html.unescape(text)
-        # Normalize whitespace
-        return " ".join(text.split())
-    except Exception:
-        return text
 
 # ===== STABILIZATION: Helper Functions =====
 
@@ -1453,329 +1477,7 @@ def cap_doc_content(text: str, max_chars: int = 12000) -> str:
         return text
     return text[:max_chars] + "\n\n[DOCUMENT CONTENT CAPPED - FULL CONTENT IN CACHE]"
 
-def _has_meaningful_source_content(doc: dict | None, min_chars: int = 100) -> bool:
-    """Return True if a source has enough content to justify references."""
-    if not doc:
-        return False
-    if doc.get("_access_denied"):
-        return False
-    content = (doc.get("content") or doc.get("snippet") or "").strip()
-    return len(content) >= min_chars
 
-def build_llm_input(
-    user_text: str,
-    attachment_texts: list[str],
-    doc_items: list[dict],
-    personalization: str,
-    memory_text: str = ""
-) -> tuple[str, dict]:
-    """Construct a token-safe LLM prompt using priority-based compression.
-
-    Priority order:
-        1. User question          â€” never compressed
-        2. Document snippets      â€” compressed per-doc and total (Includes Web results)
-        3. Attachment snippets    â€” compressed per-file and total
-        4. Memory                 â€” compressed
-
-    doc_items: [{"title": str, "url": str, "snippet": str}]
-    Returns (prompt_text, log_info)
-    """
-    from utils.context_budget import compress_for_llm, enforce_context_budget
-
-    # â”€â”€ Budget constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    MAX_PROMPT_CHARS  = int(getattr(Config, "MAX_PROMPT_CHARS", 80000))
-    MAX_DOCS          = int(getattr(Config, "MAX_DOCS", 8))
-    MAX_DOC_PER_DOC   = int(getattr(Config, "MAX_DOC_SNIPPET_CHARS", 6000))
-    MAX_DOC_TOTAL     = int(getattr(Config, "MAX_TOTAL_CONTEXT_CHARS", 24000))
-    # FIX: Summary/overview requests need enough cached document content to be useful.
-    # Otherwise a full handbook is reduced to a tiny excerpt and the model says
-    # it cannot summarize. Keep this bounded but larger than normal Q&A snippets.
-    if re.search(r"\b(summarize|summary|overview|tell me about|what is|explain)\b", (user_text or "").lower()):
-        MAX_DOC_PER_DOC = max(MAX_DOC_PER_DOC, int(os.getenv("SUMMARY_DOC_SNIPPET_CHARS", "18000")))
-        MAX_DOC_TOTAL = max(MAX_DOC_TOTAL, int(os.getenv("SUMMARY_TOTAL_CONTEXT_CHARS", "36000")))
-    MAX_ATTACH_CHARS  = int(getattr(Config, "MAX_ATTACH_CHARS", 40000))
-    MAX_LLM_ATTACH    = int(getattr(Config, "MAX_LLM_ATTACH_CHARS", 100000))
-    MAX_MEMORY_TURNS  = int(getattr(Config, "MAX_MEMORY_TURNS", 1))
-
-    # ISSUE 5 â€” Reduce doc count when PDFs present (token-dense)
-    _has_pdf = any(
-        (d.get("title") or d.get("name") or "").lower().endswith(".pdf")
-        for d in (doc_items or [])
-    )
-    if _has_pdf and MAX_DOCS > 2:
-        MAX_DOCS = 2
-        logger.info(f"ðŸ“„ ISSUE 5: PDFs detected in doc_items â€” limiting to {MAX_DOCS} docs")
-
-    # â”€â”€ 1. User text (priority 1 â€” never compressed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    utext = (user_text or "").strip()
-    ptext = _strip_html(personalization or "")
-    utext_lower_for_intent = utext.lower()
-    document_advice_intent = any(
-        phrase in utext_lower_for_intent
-        for phrase in (
-            "what do you suggest", "what should i add", "what can i add",
-            "what would you add", "suggest i add", "suggestions",
-            "recommend", "recommendations", "improve it", "improve this",
-            "improve the document", "what is missing", "what's missing",
-            "anything missing", "gaps", "make it better", "how can i improve",
-            "what else should",
-        )
-    )
-
-    # â”€â”€ 2. Documents (priority 2 â€” compressed per-doc + total) â”€â”€â”€â”€â”€â”€â”€
-    docs = []
-    doc_used = 0
-    compare_intent = False
-    try:
-        utext_lower = (utext or "").lower()
-        compare_keywords = ("compare", "difference", "differences", "diff",
-                            "similar", "similarities", "contrast", "vs", "versus")
-        compare_intent = len(attachment_texts or []) > 1 and any(
-            k in utext_lower for k in compare_keywords
-        )
-        if (len(attachment_texts or []) > 1
-                and "summarize" in utext_lower
-                and not compare_intent):
-            utext = f"{utext}\nPlease summarize each attachment separately."
-    except Exception:
-        compare_intent = False
-
-    for d in (doc_items or []):
-        if len(docs) >= MAX_DOCS:
-            break
-        title = (d.get("title") or d.get("name") or "Untitled").strip()
-        url   = (d.get("url") or "").strip()
-        raw   = _strip_html(d.get("snippet") or d.get("content") or "")
-        if not raw:
-            continue
-
-        # Per-doc compression â€” NEVER append raw content
-        remaining = max(0, MAX_DOC_TOTAL - doc_used)
-        per_doc_cap = MAX_DOC_PER_DOC
-        if d.get("primary") and is_document_summary_request(user_text):
-            per_doc_cap = max(per_doc_cap, int(os.getenv("SUMMARY_PRIMARY_DOC_CHARS", "20000")))
-        cap = min(per_doc_cap, remaining)
-        if cap <= 0:
-            logger.info(f"â›” Doc budget full ({doc_used:,}/{MAX_DOC_TOTAL:,}). Skipping: {title}")
-            break
-        snippet = compress_for_llm(raw, cap, label=f"doc:{title[:40]}")
-        total_chars = int(d.get("total_chars") or len(raw))
-        truncated = bool(d.get("truncated") or total_chars > len(snippet))
-        if truncated:
-            snippet += (
-                "\n\n[TRUNCATION NOTE: Only part of this document may be included in the prompt. "
-                "Do not claim the full document has no additional content unless the full document was actually included. "
-                "If summarizing, say: This summary is based on the included portion of the document.]"
-            )
-        doc_used += len(snippet)
-        docs.append({"title": title, "url": url, "snippet": snippet, "truncated": truncated, "total_chars": total_chars})
-
-    # â”€â”€ 3. Attachments (priority 3 â€” compressed per-file + total) â”€â”€â”€â”€
-    attach_segments = []
-    for i, text in enumerate(attachment_texts or []):
-        if not text:
-            continue
-        cleaned = _strip_html(text)
-        compressed = compress_for_llm(cleaned, MAX_ATTACH_CHARS,
-                                      label=f"attachment-{i+1}")
-        attach_segments.append(compressed)
-
-    # Enforce total attachment budget
-    total_attach = sum(len(s) for s in attach_segments)
-    if total_attach > MAX_LLM_ATTACH:
-        logger.info(
-            f"Total attachment chars ({total_attach:,}) > "
-            f"MAX_LLM_ATTACH_CHARS ({MAX_LLM_ATTACH:,}). Trimming."
-        )
-        trimmed, running = [], 0
-        for seg in attach_segments:
-            if running + len(seg) > MAX_LLM_ATTACH:
-                trimmed.append(seg[:MAX_LLM_ATTACH - running])
-                break
-            trimmed.append(seg)
-            running += len(seg)
-        attach_segments = trimmed
-    attach_plain = "\n\n---\n\n".join(attach_segments) if attach_segments else ""
-
-    # â”€â”€ 4. Memory (priority 4) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    mem_plain = ""
-    if memory_text:
-        mem_plain = compress_for_llm(_strip_html(memory_text), 4000,
-                                     label="memory")
-
-    # â”€â”€ Assemble prompt blocks with priorities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    blocks = []
-    priorities = []
-
-    blocks.append(utext);                                      priorities.append(1)
-    if ptext:
-        blocks.append(ptext);                                  priorities.append(1)
-    if attach_plain:
-        blocks.append(f"[ATTACHMENTS]\n{attach_plain}");       priorities.append(2)
-    if docs:
-        doc_lines = []
-        for i, d in enumerate(docs, 1):
-            lines = [f"[DOC {i}] {d['title']}"]
-            if d.get("url"):
-                lines.append(f"URL: {d['url']}")
-            lines.append(d["snippet"])
-            doc_lines.append("\n".join(lines))
-        blocks.append("\n\n".join(doc_lines));                 priorities.append(3)
-    if mem_plain:
-        blocks.append(
-            f"[MEMORY (last {MAX_MEMORY_TURNS})]\n{mem_plain}"
-        );                                                      priorities.append(4)
-
-    # Citation instructions
-    if docs:
-        if document_advice_intent:
-            blocks.append(
-                "[DOCUMENT REVIEW / RECOMMENDATION MODE]\n"
-                "The user is asking for professional suggestions about improving the document, "
-                "not asking whether the document itself contains recommendations.\n"
-                "Use the included document content to identify what is already covered, then provide "
-                "clearly labeled recommendations for additions, gaps, or improvements.\n"
-                "Cite the document when describing what it currently includes. Do not cite a recommendation "
-                "as if the document stated it. Recommendations may be uncited when clearly labeled as suggested additions.\n"
-                "If the document is truncated, say the recommendations are based on the included portion."
-            )
-            priorities.append(1)
-
-        cite_map_lines = []
-        for i, d in enumerate(docs, 1):
-            u = d.get("url") or ""
-            cite_map_lines.append(
-                f"  [{i}] {d['title']} -> {u}" if u else f"  [{i}] {d['title']}"
-            )
-        cite_map = "\n".join(cite_map_lines)
-        blocks.append(
-            "[CITATION REQUIREMENTS - MANDATORY]\n"
-            "ðŸš¨ YOU MUST cite sources inline for EVERY organizational fact.\n"
-            "Citations are MANDATORY, not optional.\n\n"
-            "Format: [[number]](URL) placed right after the sentence that uses the source.\n"
-            "Example: 'The CIO is John Smith [[1]](https://sharepoint.../doc.pdf).'\n\n"
-            f"Available sources:\n{cite_map}\n\n"
-            "CRITICAL RULES:\n"
-            "âœ… Cite EVERY fact from organizational sources\n"
-            "âœ… Use [[N]](URL) format immediately after each cited fact\n"
-            "âœ… Number citations sequentially [1], [2], [3]...\n"
-            "âŒ NEVER provide information without citations when sources are available\n"
-            "âŒ NEVER use general knowledge for any topic that triggered a search\n"
-            "âŒ NEVER cite documents you did not actually use\n\n"
-            "Do NOT include a References section at the end â€” it will be added automatically.\n"
-            "Exception: for clearly labeled document-improvement recommendations, cite only the document facts "
-            "you reviewed; do not pretend the recommendation itself appears in the source.\n\n"
-            "Only cite documents whose content you actually used in your answer."
-        )
-        priorities.append(2)
-        
-        # ZERO VAGUE REFERENCES - tie everything to extracted content
-        blocks.append(
-            "[ZERO VAGUE REFERENCES - CRITICAL]\n"
-            "ðŸš¨ EVERY statement MUST be tied to SPECIFIC extracted content above.\n\n"
-            "âŒ FORBIDDEN VAGUE PHRASES:\n"
-            "â€¢ 'According to the documents...'\n"
-            "â€¢ 'The files mention...'\n"
-            "â€¢ 'Based on the information provided...'\n"
-            "â€¢ 'It appears that...'\n"
-            "â€¢ 'The search results indicate...'\n"
-            "â€¢ 'The organization provides...'\n"
-            "â€¢ Any general statement without direct reference to specific text\n\n"
-            "âœ… REQUIRED PATTERN:\n"
-            "Every claim â†’ Quote specific text from [DOC N] above + cite [[N]](URL)\n\n"
-            "Example of WRONG:\n"
-            "'Swope Health offers various healthcare services.'\n\n"
-            "Example of CORRECT:\n"
-            "'Swope Health offers \"primary care, dental, and behavioral health services\" [[1]](URL).'\n\n"
-            "ðŸŽ¯ VERIFICATION: Before each statement, ask:\n"
-            "RECOMMENDATION EXCEPTION:\n"
-            "When the user asks what to add, improve, or what is missing from a document, you may provide "
-            "clearly labeled recommendations derived from gaps in the included content. Cite the document "
-            "for what it currently contains, and label your additions as recommendations instead of source facts.\n\n"
-            "1. Can I point to the EXACT text in [DOC N] that supports this?\n"
-            "2. Did I quote or closely paraphrase that specific text?\n"
-            "3. Did I cite the source?\n"
-            "If ANY answer is NO, rewrite or remove the statement unless it is clearly labeled as a recommendation."
-        )
-        priorities.append(1)
-    else:
-        blocks.append(
-            "[NO DOCUMENT SOURCES IN THIS PROMPT]\n"
-            "CRITICAL RULES:\n"
-            "1. If this is casual conversation, reply naturally and briefly.\n"
-            "2. If this is a general knowledge question, answer from general knowledge.\n"
-            "3. If this is an organizational/document question and no source content was retrieved, say no matching source content was found after checking all available sources.\n"
-            "4. Do not invent organizational facts.\n"
-            "5. Do not claim you searched unless the app actually performed a search.\n"
-            "6. Do NOT include a References section.\n"
-        )
-        priorities.append(1)
-    blocks.append(
-        "[CRITICAL: Source Usage Verification]\n"
-        "ðŸš¨ STRICT CONTENT TRACEABILITY:\n"
-        "1. ONLY reference information that appears in the [DOC N] blocks above\n"
-        "2. If a fact is in your answer, it MUST be quotable from [DOC N] content\n"
-        "3. Do not claim to have used web or document sources unless their actual content appears in this prompt\n"
-        "4. For all search-based questions: search all available sources first, then either provide source-based answers with citations or an explicit 'not found' statement. Nothing in between.\n\n"
-        "If you cannot find specific text in the [DOC N] blocks to support a factual claim, do NOT make that claim. "
-        "For clearly labeled document-improvement recommendations, you may suggest additions based on gaps in the included content."
-    )
-    priorities.append(1)
-
-    # Formatting rules
-    blocks.append(
-        "[FORMATTING RULES]\n"
-        "Structure every multi-point answer with **bold section headings** on their own line, "
-        "followed by bullet points (use - ) under each heading.\n"
-        "Wrap key terms, names, dates, and file names in **bold**.\n"
-        "Use numbered lists when order matters.\n"
-        "Start summaries with a 1-2 sentence overview before the headed sections.\n"
-        "Never output a flat list of dashes without section headings.\n"
-        "Keep each bullet to 1-2 sentences."
-    )
-    priorities.append(1)
-
-    # â”€â”€ Priority-aware assembly with budget enforcement â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    prompt = enforce_context_budget(
-        blocks, max_chars=MAX_PROMPT_CHARS, priorities=priorities
-    )
-
-    # Absolute hard-cap safety net
-    ABSOLUTE_MAX = 120_000
-    if len(prompt) > ABSOLUTE_MAX:
-        logger.error(
-            f"Prompt exceeded ABSOLUTE MAX ({len(prompt):,}) â†’ forcing trim"
-        )
-        prompt = prompt[:ABSOLUTE_MAX]
-
-    # â”€â”€ Logging â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    sizes = {
-        "user": len(utext),
-        "attachments": len(attach_plain),
-        "docs": sum(len(d["snippet"]) for d in docs),
-        "memory": len(mem_plain),
-    }
-    est_tokens = max(1, len(prompt) // 4)
-    actions = []
-    if doc_used >= MAX_DOC_TOTAL:
-        actions.append("doc_budget_full")
-    if total_attach > MAX_LLM_ATTACH if attach_segments else False:
-        actions.append("attach_trimmed")
-
-    log_info = {
-        "sizes": sizes,
-        "estimated_tokens": est_tokens,
-        "truncation_actions": actions,
-        "doc_count": len(docs),
-    }
-
-    logger.info(
-        f"build_llm_input: prompt={len(prompt):,} chars "
-        f"(~{est_tokens:,} tokens) | docs={len(docs)} | "
-        f"sizes={sizes} | actions={actions}"
-    )
-
-    return prompt, log_info
 
 
 # ---------------------------
@@ -1862,7 +1564,54 @@ def create_token_factory():
     return get_token
 
 
-app = App(token=create_token_factory())
+# ---------------------------------------------------------------------------
+# Bot credential wiring for the Teams SDK.
+#
+# This bot is registered as an Azure Bot Service (SingleTenant) resource:
+#   bot-armelyai-local-dev (RG: ArmelyDefault_RG), app 0d238f90-...
+# For a SingleTenant bot, the Bot Connector access token MUST be acquired against
+# the bot's HOME tenant (TENANT_ID / TEAMS_APP_TENANT_ID) — the SDK's TokenManager
+# derives the bot-token authority from ClientCredentials.tenant_id, so it must stay
+# set. (For a MULTI-TENANT bot it is the opposite: tenant_id must be None so the
+# token targets botframework.com, otherwise AADSTS7000229 breaks outgoing replies.)
+#
+# The SDK's App._init_credentials() reads CLIENT_ID / CLIENT_SECRET / TENANT_ID from
+# the environment. One problem with the env values here: CLIENT_SECRET in root .env
+# may be a placeholder; the real bot password is loaded by config from Key Vault
+# (SECRET_BOT_PASSWORD). So we pass client_id + the real client_secret explicitly.
+#
+# config.* already captured every value it needs at import time, and Graph code reads
+# config.GRAPH_TENANT_ID / config.TENANT_ID (not os.environ), so clearing the
+# placeholder CLIENT_SECRET from os.environ (multi-tenant branch only) does not
+# affect Graph auth.
+_bot_client_id = config.APP_ID
+_bot_client_secret = config.APP_PASSWORD
+_is_multitenant_bot = (config.APP_TYPE or "MultiTenant").strip().lower() in ("multitenant", "multi-tenant", "")
+
+if _is_multitenant_bot:
+    # Drop env values the SDK would otherwise read so ClientCredentials.tenant_id
+    # stays None and the Bot Connector token targets botframework.com.
+    os.environ.pop("TENANT_ID", None)
+    os.environ.pop("CLIENT_SECRET", None)
+
+if _bot_client_id and _bot_client_secret:
+    if _is_multitenant_bot:
+        app = App(
+            client_id=_bot_client_id,
+            client_secret=_bot_client_secret,
+            token=create_token_factory(),
+        )
+    else:
+        # Single-tenant bot: keep the home tenant so token authority is correct.
+        app = App(
+            client_id=_bot_client_id,
+            client_secret=_bot_client_secret,
+            tenant_id=config.APP_TENANTID or None,
+            token=create_token_factory(),
+        )
+else:
+    # Fall back to env-based resolution if credentials are not available.
+    app = App(token=create_token_factory())
 
 # Cleanup old attachment cache entries on startup
 try:
@@ -1905,6 +1654,12 @@ background_tasks: list = []  # Track background indexing tasks
 # above act as the working copy for one message: hydrated on entry, flushed on exit.
 from storage.conversation_store import ConversationStore, ConversationState  # noqa: E402
 conversation_db = ConversationStore(connection_string=os.getenv("AZURE_STORAGE_CONNECTION_STRING"))
+
+# Phase 7-Pre: per-user Teams SSO token cache, fed by the signin/tokenExchange handler
+# and read by the OBO exchange (get_graph_token_delegated). Empty locally (Playground
+# doesn't send SSO tokens), so it's a no-op until the bot runs in real Teams.
+from storage.sso_token_cache import SSOTokenCache  # noqa: E402
+sso_token_cache = SSOTokenCache()
 
 
 class _StoredTurn:
@@ -2262,18 +2017,49 @@ async def llm_decide_routing(
 # ---------------------------
 # Typing indicator helper
 # ---------------------------
-async def send_typing_indicator(ctx: ActivityContext[MessageActivity]) -> None:
-    """Send a typing indicator to show the bot is processing the request.
-    Silently ignores 403 Forbidden errors (conversation context may be closed)."""
+def _ctx_is_group(ctx: ActivityContext[MessageActivity]) -> bool:
+    """Best-effort detection of group/channel conversations (which can't stream)."""
     try:
-        typing_activity = TypingActivityInput()
-        await ctx.send(typing_activity)
-        logger.debug("Typing indicator sent")
+        conv = getattr(ctx.activity, "conversation", None)
+        conv_type = getattr(conv, "conversation_type", None)
+        conv_id = getattr(conv, "id", "") or ""
+        if conv_type in ("groupChat", "channel"):
+            return True
+        if "@unq.gbl.spaces" in conv_id or "group" in conv_id.lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def send_typing_indicator(ctx: ActivityContext[MessageActivity], status: str = "Working on it...") -> None:
+    """Show the bot is processing the request.
+
+    For one-on-one chats we use the SDK-native streaming *informative* update
+    (``ctx.stream.update``), which Teams renders reliably as an animated
+    "Working on..." status. Standalone typing activities are unreliable in
+    streaming personal chats, so they are only used as a fallback for group
+    chats / channels (which cannot stream). Silently ignores 403/405 errors
+    (conversation context closed or streaming unsupported)."""
+    try:
+        stream = getattr(ctx, "stream", None)
+        if stream is not None and not _ctx_is_group(ctx):
+            # Informative updates are dropped once real text starts streaming,
+            # so this naturally gives way to the answer without leaving a blank.
+            try:
+                stream.update(status)
+                logger.debug("Typing indicator sent (stream informative update)")
+                return
+            except Exception as e:
+                logger.debug(f"Stream informative update failed, falling back to typing activity: {e}")
+        # Fallback: standalone typing activity (group chats / no stream)
+        await ctx.send(TypingActivityInput())
+        logger.debug("Typing indicator sent (standalone activity)")
     except Exception as e:
         error_str = str(e).lower()
-        # 403 Forbidden is expected after certain operations - conversation context closed
-        if "403" in str(e) or "forbidden" in error_str:
-            logger.debug(f"Typing indicator skipped - conversation context closed (403)")
+        # 403/405 are expected - conversation context closed or streaming unsupported
+        if "403" in str(e) or "405" in str(e) or "forbidden" in error_str:
+            logger.debug(f"Typing indicator skipped - conversation context closed/unsupported")
         else:
             logger.warning(f"Failed to send typing indicator: {e}")
 
@@ -2306,10 +2092,15 @@ async def send_typing_with_status(ctx: ActivityContext[MessageActivity], status:
 class TypingIndicatorManager:
     """Manages periodic typing indicators during long operations to prevent timeout."""
     
-    def __init__(self, ctx: ActivityContext[MessageActivity]):
+    def __init__(self, ctx: ActivityContext[MessageActivity], status: str = "Working on it..."):
         self.ctx = ctx
         self.refresh_task = None
         self.should_refresh = False
+        self.status = status
+
+    def set_status(self, status: str):
+        """Update the status text shown in the informative typing indicator."""
+        self.status = status
     
     async def start_periodic_refresh(self, interval: float = 2.0):
         """Start sending typing indicators every `interval` seconds (default 2s for consistency).
@@ -2317,7 +2108,7 @@ class TypingIndicatorManager:
         self.should_refresh = True
         # Send initial typing indicator immediately
         try:
-            await send_typing_indicator(self.ctx)
+            await send_typing_indicator(self.ctx, self.status)
         except Exception as e:
             logger.debug(f"Initial typing indicator failed: {e}")
         
@@ -2346,7 +2137,7 @@ class TypingIndicatorManager:
                 await asyncio.sleep(interval)
                 if self.should_refresh:  # Check again after sleep
                     try:
-                        await send_typing_indicator(self.ctx)
+                        await send_typing_indicator(self.ctx, self.status)
                         consecutive_errors = 0  # Reset on successful send
                     except Exception as e:
                         error_str = str(e).lower()
@@ -2394,7 +2185,7 @@ async def send_typing_with_message(ctx: ActivityContext[MessageActivity], messag
     except Exception as e:
         logger.warning(f"Failed to send typing indicator with message: {e}")
 
-async def process_attachments_with_typing(ctx: ActivityContext[MessageActivity], attachments: list, conversation_id: str, cache_user_id: str) -> tuple:
+async def process_attachments_with_typing(ctx: ActivityContext[MessageActivity], attachments: list, conversation_id: str, cache_user_id: str, raw_sink: dict | None = None) -> tuple:
     """Process attachments with periodic typing indicators to prevent timeout."""
     MAX_ATTACHMENTS = len(attachments)
     parts = []
@@ -2425,7 +2216,7 @@ async def process_attachments_with_typing(ctx: ActivityContext[MessageActivity],
         # ALWAYS use async to prevent blocking - wrap in typing manager for all files
         try:
             async with TypingIndicatorManager(ctx):
-                file_content = await asyncio.to_thread(process_attachment, att, conversation_id, user_id=cache_user_id)
+                file_content = await asyncio.to_thread(process_attachment, att, conversation_id, cache_user_id, raw_sink)
         except MemoryError:
             logger.error(f"Memory error processing '{att_name}' - file too large")
             error_msg = f"""âŒ **Memory Error**: {att_name}
@@ -2530,14 +2321,52 @@ async def handle_stateful_conversation(model: AIModel, ctx: ActivityContext[Mess
         return
     
     handle_stateful_conversation.active_llm_calls[conversation_id] = _now
+    # One persistent typing indicator for the whole turn. Started early (during
+    # search) so the bot never looks "blank" while a slow query runs, and always
+    # stopped here in finally so no path can leak the background refresh task.
+    typing_mgr = TypingIndicatorManager(ctx)
     try:  # STABILIZATION FIX 6: Wrap entire handler in try/finally to always clear the guard
-        await _handle_stateful_conversation_inner(model, ctx, conversation_id)
+        await _handle_stateful_conversation_inner(model, ctx, conversation_id, typing_mgr)
     finally:
+        try:
+            await typing_mgr.stop_refresh()
+        except Exception:
+            pass
         handle_stateful_conversation.active_llm_calls.pop(conversation_id, None)
         logger.info(f"ðŸ”“ LLM call guard cleared for conversation {conversation_id[:20]}")
 
 
-async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityContext[MessageActivity], conversation_id: str) -> None:
+# Keywords that hint the user wants computation, data manipulation, charting,
+# or document generation — i.e. the code interpreter should be made available.
+_INTERPRETER_INTENT_RE = re.compile(
+    r"("
+    r"calculat|comput|average|median|how many|"
+    r"chart|graph|plot|visuali[sz]|diagram|histogram|pie chart|"
+    r"generat|create|make me|build me|produc|export|convert|turn (this|it) into|"
+    r"download|"
+    r"excel|spreadsheet|xlsx|csv|docx|word doc|powerpoint|pptx|slide|"
+    r"presentation|\bpdf\b|\breport\b|\bzip\b|"
+    r"summari[sz]e|compare|comparison|forecast|pivot|"
+    r"deduplicat|reformat"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _should_enable_interpreter(user_text: str, has_raw_files: bool) -> bool:
+    """Decide whether to expose the code-interpreter tool for this turn.
+
+    Enabled when raw file bytes are available (so the model can manipulate them)
+    or when the user's text expresses compute/visualization/generation intent.
+    """
+    if not _INTERPRETER_AVAILABLE:
+        return False
+    if has_raw_files:
+        return True
+    return bool(_INTERPRETER_INTENT_RE.search(user_text or ""))
+
+
+async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityContext[MessageActivity], conversation_id: str, typing_mgr: "TypingIndicatorManager") -> None:
     """Inner implementation of handle_stateful_conversation (wrapped in try/finally by caller)."""
     user_text = (ctx.activity.text or "").strip()
     attachments_raw = ctx.activity.attachments or []
@@ -2553,6 +2382,53 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     logger.info(f"Raw attachments received: {len(attachments_raw)}")
     for idx, raw_att in enumerate(attachments_raw, 1):
         logger.info(f"  Raw attachment {idx}: type={type(raw_att).__name__}")
+
+    # DEEP DIAGNOSTIC: dump the full inbound activity so we can see exactly how
+    # Teams delivers OneDrive/SharePoint "cloud" file attachments (which arrive
+    # differently from direct uploads). Helps locate the real file reference.
+    try:
+        _diag = {
+            "text": (user_text or "")[:200],
+            "attachments": [],
+            "entities": None,
+            "channel_data_keys": None,
+            "value": None,
+        }
+        for raw_att in attachments_raw:
+            _c = getattr(raw_att, "content", None)
+            _diag["attachments"].append({
+                "content_type": getattr(raw_att, "content_type", None) or getattr(raw_att, "contentType", None),
+                "content_url": getattr(raw_att, "content_url", None) or getattr(raw_att, "contentUrl", None),
+                "name": getattr(raw_att, "name", None),
+                "content_type_of_content": type(_c).__name__,
+                "content_preview": (str(_c)[:400] if _c is not None else None),
+            })
+        _ents = getattr(ctx.activity, "entities", None)
+        if _ents:
+            try:
+                _diag["entities"] = [
+                    (getattr(e, "type", None) or (e.get("type") if isinstance(e, dict) else None), str(e)[:300])
+                    for e in _ents
+                ]
+            except Exception:
+                _diag["entities"] = str(_ents)[:600]
+        _cd = getattr(ctx.activity, "channel_data", None)
+        if _cd is not None:
+            try:
+                if isinstance(_cd, dict):
+                    _diag["channel_data"] = json.dumps(_cd, default=str)[:600]
+                elif hasattr(_cd, "model_dump"):
+                    _diag["channel_data"] = json.dumps(_cd.model_dump(), default=str)[:600]
+                else:
+                    _diag["channel_data"] = str(_cd)[:600]
+            except Exception:
+                _diag["channel_data"] = str(_cd)[:600]
+        _val = getattr(ctx.activity, "value", None)
+        if _val is not None:
+            _diag["value"] = str(_val)[:400]
+        logger.info(f"ðŸ§ª ACTIVITY DIAGNOSTIC: {json.dumps(_diag, default=str)[:2500]}")
+    except Exception as _diag_err:
+        logger.warning(f"Activity diagnostic logging failed: {_diag_err}")
     
     attachments = [a for a in attachments_raw if is_file_attachment(a)]
     web_results = []  # Initialize to avoid NameError if search is skipped
@@ -2605,7 +2481,11 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
         return
 
     # Send typing indicator IMMEDIATELY to show the bot is processing
-    await send_typing_indicator(ctx)
+    # Start the PERSISTENT typing indicator now and keep it visible through the
+    # whole turn (search + LLM). A single typing activity expires after a few
+    # seconds in Teams, which made the bot look "blank" during slow searches.
+    typing_mgr.set_status("Reading your message...")
+    await typing_mgr.start_periodic_refresh(interval=3.0)
 
     # GROUP CHAT PERMISSIONS CHECK: Verify bot can send messages in this context
     if is_group:
@@ -2651,6 +2531,59 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
         logger.debug("Cached attachment check TIMED OUT - skipping")
     except Exception:
         pass
+
+    # ── ANTI-HALLUCINATION GUARD ───────────────────────────────────────────
+    # If the user refers to a document they just attached ("summarize this
+    # document") but no file actually reached the bot this turn (a OneDrive/
+    # SharePoint "cloud" attachment is frequently NOT delivered to bots), DO NOT
+    # fall through to a generic SharePoint/AI Search summary — that produces a
+    # confident summary of an unrelated indexed document (a hallucination).
+    #
+    # IMPORTANT: We fire this guard even when there IS a cached attachment from
+    # earlier in the conversation, because a stale/unrelated cached file (e.g. a
+    # leftover "build localhost.pdf") must NOT be silently summarized as if it
+    # were the file the user just attached. Instead we tell the user the file
+    # didn't arrive and, if a cached file exists, let them request it BY NAME
+    # (an explicit filename request is not deictic, so it bypasses this guard).
+    if (
+        refers_to_attached_document(user_text)
+        and not attachments
+    ):
+        logger.warning(
+            "🛑 ANTI-HALLUCINATION: user referenced an attached document but no file "
+            "reached the bot this turn — refusing to summarize unrelated search/cache "
+            "results. has_cached_attachments=%s cached=%s",
+            has_cached_attachments,
+            cached_attachment_filenames,
+        )
+        await typing_mgr.stop_refresh()
+        if has_cached_attachments and cached_attachment_filenames:
+            _names = "\n".join(f"• **{n}**" for n in cached_attachment_filenames[:5])
+            _msg = (
+                "I don't see a file attached to this message, so I won't guess at its "
+                "contents.\n\n"
+                "Teams often attaches files **from OneDrive/SharePoint as a cloud "
+                "link**, which it doesn't always pass to me.\n\n"
+                "**To get an accurate result, do one of these:**\n"
+                "1️⃣ Use the **paperclip → Upload from this device** so the actual file "
+                "is sent (not a link), then resend your request.\n"
+                f"2️⃣ Or, if you meant a file you already shared, ask for it **by name**:\n{_names}\n"
+                "   (e.g. \"summarize " + cached_attachment_filenames[0] + "\")"
+            )
+        else:
+            _msg = (
+                "I can see you wanted me to work with a document, but no file reached "
+                "me — so I won't guess at its contents.\n\n"
+                "This usually happens when a file is attached **from OneDrive/"
+                "SharePoint as a cloud link**, which Teams doesn't always pass to me.\n\n"
+                "**Please try one of these:**\n"
+                "1️⃣ Use the **paperclip** and choose **Upload from this device** "
+                "(this attaches the actual file, not a link)\n"
+                "2️⃣ Or **download the file first**, then upload it directly here\n"
+                "3️⃣ Then resend your request (e.g. \"summarize this document\")"
+            )
+        await ctx.send(MessageActivityInput(text=_msg).add_ai_generated())
+        return
 
     # Add simple conversation reset functionality
     if user_text and user_text.lower().strip() in ["reset", "clear conversation", "debug conversation"]:
@@ -2732,106 +2665,6 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     # These match the 'respond_direct' cases defined in the router: questions about the bot ITSELF,
     # not about external topics, documents, or organizational content.
     _user_text_lower = user_text.lower().strip().rstrip("?!.")
-    _BOT_SELF_PATTERNS = [
-        "how can you help", "how can you help me", "how do you help",
-        "what can you do", "what do you do", "what are you",
-        "what are your capabilities", "what are your features",
-        "tell me about yourself", "tell me what you can do",  # EXACT: only "yourself", not general topics
-        "what is your purpose", "what's your purpose",
-        "how do you work", "what can this bot do", "what can the bot do",
-        "what kind of questions can i ask", "what questions can i ask",
-        "what should i ask", "how does this work",
-        "what kind of help can you", "what type of help can you",
-    ]
-    
-    # CRITICAL FIX: Match ONLY exact phrases or those specifically about the BOT
-    # NOT phrases like "tell me about [topic]" which are organizational queries
-    def _is_bot_self_question(text: str) -> bool:
-        """Check if this is a question about the BOT itself, not a general organizational query."""
-        # Exact matches or starts-with for bot-specific questions
-        for pattern in _BOT_SELF_PATTERNS:
-            if text == pattern or (text.startswith(pattern) and (
-                # Allow follow-ups ONLY to bot-specific patterns
-                pattern in ["what can you do", "what kind of help can you", "what type of help can you", "how can you help"] or
-                # STOP: "tell me about yourself" should NOT match "tell me about X" for any X
-                pattern == "tell me about yourself" and text == pattern
-            )):
-                return True
-        return False
-    
-    def _is_general_knowledge_question(text: str) -> bool:
-        """Detect general knowledge questions to answer without searching.
-        These are questions about universal facts, not organization-specific info."""
-        text_lower = text.lower().strip()
-
-        org_terms = [
-            "armely", "swope", "sharepoint", "company", "organization", "our ", "we ", "us ",
-            "internal", "employee", "hr", "policy", "procedure", "handbook",
-            "document", "file", "report", "pdf", "docx", "spreadsheet",
-            " llc", " inc", " corp", " corporation", " ltd", " vendor", " client",
-            " customer",
-        ]
-        if any(org in text_lower for org in org_terms):
-            return False
-
-        general_starters = (
-            "what is ", "what are ", "who is ", "who are ", "where is ",
-            "where are ", "when was ", "when did ", "why is ", "why do ",
-            "how does ", "how do ", "how can ", "explain ", "define ",
-            "tell me about ", "give me facts about ",
-        )
-        if text_lower.startswith(general_starters):
-            return True
-        
-        # Pattern: geography/location questions
-        if any(phrase in text_lower for phrase in [
-            "where is", "where are", "location of", "country is", "city is",
-            "capital of", "located in", "found at", "situated in"
-        ]):
-            # But exclude org-specific: "where is swope", "where is our office"
-            if not any(org in text_lower for org in ["swope", "our office", "our location", "company office"]):
-                return True
-        
-        # Pattern: definition questions (what is/are)
-        if any(phrase in text_lower for phrase in [
-            "what is python", "what is ai", "what is machine learning", "what is covid",
-            "what is a virus", "what is photosynthesis", "what is gravity", "what is dna",
-            "what is climate change", "what are atoms", "what are cells"
-        ]):
-            return True
-        
-        # Pattern: general science/facts
-        if any(phrase in text_lower for phrase in [
-            "how does photosynthesis", "how do plants", "how does gravity", "how do vaccines",
-            "explain physics", "explain chemistry", "tell me about", "facts about"
-        ]):
-            if not any(org in text_lower for org in [
-                "swope", "company", "organization", "our", "sharepoint",
-                "document", "file", "handbook", "policy", "procedure",
-                "employee", "it", "this", "that",
-            ]):
-                return True
-        
-        # Pattern: math/calculation
-        if any(phrase in text_lower for phrase in [
-            "what is", "calculate", "solve", "equals", "plus", "minus", "times"
-        ]):
-            # Only if it looks like pure math (numbers + operators)
-            import re
-            if re.search(r'\d+\s*[\+\-\*/]\s*\d+', text):
-                return True
-        
-        # Pattern: trivia/general questions
-        if any(phrase in text_lower for phrase in [
-            "who won", "who is the", "when was", "what year", "which president",
-            "who discovered", "who invented", "what is the meaning"
-        ]):
-            # Exclude org-related: "who is our ceo", "what is our mission"
-            if not any(org in text_lower for org in ["swope", "our ", "company ", "organization "]):
-                return True
-        
-        return False
-
     def _is_org_or_document_request(text: str) -> bool:
         """Default to organizational/document retrieval for any substantive turn.
 
@@ -2926,8 +2759,8 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     _force_respond_direct = (
         is_small_talk(user_text)
         or is_personal_advice_request(user_text)
-        or _is_bot_self_question(_user_text_lower)
-        or (_is_general_knowledge_question(user_text) and not _needs_org_search)
+        or is_bot_self_question(_user_text_lower)
+        or (is_general_knowledge_question(user_text) and not _needs_org_search)
     )
 
     _refine_phrases = (
@@ -2937,50 +2770,19 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     _looks_like_refine = any(p in _user_text_lower for p in _refine_phrases)
     _looks_like_previous_doc_followup = _is_previous_document_followup(user_text)
 
-    # Route decision. In SharePoint-only mode, skip the router LLM for normal
-    # knowledge questions so typing starts quickly and search begins immediately.
-    if _force_respond_direct:
-        route = {"action": "respond_direct", "should_search": False, "search_query": "", "scope": "local"}
-        logger.info(f"âš¡ Short-circuited to respond_direct (bot self-knowledge): '{user_text[:60]}'")
-    elif _looks_like_previous_doc_followup:
-        route = {
-            "action": "refine_previous",
-            "should_search": False,
-            "is_followup": True,
-            "query": "",
-            "scope": "local",
-            "top_k": 3,
-            "reason": "follow-up about previous document/source",
-        }
-        logger.info(f"Fast-routed to previous document follow-up: '{user_text[:80]}'")
-    elif (
-        Config.DATA_SOURCE_MODE in ("sharepoint", "sharepoint_uploads_only", "sharepoint_ai_search_uploads_only")
-        and _needs_org_search
-        and not attachments
-        and not has_cached_attachments
-        and not _looks_like_refine
-        and not _looks_like_previous_doc_followup
-    ):
-        route = {
-            "action": "search_documents",
-            "should_search": True,
-            "is_followup": False,
-            "query": user_text.strip(),
-            "scope": "ai_search",
-            "top_k": 6,
-        }
-        logger.info(f"Fast-routed to Azure AI Search: '{user_text[:80]}'")
-    elif _looks_like_refine:
-        route = {
-            "action": "refine_previous",
-            "should_search": False,
-            "is_followup": True,
-            "query": user_text.strip(),
-            "scope": "local",
-            "top_k": 3,
-        }
-        logger.info(f"Fast-routed to refine_previous: '{user_text[:80]}'")
-    else:
+    # Route decision — deterministic tree extracted to routing/message_router.classify_message;
+    # falls back to the LLM router (llm_decide_routing) when no deterministic rule applies.
+    route = classify_message(
+        user_text,
+        data_source_mode=Config.DATA_SOURCE_MODE,
+        force_respond_direct=_force_respond_direct,
+        looks_like_previous_doc_followup=_looks_like_previous_doc_followup,
+        needs_org_search=_needs_org_search,
+        has_attachments=bool(attachments),
+        has_cached_attachments=has_cached_attachments,
+        looks_like_refine=_looks_like_refine,
+    )
+    if route is None:
         route = await llm_decide_routing(
             model,
             user_text,
@@ -2993,6 +2795,8 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
             last_source_names=_prev_source_names,
             recent_history=_recent_history,
         )
+    # Phase 7.1 intent (app-only safe; consumed by the parallel Graph path in Step 7).
+    intent = classify_intent(user_text, route)
     # Final safety gate: casual/social messages must never call retrieval tools.
     if user_text and (is_small_talk(user_text) or is_personal_advice_request(user_text)):
         route = {"action": "respond_direct", "should_search": False, "search_query": "", "scope": "local"}
@@ -3109,8 +2913,8 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
             if cached_fnames:
                 logger.info(f"   Cached file(s): {', '.join(cached_fnames)}")
 
-    # Send typing indicator after routing decision to keep connection alive during user profile resolution
-    await send_typing_indicator(ctx)
+    # Update status after routing so user sees what phase we're entering
+    typing_mgr.set_status("Searching your documents...")
     
     user_key = aad_id or extracted_upn_initial or conversation_id
     stable_lookup_key = aad_id or extracted_upn_initial
@@ -3651,10 +3455,12 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
         file_storage = []
     # Track current attachments for calculations in this request
     current_attachment_files: list[dict] = []
+    # Raw downloaded bytes for the code interpreter (real xlsx/pdf/docx manipulation).
+    interpreter_input_files: dict[str, bytes] = {}
     
     # Attachment processing - files uploaded directly to chat
     if attachments and not skip_attachments_for_small_talk:
-        await send_typing_indicator(ctx)
+        typing_mgr.set_status("Reading attached file...")
         MAX_ATTACHMENTS = len(attachments)
         parts = []
         extracted_for_aggregation = []  # For multi-file comparison
@@ -3668,13 +3474,14 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
         for i, att in enumerate(attachments[:MAX_ATTACHMENTS], 1):
             att_name = getattr(att, "name", "unknown")
             
-            # Send typing indicator before each attachment to keep connection alive
+            # Update status per attachment so user sees progress
             if total_attachments > 1:
-                status_id = await send_typing_with_status(ctx, f"Processing {att_name} ({i}/{total_attachments})")
+                typing_mgr.set_status(f"Reading {att_name} ({i} of {total_attachments})...")
+                status_id = await send_typing_with_status(ctx, f"Reading {att_name} ({i}/{total_attachments})")
                 if status_id:
                     status_activity_ids.append(status_id)
             else:
-                await send_typing_indicator(ctx)
+                typing_mgr.set_status(f"Reading {att_name}...")
             
             # Validate file before processing
             is_valid, validation_error = validate_file_attachment(att)
@@ -3695,7 +3502,7 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
                 logger.info(f"Processing {att_name} (size: {file_size_mb:.1f}MB) with periodic typing refresh")
                 
                 async with TypingIndicatorManager(ctx):
-                    file_content = await asyncio.to_thread(process_attachment, att, conversation_id, user_id=cache_user_id)
+                    file_content = await asyncio.to_thread(process_attachment, att, conversation_id, cache_user_id, interpreter_input_files)
             except MemoryError as mem_err:
                 logger.error(f"MEMORY ERROR processing '{att_name}': {mem_err}")
                 file_content = f"âŒ **File too large**: {att_name}\n\nThis file caused a memory error. Try:\nâ€¢ Splitting into smaller files\nâ€¢ Reducing file size\nâ€¢ Asking about specific sections"
@@ -3931,8 +3738,7 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
             strong_title_match_doc = None
             logger.info(f"Detected document summary request: {is_summary_request}")
 
-            # Send typing indicator for search operations
-            await send_typing_indicator(ctx)
+            typing_mgr.set_status("Searching your documents...")
             
             top_k = int(route.get("top_k", 10))
             
@@ -4054,8 +3860,7 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
             unified_search_results = []
             parallel_results = {}
             
-            # Send typing indicator before potentially long Graph API operations
-            await send_typing_indicator(ctx)
+            typing_mgr.set_status("Searching your documents...")
             
             # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             # STRICT SCOPE ENFORCEMENT - User specifies WHERE to search
@@ -4114,10 +3919,11 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
                 logger.info("AI SEARCH RESULTS | count=%s", len(unified_search_results))
             # Check if this is a parallel search request (pipe-separated queries)
             elif '|' in search_query:
-                logger.info(f"ðŸ”„ Detected parallel search request: {search_query}")
+                logger.info(f"Detected parallel search request: {search_query}")
                 queries = [q.strip() for q in search_query.split('|') if q.strip()]
-                logger.info(f"ðŸ” Executing {len(queries)} parallel searches: {queries}")
-                
+                logger.info(f"Executing {len(queries)} parallel searches: {queries}")
+                typing_mgr.set_status(f"Running {len(queries)} searches in parallel...")
+
                 parallel_results = await perform_parallel_searches(
                     queries=queries,
                     top_k=top_k,
@@ -4766,7 +4572,7 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
                         f"<h4 style=\"margin: 0.5rem 0; font-size: 1rem;\">[{idx}] {name} {source_label}</h4>"
                         f"<p style=\"margin: 0.25rem 0; font-size: 0.85rem; color: #666;\">"
                         f"<a href=\"{clean_url}\" style=\"text-decoration: none; color: #0078d4;\">View Document</a></p>"
-                        f"<p style=\"margin: 0.5rem 0; font-size: 0.9rem; line-height: 1.4;\">{snippet if len(snippet) <= 500 else snippet[:500] + 'â€¦'}</p>"
+                        f"<p style=\"margin: 0.5rem 0; font-size: 0.9rem; line-height: 1.4;\">{snippet if len(snippet) <= 500 else snippet[:500] + '…'}</p>"
                         f"</div>"
                     )
                     sources_refs.append(_format_ref_line(idx, name, clean_url))
@@ -4821,6 +4627,30 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     # so we never expose documents the user cannot access
     # IMPORTANT: Add search results (cached + combined) FIRST before web results
     # This ensures high-relevance documents get priority when limiting docs (e.g., PDF limit)
+
+    # â”€â”€ ATTACHMENT ISOLATION (anti-hallucination) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # When the user uploaded a file THIS turn (and isn't explicitly asking to
+    # compare it against org/SharePoint content), analyze/summarize ONLY that
+    # file. Drop any index / cache / AI-Search docs AND the prior-source memory
+    # summary that may have been collected, so unrelated indexed documents
+    # cannot bleed into the prompt and produce a confident summary of the WRONG
+    # document. (Root cause of the "public health messages" hallucination: a
+    # tiny 140-char e-ticket was blended with 3174 chars of unrelated indexed
+    # docs, and the model summarized the larger unrelated text.)
+    if attachments and attachment_texts and not _explicit_attachment_org_compare:
+        _dropped = len(cached_results or []) + len(combined_doc_results or []) + len(ai_search_results or [])
+        if _dropped or _conversation_source_summary:
+            logger.info(
+                "ATTACHMENT ISOLATION: focusing on uploaded file(s) only - dropped %d index/cache docs "
+                "and %d chars of prior-source memory to prevent cross-document hallucination.",
+                _dropped,
+                len(_conversation_source_summary or ""),
+            )
+        cached_results = []
+        combined_doc_results = []
+        ai_search_results = []
+        _conversation_source_summary = ""
+
     model_doc_items = []
     
     # STABILIZATION: Chunk+compress all doc snippets entering model_doc_items (ISSUE 1+2)
@@ -5135,7 +4965,8 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
         attachment_texts=attachment_texts,
         doc_items=model_doc_items,
         personalization=personalization,
-        memory_text=_conversation_source_summary
+        memory_text=_conversation_source_summary,
+        is_summary_request=is_document_summary_request(user_text or ""),
     )
     
     # â”€â”€ ISSUE 9: Log final prompt size â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -5211,7 +5042,72 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     # Azure OpenAI will handle final token limits gracefully
     # The build_llm_input function already truncated content appropriately
 
-    chat_prompt = ChatPrompt(model)
+    # â”€â”€ CODE INTERPRETER (Phase 1) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Expose the run_python tool when the user wants computation, data manipulation,
+    # charting, or document generation. The model decides when to call it; any files
+    # it produces are delivered to the user after the response completes.
+    interpreter_turn = None
+    interpreter_tools = None
+    try:
+        _enable_interp = _should_enable_interpreter(user_text or "", bool(interpreter_input_files))
+        if _enable_interp:
+            interpreter_turn = InterpreterTurn(input_files=dict(interpreter_input_files))
+            interpreter_tools = build_interpreter_tools(interpreter_turn)
+            logger.info(
+                f"ðŸ§® Code interpreter ENABLED for this turn "
+                f"(input_files={len(interpreter_input_files)}, tools={len(interpreter_tools)})"
+            )
+    except Exception as _interp_err:
+        logger.warning(f"Failed to enable code interpreter: {_interp_err}")
+        interpreter_turn = None
+        interpreter_tools = None
+
+    chat_prompt = ChatPrompt(model, functions=interpreter_tools) if interpreter_tools else ChatPrompt(model)
+
+    # When the interpreter is active, tell the model how/when to use it.
+    _effective_instructions = BASE_INSTRUCTIONS
+    if interpreter_tools:
+        _effective_instructions = (BASE_INSTRUCTIONS or "") + (
+            "\n\n## CODE INTERPRETER\n"
+            "You have a `run_python` tool that executes Python in a secure sandbox "
+            "(pandas, numpy, openpyxl, matplotlib, python-docx, python-pptx, reportlab, "
+            "Pillow, pypdf; NO internet). Use it to:\n"
+            "- Do accurate calculations, statistics, and data analysis on uploaded files "
+            "(never guess numbers — compute them).\n"
+            "- Create charts/visualizations and SAVE them as image files.\n"
+            "- Generate documents the user asks for: .xlsx, .docx, .pptx, .pdf, .csv, "
+            ".txt, .zip — save them to the current directory.\n"
+            "Uploaded files are already in the working directory under their original "
+            "filenames. After a tool run, briefly explain what you found or created. "
+            "Generated files are delivered to the user automatically — do NOT fabricate "
+            "download links or claim a file exists unless run_python actually created it."
+        )
+
+    _artifacts_delivered = {"done": False}
+
+    async def deliver_interpreter_artifacts():
+        """Send any files produced by run_python this turn as download links."""
+        if _artifacts_delivered["done"]:
+            return
+        _artifacts_delivered["done"] = True
+        if not interpreter_turn or not interpreter_turn.artifacts:
+            return
+        try:
+            lines = ["**Generated file(s):**", ""]
+            for art in interpreter_turn.artifacts:
+                size_kb = max(1, art.size // 1024)
+                url = art.url
+                if url.startswith("http"):
+                    lines.append(f"- [{art.filename}]({url}) ({size_kb} KB)")
+                else:
+                    # No absolute base URL configured; show filename only.
+                    lines.append(f"- {art.filename} ({size_kb} KB)")
+            msg = "\n".join(lines)
+            await ctx.send(MessageActivityInput(text=msg).add_ai_generated())
+            logger.info(f"ðŸ“Ž Delivered {len(interpreter_turn.artifacts)} artifact link(s)")
+        except Exception as _deliver_err:
+            logger.warning(f"Failed to deliver interpreter artifacts: {_deliver_err}")
+
     
     # Throttle streaming to prevent Bot Framework 429 errors
     last_emit_time = 0
@@ -5250,13 +5146,15 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
                     # Keep chunks in buffer for final emission
         # Otherwise, buffer chunks and they'll be emitted in next interval or at end
     
-    # Use Teams SDK built-in streaming with retry logic and throttling
-    typing_mgr = TypingIndicatorManager(ctx)
+    # Use Teams SDK built-in streaming with retry logic and throttling.
+    # Reuse the persistent typing manager already started during the search phase
+    # so the indicator stays continuous from the moment the user sent their message.
     try:
-        # ðŸ”„ START PERSISTENT TYPING: Keep indicator visible throughout entire response generation
-        # Using 3.0s interval (increased from 2.0s to reduce 429 rate limiting) with background refresh
-        await typing_mgr.start_periodic_refresh(interval=3.0)
-        
+        # Ensure typing is running (it normally already is from the search phase).
+        typing_mgr.set_status("Reasoning through your answer...")
+        if not getattr(typing_mgr, "should_refresh", False):
+            await typing_mgr.start_periodic_refresh(interval=3.0)
+                
         # GROUP CHAT DEBUGGING: Log before making chat call
         logger.info(f"ðŸš€ Starting LLM call for conversation: {conversation_id[:20]}... (IsGroup: {is_group})")
         
@@ -5314,7 +5212,7 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
                 return await chat_prompt.send(
                     input=llm_input,
                     memory=None,
-                    instructions=BASE_INSTRUCTIONS,
+                    instructions=_effective_instructions,
                     on_chunk=throttled_emit,
                 )
         
@@ -5413,6 +5311,9 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
                     source_names=[d.get("title") or d.get("name") or "" for d in model_doc_items],
                 )
                 
+                # Deliver any files produced by the code interpreter
+                await deliver_interpreter_artifacts()
+
                 # Return early to prevent duplicate messages from normal flow
                 return
                 
@@ -5494,7 +5395,9 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
             source_names=[d.get("title") or d.get("name") or "" for d in model_doc_items],
         )
         
-        # CACHE DOCUMENTS POST-RESPONSE: Only cache documents from live Graph search that were used
+        # Deliver any files produced by the code interpreter this turn
+        await deliver_interpreter_artifacts()
+        
         # Save conversation memory after response for instant recovery on next turn
         # âœ… SIMPLIFIED: No manual memory saving needed with simple approach
         # The ChatPrompt automatically handles memory management
@@ -5862,6 +5765,34 @@ async def handle_message_feedback(ctx: ActivityContext[MessageSubmitActionInvoke
     logger.info(f"Feedback: {feedback}")
 
 
+# Phase 7-Pre: capture the user's Teams SSO token on each signin/tokenExchange invoke.
+# Only fires in real Teams with SSO configured; the Playground never sends it. The exact
+# response contract is verified in Step 8 (real Teams) — the SDK handles the ack envelope.
+try:
+    @app.on_signin_token_exchange
+    async def handle_signin_token_exchange(ctx: ActivityContext):
+        try:
+            value = getattr(ctx.activity, "value", None)
+            token = getattr(value, "token", None)
+            if token is None and isinstance(value, dict):
+                token = value.get("token")
+            sender = getattr(ctx.activity, "from_", None)
+            uid = (
+                getattr(sender, "aad_object_id", None)
+                or getattr(sender, "aadObjectId", None)
+                or getattr(sender, "id", None)
+            )
+            if token and uid:
+                sso_token_cache.set(str(uid), token)
+                logger.info("SSO token captured for user %s", str(uid)[:8])
+            else:
+                logger.debug("signin/tokenExchange received but token or user id missing")
+        except Exception as exc:
+            logger.warning("SSO token capture failed: %s", exc)
+except AttributeError:
+    logger.info("Note: SDK has no on_signin_token_exchange decorator; SSO capture disabled")
+
+
 def check_web_indexing_dependencies():
     """Website indexing is disabled for this SharePoint/uploads-only assistant."""
     return False
@@ -5888,9 +5819,10 @@ async def startup():
         )
         # Single-line effective-config summary — the first thing to check in any deployment log.
         logger.info(
-            "STARTUP | index=%s | security_trimming=%s | memory_turns=%s | kv=%s",
+            "STARTUP | index=%s | security_trimming=%s | graph_search=%s | memory_turns=%s | kv=%s",
             config.AZURE_SEARCH_INDEX_NAME,
             config.ENABLE_SECURITY_TRIMMING,
+            config.ENABLE_GRAPH_SEARCH,
             config.MAX_MEMORY_TURNS,
             "set" if os.environ.get("AZURE_KEY_VAULT_URL") else "not set",
         )
@@ -5906,8 +5838,49 @@ async def startup():
     except Exception as e:
         logger.error(f"Failed to start SharePoint AI Search indexing worker: {e}", exc_info=True)
 
+    # Warm up the embedding model + AI Search connection so the FIRST real user
+    # query doesn't pay the cold-start penalty (which previously took ~50s and
+    # could surface as an error to the user). Runs in the background; failures
+    # here are harmless and never block startup.
+    async def _warm_up_search() -> None:
+        try:
+            import time as _t
+            from search.embeddings import embed_text
+            from search.ai_search_retriever import get_search_client, SELECT_FIELDS
+
+            _started = _t.perf_counter()
+            await asyncio.to_thread(embed_text, "warm up")
+            try:
+                client = get_search_client()
+                rows = await asyncio.to_thread(
+                    lambda: list(client.search(search_text="warm up", top=1, select=SELECT_FIELDS))
+                )
+                _ = len(rows)
+            except Exception as inner:
+                logger.info("WARMUP | search probe skipped: %s", inner)
+            logger.info("WARMUP | embedding+search primed | seconds=%.2f", _t.perf_counter() - _started)
+        except Exception as warm_err:
+            logger.info("WARMUP | skipped: %s", warm_err)
+
+    try:
+        warm_task = asyncio.create_task(_warm_up_search())
+        add_background_task(warm_task, "search_warm_up")
+    except Exception as e:
+        logger.info(f"Failed to schedule search warm-up: {e}")
+
     logger.info("Starting Teams AI app...")
     logger.info("=" * 60)
+
+    # Register the secure artifact download route (GET /files/{token}) on the
+    # bot's FastAPI server BEFORE it starts, so code-interpreter outputs can be
+    # delivered to users via expiring links.
+    if _INTERPRETER_AVAILABLE:
+        try:
+            from generation.file_store import register_file_routes
+            register_file_routes(app.server.adapter.app)
+        except Exception as _route_err:
+            logger.warning(f"Could not register artifact download route: {_route_err}")
+
     await app.start()
 
 
