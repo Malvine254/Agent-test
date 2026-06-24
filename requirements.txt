@@ -26,6 +26,10 @@ pandas>=2.0.0
 
 numpy>=1.24.0
 
+# Code interpreter: charts & PDF generation
+matplotlib>=3.8.0
+reportlab>=4.0.0
+
 # Optional: Legacy Office format support (.doc, .ppt)
 # textract - requires system dependencies (antiword, poppler-utils, etc.)
 # Install manually if needed: pip install textract
