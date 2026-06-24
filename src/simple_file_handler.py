@@ -292,7 +292,8 @@ def _analyze_csv_content(csv_text: str, display_name: str) -> str:
         return _smart_truncate(summary, "CSV")
 
 
-def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optional[str] = None) -> str:
+def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optional[str] = None,
+                       raw_sink: Optional[dict] = None) -> str:
     """
     Process file attachment from Teams and extract text content.
     - Per Teams docs: downloadUrl in content is pre-authenticated by Teams
@@ -304,6 +305,9 @@ def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optio
         attachment: Teams attachment object
         corr_id: Correlation ID for logging
         user_id: User ID for logging purposes
+        raw_sink: Optional dict to capture the raw downloaded bytes keyed by
+            filename (used by the code interpreter for real file manipulation).
+            Only populated on the direct-download path and capped to 25 MB.
     
     Returns:
         Extracted text or file info (truncated if necessary)
@@ -626,6 +630,17 @@ The attachment payload did not include a usable download URL, which typically in
             return f"❌ The downloaded content appears to be an HTML viewer page, not the raw file: {display_name}. If this is a SharePoint/OneDrive file, I can access it via Graph—please share the original file link."
         if not content:
             return f"📎 {display_name} (empty file)"
+        
+        # Capture raw bytes for the code interpreter (real xlsx/pdf/docx manipulation).
+        # Capped to 25 MB to bound memory; larger files fall back to text-only.
+        if raw_sink is not None:
+            try:
+                if len(content) <= 25 * 1024 * 1024:
+                    raw_sink[display_name] = content
+                else:
+                    logger.info(f"{prefix}Raw bytes for '{display_name}' not captured ({len(content)} bytes > 25MB cap)")
+            except Exception as _rb_err:
+                logger.debug(f"{prefix}raw_sink capture failed: {_rb_err}")
         
         # Extract content from file bytes
         extracted_text = _extract_content(display_name, content)
