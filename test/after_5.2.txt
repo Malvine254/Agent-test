@@ -1,0 +1,179 @@
+# Phase 5 pre-refactor response baseline
+# Query 9 (PDF upload) requires manual testing — Teams attachment download not simulable here.
+
+### q1-idsr
+QUERY: Summarize the IDSR guideline
+RESPONSE:
+This summary is based on the included portion of the Final_IDSR Technical Guidelines_Final Version signed by Hon. DG and Hon. Minister.pdf.
+
+The IDSR guidelines set out a framework for integrated disease surveillance and response, detailing core components and distinct stakeholder roles to ensure coordinated management of public health events [[1]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf).
+
+Core Components of IDSR
+
+- The guidelines identify "eight components: legislation; policy and coordination; surveillance; preparedness; response; risk communications; laboratory; and human resources," all of which are essential for effective IDSR implementation [[1]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf).
+
+Key Roles and Responsibilities
+
+- Community-based surveillance focal persons are tasked to "monitor district IDSR performance," "assist districts in design and implementation of community health education programmes," "help districts in implementing appropriate public health response," and facilitate "cross-border district surveillance and response initiatives" [[1]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf).
+- The Ministry of Health (MOH)/national level must “set up a public health emergency operation center," "set standards, policies and guidelines for IDSR," "identify domestic resources and mobilize and coordinate external support," "supervise, monitor and evaluate IDSR activities," and "support investigation of suspected epidemics detected through surveillance" [[1]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf).
+- WHO and other partners "contribute to setting standards and developing guidelines," "provide technical assistance," "support the Ministry of Health in mobilizing resources," and "supply management support, capacity-building, and response during public health emergencies" [[1]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf).
+
+International Health Regulations & Points of Entry
+
+- The "purpose of the International Health Regulations (IHR 2005) is to prevent, protect against, control and provide public health response to the international spread of diseases,” including at points of entry such as "ports, airports and ground crossings" and calls for closely linking border health activities to "other surveillance activities under IDSR" [[1]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf).
+
+---
+**References:**
+
+[1] [Final_IDSR Technical Guidelines_Final Version signed by  Hon. DG and Hon. Minister.pdf](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf)
+
+### q2-daily
+QUERY: What is the Daily Brief AI spec?
+RESPONSE:
+Summary  
+The DailyBrief.AI spec outlines the requirements and architectural design for a Microsoft Teams application that consolidates Microsoft 365 work signals into a unified daily briefing, leveraging Azure Cognitive Search, Azure OpenAI, Azure AI Foundry, and Microsoft Graph. This summary is based on the included portion of both the requirements and AI agent design specification documents.
+
+**System Purpose and Integration**
+- The DailyBrief.AI system is "a Microsoft Teams-integrated application designed to consolidate scattered work signals across Microsoft 365 into a unified daily briefing" [[1]](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257BC8199E0B-9227-4A8E-98F0-C2A296B30DCF%257D&file=DailyBriefAI_Requirements_Specification%2520%282%29.docx&action=default&mobileredirect=true).
+- It leverages "Azure Cognitive Search, Azure OpenAI, Azure AI Foundry, and Microsoft Graph" for signal detection and processing [[1]](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257BC8199E0B-9227-4A8E-98F0-C2A296B30DCF%257D&file=DailyBriefAI_Requirements_Specification%2520%282%29.docx&action=default&mobileredirect=true).
+
+**Key Functional Requirements**
+- The system "shall generate a daily briefing containing the user's top priorities, derived from emails, tasks, meetings, and file updates" [[1]](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257BC8199E0B-9227-4A8E-98F0-C2A296B30DCF%257D&file=DailyBriefAI_Requirements_Specification%2520%282%29.docx&action=default&mobileredirect=true).
+- It must "detect overdue and pending tasks and display them within a structured summary" [[1]](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257BC8199E0B-9227-4A8E-98F0-C2A296B30DCF%257D&file=DailyBriefAI_Requirements_Specification%2520%282%29.docx&action=default&mobileredirect=true).
+- The system "shall identify follow-ups owed by the user based on unread emails, unresponded messages, flagged items, and tasks assigned through Planner or To Do" [[1]](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257BC8199E0B-9227-4A8E-98F0-C2A296B30DCF%257D&file=DailyBriefAI_Requirements_Specification%2520%282%29.docx&action=default&mobileredirect=true).
+- It will also "detect follow-ups owed to the user by analyzing communications from teammates, delegated tasks, and pending approvals" [[1]](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257BC8199E0B-9227-4A8E-98F0-C2A296B30DCF%257D&file=DailyBriefAI_Requirements_Specification%2520%282%29.docx&action=default&mobileredirect=true).
+
+**AI Agent Architecture and Operation**
+- The orchestration agent is "built within Azure AI Foundry" and is "responsible for coordinating Microsoft Graph retrieval, Cognitive Search queries, Azure OpenAI reasoning, classification workflows, ranking, filtering, normalizing, and generating the final structured daily brief" [[2]](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257B1BEC739E-5DE3-42DF-9E67-32C9F05AA514%257D&file=DailyBriefAI_AI_Agent_Design_Specification%2520%281%29.docx&action=default&mobileredirect=true).
+- The agent "acts as the central reasoning engine for the system" and is designed to "synthesize work signals from email, tasks, meetings, files, and messages into actionable insight" [[2]](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257B1BEC739E-5DE3-42DF-9E67-32C9F05AA514%257D&file=DailyBriefAI_AI_Agent_Design_Specification%2520%281%29.docx&action=default&mobileredirect=true).
+- Its operation is "deterministic, auditable, and reproducible," ensuring "consistency and reliability across daily brief generations" [[2]](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257B1BEC739E-5DE3-42DF-9E67-32C9F05AA514%257D&file=DailyBriefAI_AI_Agent_Design_Specification%2520%281%29.docx&action=default&mobileredirect=true).
+
+**Summary Statement**
+All statements above are directly quoted or closely paraphrased from the included portions of the DailyBrief.AI requirements and AI agent design specification documents [[1]](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257BC8199E0B-9227-4A8E-98F0-C2A296B30DCF%257D&file=DailyBriefAI_Requirements_Specification%2520%282%29.docx&action=default&mobileredirect=true) [[2]](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257B1BEC739E-5DE3-42DF-9E67-32C9F05AA514%257D&file=DailyBriefAI_AI_Agent_Design_Specification%2520%281%29.docx&action=default&mobileredirect=true).
+
+---
+**References:**
+
+[1] [DailyBriefAI_Requirements_Specification (2).docx](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257BC8199E0B-9227-4A8E-98F0-C2A296B30DCF%257D&file=DailyBriefAI_Requirements_Specification%2520%282%29.docx&action=default&mobileredirect=true)
+
+[2] [DailyBriefAI_AI_Agent_Design_Specification (1).docx](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257B1BEC739E-5DE3-42DF-9E67-32C9F05AA514%257D&file=DailyBriefAI_AI_Agent_Design_Specification%2520%281%29.docx&action=default&mobileredirect=true)
+
+### q3-list
+QUERY: What documents do you have?
+RESPONSE:
+Summary  
+You have access to two specific documents listed below. The details of each are drawn from their visible, included portions. There may be additional content in their full versions.
+
+**Available Documents**
+
+- **AI Agent Use Case - Swope Health.pdf**
+  - This document is titled **"AI Agent Use Case - Swope Health,"** was prepared for **Swope Health** by **Armely, LLC**, and is dated **July 25, 2025**. The included section features a **Table of Contents**, **Introduction**, **Primary Use Cases**, **Personalized Interaction**, and **Document Search & Retrieval** [[1]](https://armely.sharepoint.com/sites/Test-team/Submissions/AI%2520Agent%2520Use%2520Case%2520-%2520Swope%2520Health.pdf).
+  - Note: Only a portion of this document is provided here; this summary is based on the included portion.
+
+- **SoW for DA Protective Order Quote 2022.pdf**
+  - This document discusses **Protective Orders**, specifically court procedures related to their application and hearings. Topics include the typical duration of protective orders (up to 2 years, with exceptions), guidance on preparing for court, and evidence or witness requirements. It provides practical advice for applicants, such as bringing income documentation and practicing statements for the judge [[2]](https://armely.sharepoint.com/sites/Test-team/Submissions/SoW%2520for%2520DA%2520Protective%2520Order%2520Quote%25202022.pdf).
+  - Note: Only a portion of this document is provided here; this summary is based on the included section.
+
+If you need information from a specific document or section, please specify which document and the details you are seeking.
+
+---
+**References:**
+
+[1] [AI Agent Use Case - Swope Health.pdf](https://armely.sharepoint.com/sites/Test-team/Submissions/AI%2520Agent%2520Use%2520Case%2520-%2520Swope%2520Health.pdf)
+
+[2] [SoW for DA Protective Order Quote 2022.pdf](https://armely.sharepoint.com/sites/Test-team/Submissions/SoW%2520for%2520DA%2520Protective%2520Order%2520Quote%25202022.pdf)
+
+### q4-lease
+QUERY: Tell me about the lease agreement sample
+RESPONSE:
+Here is a detailed summary of the sample lease agreement provided in the document. The document is a sample file created for testing automation workflows and outlines fundamental lease terms for a commercial property.
+
+Overview
+The sample lease agreement provides basic details for a lease arrangement between a landlord and tenant regarding a specific commercial property in Dallas, Texas [[1]](https://armely.sharepoint.com/sites/Test-team/Mondaycom%2520Testing/Monday.com%2520Testing/lease_agreement_sample.pdf).
+
+Key Lease Terms
+
+- Property Address  
+  - The property is located at 123 Main Street, Dallas, TX [[1]](https://armely.sharepoint.com/sites/Test-team/Mondaycom%2520Testing/Monday.com%2520Testing/lease_agreement_sample.pdf).
+
+- Tenant  
+  - The tenant identified in the agreement is ABC Consulting LLC [[1]](https://armely.sharepoint.com/sites/Test-team/Mondaycom%2520Testing/Monday.com%2520Testing/lease_agreement_sample.pdf).
+
+- Landlord  
+  - The landlord listed is XYZ Properties [[1]](https://armely.sharepoint.com/sites/Test-team/Mondaycom%2520Testing/Monday.com%2520Testing/lease_agreement_sample.pdf).
+
+- Lease Term  
+  - The lease starts on July 1, 2026, and ends on June 30, 2027 [[1]](https://armely.sharepoint.com/sites/Test-team/Mondaycom%2520Testing/Monday.com%2520Testing/lease_agreement_sample.pdf).
+
+- Monthly Rent  
+  - The agreed monthly rent is $2,500 [[1]](https://armely.sharepoint.com/sites/Test-team/Mondaycom%2520Testing/Monday.com%2520Testing/lease_agreement_sample.pdf).
+
+Purpose of Document
+
+- The agreement is explicitly identified as "a sample file created for testing Monday.com to SharePoint automation workflows" [[1]](https://armely.sharepoint.com/sites/Test-team/Mondaycom%2520Testing/Monday.com%2520Testing/lease_agreement_sample.pdf).
+
+If you need details beyond the key terms above, please clarify your specific question or request.
+
+---
+**References:**
+
+[1] [lease_agreement_sample.pdf](https://armely.sharepoint.com/sites/Test-team/Mondaycom%2520Testing/Monday.com%2520Testing/lease_agreement_sample.pdf)
+
+### q5-hi
+QUERY: Hi
+RESPONSE:
+Hi! How can I help you today?
+
+### q6-thanks
+QUERY: Thanks
+RESPONSE:
+You're welcome. What would you like to work on next?
+
+### q7-sop
+QUERY: What's our outbreak investigation SOP?
+RESPONSE:
+Summary
+The outbreak investigation SOP defines how to recognize, investigate, and respond to disease outbreaks using clearly delineated steps and management protocols.
+
+Definition of Outbreak
+
+- An outbreak is defined as "a disease or an event above what is normally expected within the population in a given area over a particular time period" [[2]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf).
+
+Key Steps in Outbreak Investigation
+
+- "When an outbreak or any public health event or condition is detected and notified, several steps need to be followed when conducting outbreak investigation" [[2]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf).
+- "Knowledge of these steps is crucial to proper investigation of the outbreak, using common sense and logic to determine when, how often and to what extent the different steps should be implemented in a real investigation" [[2]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf).
+- "The results of an investigation targeting an outbreak or other public health event leads to identification and assessment of persons exposed to an infectious disease or affected by an unusual health event. The investigation provides relevant information needed to take immediate action and improve longer-term disease prevention activities" [[2]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf).
+
+General Response Structure
+
+- The document "STANDARD OPERATING PROCEDURE FOR OUTBREAK INVESTIGATION AND MANAGEMENT" was developed as a consensus under the National Vector Borne Disease Control Programme, reflecting local disease epidemiology, risk factors, and health systems contexts, with reference to global best practices [[1]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/sop_outbreak_investigation_management_aug_2020.pdf).
+- The SOP refers to systematic investigation and management processes to "search for additional KA and PKDL cases, entomological surveillance, [and] integrated vector control measures" [[1]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/sop_outbreak_investigation_management_aug_2020.pdf).
+
+This summary is based on the included portions of the referenced documents. For the complete stepwise SOP details, please review the full documents.
+
+---
+**References:**
+
+[1] [sop_outbreak_investigation_management_aug_2020.pdf](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/sop_outbreak_investigation_management_aug_2020.pdf)
+
+[2] [Final_IDSR Technical Guidelines_Final Version signed by  Hon. DG and Hon. Minister.pdf](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf)
+
+### q8-followup
+QUERY: Can you summarize the last thing you told me?
+RESPONSE:
+This summary is based on the content of the previous reply.
+
+Overview
+
+- The last message stated that the Integrated Disease Surveillance and Response (IDSR) guideline "provides a framework for strengthening national disease surveillance and response systems through key public health components, clearly outlining the roles and responsibilities of different actors, including Ministry of Health, partners (e.g., WHO, NGOs), and community-based personnel" [[1]](https://armely.sharepoint.com/sites/Test-team/Surveillance%2520documents/Final_IDSR%2520Technical%2520Guidelines_Final%2520Version%2520signed%2520by%2520%2520Hon.%2520DG%2520and%2520Hon.%2520Minister.pdf).
+
+---
+**References:**
+
+[1] [Microsoft Copilot Studio - Implementation Guide (1.5).pptx](https://armely.sharepoint.com/sites/Test-team/_layouts/15/Doc.aspx?sourcedoc=%257BE840C695-2027-418C-9961-6538516E85D2%257D&file=Microsoft%2520Copilot%2520Studio%2520-%2520Implementation%2520Guide%2520%281.5%29.pptx&action=edit&mobileredirect=true)
+
+### q10-twoturn
+QUERY: Can you give me more detail on the first point?
+RESPONSE:
+
