@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 from config import Config
 from search.ai_search_client import (
+    delete_document_chunks,
     delete_documents_by_source_url,
     get_document_metadata,
     get_documents_by_source_url,
@@ -16,7 +17,13 @@ from search.ai_search_client import (
 from search.ai_search_index import ensure_sharepoint_index
 from search.chunking import chunk_document
 from search.embeddings import embed_text
-from sharepoint.graph_client import clear_permission_cache, get_item_permissions, get_library_permissions
+from sharepoint.graph_client import (
+    clear_permission_cache,
+    get_item_permissions,
+    get_library_permissions,
+    list_configured_sharepoint_drives,
+    list_drive_delta,
+)
 from sharepoint.sharepoint_reader import download_sharepoint_document, extract_document_text, list_sharepoint_documents
 
 logger = logging.getLogger(__name__)
@@ -205,6 +212,90 @@ def index_all_sharepoint_documents() -> dict:
         summary.get("discovered_documents", 0),
         summary["indexed_documents"],
         summary["indexed_chunks"],
+        summary["skipped_documents"],
+        summary["failed_documents"],
+    )
+    return summary
+
+
+def index_sharepoint_delta() -> dict:
+    """Incremental indexing via the Graph drive delta feed.
+
+    For each configured drive: fetch only items changed or deleted since the last run
+    (using a persisted per-drive delta token), index the changed files, remove the
+    deleted ones, then advance the token. The first run for a drive (no token) walks
+    the whole drive and establishes the token — so this transparently does a full
+    initial index and fast incremental updates thereafter.
+
+    A forced rebuild (SHAREPOINT_FORCE_REINDEX / RECREATE_SEARCH_INDEX) clears stored
+    tokens so every drive re-walks fully and re-embeds all content.
+    """
+    from storage.delta_state import clear_all, get_delta_link, set_delta_link
+
+    ensure_sharepoint_index()
+    clear_permission_cache()
+    if Config.SHAREPOINT_FORCE_REINDEX or Config.RECREATE_SEARCH_INDEX:
+        clear_all()
+        logger.info("DELTA INDEXING | cleared delta tokens for forced full rebuild")
+
+    summary = {
+        "indexed_documents": 0,
+        "indexed_chunks": 0,
+        "skipped_documents": 0,
+        "failed_documents": 0,
+        "deleted_documents": 0,
+        "discovered_documents": 0,
+    }
+    logger.info("INDEXING RUN STARTED (delta) | index=%s", Config.AZURE_SEARCH_INDEX_NAME)
+
+    try:
+        drives = list_configured_sharepoint_drives()
+    except Exception as exc:
+        logger.error("DELTA INDEXING | failed to list drives: %s", exc)
+        return summary
+
+    for drive in drives:
+        site_id = drive["site_id"]
+        drive_id = drive["drive_id"]
+        token = get_delta_link(drive_id)
+        try:
+            delta = list_drive_delta(site_id, drive_id, token)
+        except Exception as exc:
+            # Don't advance the token on failure — the same window is retried next run.
+            logger.warning("DELTA INDEXING | walk failed for drive %s: %s — retry next run", drive_id, exc)
+            continue
+
+        for item_id in delta.get("deleted_ids", []):
+            document_id = build_document_id(site_id, drive_id, item_id)
+            try:
+                delete_document_chunks(document_id)
+                summary["deleted_documents"] += 1
+            except Exception as exc:
+                logger.warning("DELTA INDEXING | deletion failed for %s: %s", document_id, exc)
+
+        files = delta.get("files", [])
+        summary["discovered_documents"] += len(files)
+        for item in files:
+            try:
+                result = index_sharepoint_document(item)
+                if result.get("status") == "indexed":
+                    summary["indexed_documents"] += 1
+                    summary["indexed_chunks"] += int(result.get("chunks", 0))
+                else:
+                    summary["skipped_documents"] += 1
+            except Exception as exc:
+                logger.warning("INDEXING DOCUMENT FAILED | file=%s | error=%s", item.get("name"), exc)
+                summary["failed_documents"] += 1
+
+        # Advance the token only after this drive's batch is processed.
+        set_delta_link(drive_id, delta.get("delta_link"))
+
+    logger.info(
+        "INDEXING RUN FINISHED (delta) | discovered=%s | indexed_docs=%s | indexed_chunks=%s | deleted=%s | skipped=%s | failed=%s",
+        summary["discovered_documents"],
+        summary["indexed_documents"],
+        summary["indexed_chunks"],
+        summary["deleted_documents"],
         summary["skipped_documents"],
         summary["failed_documents"],
     )

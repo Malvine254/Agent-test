@@ -78,6 +78,7 @@ def _normalize_result(row: dict) -> dict:
     if not content:
         content = snippet
     source_url = _first_non_empty(row.get("source_url"), row.get("url"))
+    reranker_score = row.get("@search.reranker_score")
     return {
         "title": _first_non_empty(row.get("title"), row.get("file_name"), "SharePoint document"),
         "file_name": _first_non_empty(row.get("file_name")),
@@ -88,7 +89,8 @@ def _normalize_result(row: dict) -> dict:
         "source_type": "ai_search",
         "document_id": _first_non_empty(row.get("document_id"), row.get("id")),
         "chunk_id": _first_non_empty(row.get("chunk_id")),
-        "score": row.get("@search.score") if row.get("@search.score") is not None else row.get("@search.reranker_score"),
+        "reranker_score": reranker_score,
+        "score": row.get("@search.score") if row.get("@search.score") is not None else reranker_score,
     }
 
 
@@ -124,6 +126,73 @@ def _normalize_graph_result(row: dict) -> dict:
     }
 
 
+def _targeted_document_search(query: str, *, max_files: int = 2) -> list[dict]:
+    """Filename-targeted fallback: search configured drives for a named document and
+    extract its text on the fly.
+
+    This catches the case where a user names a specific file that the AI Search index
+    doesn't (yet) contain — e.g. a freshly uploaded document or one named differently
+    from its body text. Returns normalized results WITH content so the model can answer
+    instead of hallucinating. Returns [] when nothing matches (caller answers honestly).
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        from sharepoint.graph_client import (
+            download_file_bytes,
+            list_configured_sharepoint_drives,
+            search_drive_items,
+        )
+        from sharepoint.sharepoint_reader import extract_document_text
+    except Exception as exc:
+        logger.info("Targeted document search unavailable: %s", exc)
+        return []
+
+    try:
+        drives = list_configured_sharepoint_drives()
+    except Exception as exc:
+        logger.info("Targeted document search: could not list drives: %s", exc)
+        return []
+
+    seen_items: set[str] = set()
+    results: list[dict] = []
+    for drive in drives:
+        drive_id = drive.get("drive_id") or drive.get("id")
+        if not drive_id:
+            continue
+        for item in search_drive_items(drive_id, query, top=3):
+            item_id = item.get("id") or ""
+            if not item_id or item_id in seen_items:
+                continue
+            seen_items.add(item_id)
+            name = item.get("name") or "document"
+            try:
+                file_bytes = download_file_bytes(drive_id, item_id)
+                content = extract_document_text(name, file_bytes) or ""
+            except Exception as exc:
+                logger.info("Targeted search: failed to read %s: %s", name, type(exc).__name__)
+                content = ""
+            results.append({
+                "title": name,
+                "file_name": name,
+                "source_url": item.get("webUrl") or "",
+                "url": item.get("webUrl") or "",
+                "content": content,
+                "snippet": content[:600],
+                "source_type": "graph_targeted",
+                "document_id": item_id,
+                "chunk_id": "",
+                "score": item.get("@search.score") or 1.0,
+            })
+            if len(results) >= max_files:
+                logger.info("Targeted document search matched %s file(s) for %r", len(results), query[:60])
+                return results
+    if results:
+        logger.info("Targeted document search matched %s file(s) for %r", len(results), query[:60])
+    return results
+
+
 def _search_kwargs(query: str, filter_expr: str, top: int) -> dict:
     kwargs = {
         "search_text": query,
@@ -146,6 +215,33 @@ def _search_kwargs(query: str, filter_expr: str, top: int) -> dict:
 
 def _materialize(rows) -> list[dict]:
     return [_normalize_result(dict(row)) for row in rows]
+
+
+def _apply_score_threshold(query: str, results: list[dict]) -> list[dict]:
+    """Drop semantic results whose reranker score is below Config.MIN_RERANKER_SCORE.
+
+    The reranker score (Azure scale 0-4) is only present for semantic queries. Weak
+    matches are a primary cause of hallucination — the model treats a barely-relevant
+    chunk as authoritative. Filtering them here means a query with no strong match
+    returns nothing, so the caller can answer honestly ('not found') instead of
+    inventing an answer. Keyword-only results (no reranker score) are never filtered.
+    """
+    threshold = float(getattr(Config, "MIN_RERANKER_SCORE", 0) or 0)
+    if threshold <= 0:
+        return results
+    scored = [r for r in results if isinstance(r.get("reranker_score"), (int, float))]
+    if not scored:
+        return results  # no reranker scores present (keyword path) — nothing to filter
+    kept = [r for r in results if not isinstance(r.get("reranker_score"), (int, float)) or r["reranker_score"] >= threshold]
+    if len(kept) != len(results):
+        logger.info(
+            "AI SEARCH SCORE THRESHOLD | query=%r | threshold=%.2f | kept=%s | dropped=%s",
+            query,
+            threshold,
+            len(kept),
+            len(results) - len(kept),
+        )
+    return kept
 
 
 def _apply_precision_filters(query: str, results: list[dict]) -> list[dict]:
@@ -204,6 +300,7 @@ def _run_search(client, *, query: str, top: int, filter_expr: str, vector_querie
     rows = client.search(vector_queries=vector_queries, **kwargs) if vector_queries else client.search(**kwargs)
     raw_rows = list(rows)
     results = _apply_precision_filters(query, _materialize(raw_rows))
+    results = _apply_score_threshold(query, results)
     _log_diagnostics(query, len(raw_rows), results, status="200")
     logger.info(
         "AI SEARCH PHASE | query=%r | phase=%s | seconds=%.2f | raw_results=%s | mapped_results=%s",
@@ -330,6 +427,22 @@ def search_ai_index(query: str, top: int = 8, user_id: str | None = None) -> lis
     if trimming:
         logger.info("AI Search returned no results; live Graph fallback skipped under security trimming")
         return []
+
+    # Document-specific fallback: the user may be naming a file that the index does
+    # not contain yet (just uploaded, or named differently from its body text). Search
+    # the configured drives by filename and read the match directly.
+    try:
+        targeted = _targeted_document_search(query)
+        if targeted:
+            logger.info(
+                "AI SEARCH TOTAL | query=%r | seconds=%.2f | results=%s | source=targeted_document",
+                query,
+                time.perf_counter() - started_at,
+                len(targeted),
+            )
+            return targeted
+    except Exception as exc:
+        logger.warning("Targeted document search failed: %s", exc)
 
     logger.info("AI Search returned no results; falling back to live Graph search for %r", query)
     try:
