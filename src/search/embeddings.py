@@ -28,7 +28,7 @@ def _get_embedding_client():
         _embedding_client = AzureOpenAI(
             api_key=Config.AZURE_OPENAI_API_KEY,
             azure_endpoint=Config.AZURE_OPENAI_ENDPOINT,
-            api_version="2024-02-01",
+            api_version=Config.AZURE_OPENAI_API_VERSION,
             timeout=_EMBED_TIMEOUT_SECONDS,
             max_retries=0,  # we handle retries ourselves below
         )
@@ -55,9 +55,13 @@ def embed_text(text: str) -> list[float]:
         try:
             client = _get_embedding_client()
             attempt_started_at = time.perf_counter()
+            # text-embedding-3-* models default to their native dimensionality
+            # (3072 for -large). Pass dimensions explicitly so the returned vector
+            # always matches the index's vector field width (Config.EMBEDDING_DIMENSIONS).
             response = client.embeddings.create(
                 model=Config.AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
                 input=text[:8000],
+                dimensions=Config.EMBEDDING_DIMENSIONS,
             )
             vector = list(response.data[0].embedding)
             if len(vector) != Config.EMBEDDING_DIMENSIONS:

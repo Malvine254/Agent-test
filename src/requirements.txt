@@ -21,6 +21,9 @@ requests>=2.31.0
 # Durable conversation memory (Azure Table Storage)
 azure-data-tables>=12.5.0
 
+# Blob storage for caching uploaded/attachment bytes
+azure-storage-blob>=12.19.0
+
 # Secret management (Azure Key Vault)
 azure-keyvault-secrets>=4.8.0
 

@@ -14,14 +14,30 @@ import os
 logger = logging.getLogger(__name__)
 
 # Maps Key Vault secret names (hyphens only — KV doesn't allow underscores) to the
-# environment variable names the rest of the app expects.
+# environment variable names the rest of the app expects. config.py derives Graph
+# credentials from AZURE_CLIENT_ID/AZURE_CLIENT_SECRET first, so mapping
+# 'azure-client-secret' is enough to repoint Graph auth in deployed environments.
 SECRET_MAP = {
+    # Identity / Graph
+    "azure-client-secret": "AZURE_CLIENT_SECRET",
     "graph-client-secret": "GRAPH_CLIENT_SECRET",
+    "bot-app-password": "SECRET_BOT_PASSWORD",
+    # Azure OpenAI / AI Foundry
     "azure-openai-api-key": "AZURE_OPENAI_API_KEY",
+    # Azure AI Search
     "azure-search-admin-key": "AZURE_SEARCH_ADMIN_KEY",
     "azure-search-query-key": "AZURE_SEARCH_QUERY_KEY",
+    # Document Intelligence
+    "document-intelligence-key": "AZURE_DOCUMENT_INTELLIGENCE_KEY",
+    # Image generation
+    "flux-api-key": "FLUX_API_KEY",
+    "azure-dalle-api-key": "AZURE_DALLE_API_KEY",
+    # Storage
+    "azure-storage-account-key": "AZURE_STORAGE_ACCOUNT_KEY",
     "azure-storage-conn-string": "AZURE_STORAGE_CONNECTION_STRING",
-    "bot-app-password": "SECRET_BOT_PASSWORD",
+    # Database
+    "database-url": "DATABASE_URL",
+    "azure-sql-password": "AZURE_SQL_PASSWORD",
 }
 
 

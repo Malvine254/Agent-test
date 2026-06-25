@@ -27,7 +27,10 @@ def index_exists(index_name: str) -> bool:
 
 def build_sharepoint_index():
     from azure.search.documents.indexes.models import (
+        FreshnessScoringFunction,
+        FreshnessScoringParameters,
         HnswAlgorithmConfiguration,
+        ScoringProfile,
         SearchableField,
         SearchField,
         SearchFieldDataType,
@@ -37,6 +40,7 @@ def build_sharepoint_index():
         SemanticPrioritizedFields,
         SemanticSearch,
         SimpleField,
+        TextWeights,
         VectorSearch,
         VectorSearchProfile,
     )
@@ -86,7 +90,38 @@ def build_sharepoint_index():
             )
         ]
     )
-    return SearchIndex(name=Config.AZURE_SEARCH_INDEX_NAME, fields=fields, vector_search=vector_search, semantic_search=semantic)
+    # Scoring profile: weight title/file_name above body text and boost recently
+    # modified documents so newer content surfaces first (freshness ranking).
+    scoring_profiles = [
+        ScoringProfile(
+            name=Config.AZURE_SEARCH_SCORING_PROFILE,
+            text_weights=TextWeights(
+                weights={
+                    "title": 5.0,
+                    "file_name": 3.0,
+                    "folder_path": 1.5,
+                    "summary": 2.0,
+                    "content": 1.0,
+                }
+            ),
+            functions=[
+                FreshnessScoringFunction(
+                    field_name="last_modified",
+                    boost=2.0,
+                    parameters=FreshnessScoringParameters(boosting_duration="P365D"),
+                    interpolation="linear",
+                )
+            ],
+        )
+    ]
+    return SearchIndex(
+        name=Config.AZURE_SEARCH_INDEX_NAME,
+        fields=fields,
+        vector_search=vector_search,
+        semantic_search=semantic,
+        scoring_profiles=scoring_profiles,
+        default_scoring_profile=Config.AZURE_SEARCH_SCORING_PROFILE,
+    )
 
 
 def ensure_sharepoint_index(recreate: bool = False) -> None:

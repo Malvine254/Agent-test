@@ -71,9 +71,14 @@ class Config:
     BOT_APP_ID = APP_ID
     BOT_APP_PASSWORD = APP_PASSWORD
     TENANT_ID = APP_TENANTID
-    GRAPH_CLIENT_ID = os.environ.get("GRAPH_CLIENT_ID", APP_ID)
-    GRAPH_CLIENT_SECRET = os.environ.get("GRAPH_CLIENT_SECRET", APP_PASSWORD)
+    # Graph identity for app-only calls (indexing, mail, files, sites, calendar,
+    # meetings). Prefer the dedicated application registration (AZURE_CLIENT_ID) that
+    # holds the full set of application permissions; fall back to the legacy
+    # GRAPH_CLIENT_ID, then the bot app, so existing deployments keep working.
+    GRAPH_CLIENT_ID = os.environ.get("AZURE_CLIENT_ID") or os.environ.get("GRAPH_CLIENT_ID") or APP_ID
+    GRAPH_CLIENT_SECRET = os.environ.get("AZURE_CLIENT_SECRET") or os.environ.get("GRAPH_CLIENT_SECRET") or APP_PASSWORD
     GRAPH_TENANT_ID = os.environ.get("GRAPH_TENANT_ID", APP_TENANTID)
+    GRAPH_SCOPES = os.environ.get("GRAPH_SCOPES", "https://graph.microsoft.com/.default")
     SENDER_UPN = os.environ.get("SENDER_UPN", "")
     BOT_DOMAIN = os.environ.get("BOT_DOMAIN", "")
     BOT_ENDPOINT = os.environ.get("BOT_ENDPOINT", "")
@@ -87,8 +92,50 @@ class Config:
     AZURE_OPENAI_API_KEY = _require_env("AZURE_OPENAI_API_KEY")
     AZURE_OPENAI_MODEL_DEPLOYMENT_NAME = _require_env("AZURE_OPENAI_MODEL_DEPLOYMENT_NAME")
     AZURE_OPENAI_ENDPOINT = _require_env("AZURE_OPENAI_ENDPOINT")
+    AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
     AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small")
     EMBEDDING_DIMENSIONS = int(os.environ.get("EMBEDDING_DIMENSIONS", "1536"))
+
+    # === Azure Document Intelligence (primary text/OCR extractor) ===
+    # Server-side extraction (no local GIL pressure) with OCR for scanned/image PDFs
+    # and reliable table extraction. Local pypdf/python-docx remain as fallback.
+    AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = os.environ.get("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "")
+    AZURE_DOCUMENT_INTELLIGENCE_KEY = os.environ.get("AZURE_DOCUMENT_INTELLIGENCE_KEY", "")
+    DOCUMENT_INTELLIGENCE_MODEL = os.environ.get("DOCUMENT_INTELLIGENCE_MODEL", "prebuilt-read")
+    DOCUMENT_INTELLIGENCE_TIMEOUT = int(os.environ.get("DOCUMENT_INTELLIGENCE_TIMEOUT", "60"))
+    ENABLE_DOCUMENT_INTELLIGENCE = (
+        os.environ.get("ENABLE_DOCUMENT_INTELLIGENCE", "true").strip().lower() in ("1", "true", "yes")
+        and bool(AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT and AZURE_DOCUMENT_INTELLIGENCE_KEY)
+    )
+
+    # === Image generation (FLUX primary, DALL-E fallback) ===
+    FLUX_ENDPOINT = os.environ.get("FLUX_ENDPOINT", "")
+    FLUX_API_KEY = os.environ.get("FLUX_API_KEY", "")
+    FLUX_DEPLOYMENT = os.environ.get("FLUX_DEPLOYMENT", "FLUX.1-Kontext-pro")
+    FLUX_API_VERSION = os.environ.get("FLUX_API_VERSION", "2024-05-01-preview")
+    AZURE_DALLE_ENDPOINT = os.environ.get("AZURE_DALLE_ENDPOINT", "")
+    AZURE_DALLE_API_KEY = os.environ.get("AZURE_DALLE_API_KEY", "")
+    AZURE_DALLE_API_VERSION = os.environ.get("AZURE_DALLE_API_VERSION", "2024-04-01-preview")
+    AZURE_DALLE_DEPLOYMENT = os.environ.get("AZURE_DALLE_DEPLOYMENT", "dall-e-3")
+
+    # === Database (Azure SQL) ===
+    DATABASE_URL = os.environ.get("DATABASE_URL", "")
+    AZURE_SQL_SERVER = os.environ.get("AZURE_SQL_SERVER", "")
+    AZURE_SQL_DATABASE = os.environ.get("AZURE_SQL_DATABASE", "")
+    AZURE_SQL_USERNAME = os.environ.get("AZURE_SQL_USERNAME", "")
+    AZURE_SQL_PASSWORD = os.environ.get("AZURE_SQL_PASSWORD", "")
+
+    # === Azure Storage ===
+    AZURE_STORAGE_ACCOUNT_NAME = os.environ.get("AZURE_STORAGE_ACCOUNT_NAME", "")
+    AZURE_STORAGE_ACCOUNT_KEY = os.environ.get("AZURE_STORAGE_ACCOUNT_KEY", "")
+    AZURE_STORAGE_CONNECTION_STRING = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", "")
+    AZURE_STORAGE_CONTAINER_DOCUMENTS = os.environ.get("AZURE_STORAGE_CONTAINER_DOCUMENTS", "")
+    AZURE_STORAGE_CONTAINER_UPLOADS = os.environ.get("AZURE_STORAGE_CONTAINER_UPLOADS", "")
+    AZURE_STORAGE_CONTAINER_AGENT_MEMORY = os.environ.get("AZURE_STORAGE_CONTAINER_AGENT_MEMORY", "")
+
+    # === Organisation website (grounded web answering allowlist) ===
+    ORG_WEBSITE_ALLOWLIST = os.environ.get("ORG_WEBSITE_ALLOWLIST", "")
+    ORG_WEBSITE_CRAWL_DEPTH = int(os.environ.get("ORG_WEBSITE_CRAWL_DEPTH", "3"))
 
     # Azure AI Search is the primary retrieval layer for indexed SharePoint documents.
     AZURE_SEARCH_ENDPOINT = os.environ.get("AZURE_SEARCH_ENDPOINT", "")
@@ -97,6 +144,22 @@ class Config:
     AZURE_SEARCH_INDEX_NAME = os.environ.get("AZURE_SEARCH_INDEX_NAME", "sharepoint-documents")
     AZURE_SEARCH_API_VERSION = os.environ.get("AZURE_SEARCH_API_VERSION", "2025-09-01")
     AZURE_SEARCH_SEMANTIC_CONFIG = os.environ.get("AZURE_SEARCH_SEMANTIC_CONFIG", "default-semantic-config")
+    AZURE_SEARCH_SCORING_PROFILE = os.environ.get("AZURE_SEARCH_SCORING_PROFILE", "freshness-boost")
+    # === Retrieval precision (anti-hallucination) ===
+    # Smaller chunks = more precise retrieval and far less hallucination than the old
+    # 6000-char chunks (the model saw a fragment and invented the rest).
+    CHUNK_MAX_CHARS = int(os.environ.get("CHUNK_MAX_CHARS", "1500"))
+    CHUNK_OVERLAP_CHARS = int(os.environ.get("CHUNK_OVERLAP_CHARS", "300"))
+    # Minimum semantic reranker score (Azure scale 0-4) to accept a result. Results
+    # below this are treated as noise and dropped so the model never grounds on weak
+    # matches. Set to 0 to disable. Falls back to keyword search if all are filtered.
+    MIN_RERANKER_SCORE = float(os.environ.get("MIN_RERANKER_SCORE", "1.3"))
+    # Image generation provider order (first available wins).
+    IMAGE_PROVIDER_ORDER = [
+        p.strip().lower()
+        for p in os.environ.get("IMAGE_PROVIDER_ORDER", "flux,dalle").split(",")
+        if p.strip()
+    ]
     RECREATE_SEARCH_INDEX = os.environ.get("RECREATE_SEARCH_INDEX", "false").strip().lower() in ("1", "true", "yes")
     # One-shot: reprocess every SharePoint document on the next indexing run regardless
     # of checksum. Used to backfill ACLs after enabling security trimming. Turn off again

@@ -11,6 +11,13 @@ instead of trying to strip it we patch microsoft_teams.apps.App to inject
 This file is for local testing only; production/Teams runs use app.py.
 """
 import asyncio
+import logging
+
+# Make SDK errors visible — the SDK catches all exceptions and logs via its own
+# logger, but that logger has no handlers configured by default, so 500 errors
+# are completely silent. Route it to stderr so we can see what's failing.
+logging.basicConfig(level=logging.WARNING, format="%(name)s | %(levelname)s | %(message)s")
+logging.getLogger("microsoft_teams").setLevel(logging.DEBUG)
 
 # Patch App BEFORE importing app.py (which does `from microsoft_teams.apps import App`).
 import microsoft_teams.apps as _mta
@@ -27,6 +34,11 @@ class _NoAuthApp(_OrigApp):  # type: ignore[misc, valid-type]
 _mta.App = _NoAuthApp
 
 import app  # noqa: E402
+
+# app.py silences the microsoft_teams logger (CRITICAL). Re-enable ERROR+
+# so SDK exceptions are visible in local dev — we need to see the traceback.
+import logging as _logging
+_logging.getLogger("microsoft_teams").setLevel(_logging.ERROR)
 
 if __name__ == "__main__":
     print("[run_local_playground] JWT validation DISABLED (local emulator mode)")

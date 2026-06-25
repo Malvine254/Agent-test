@@ -106,6 +106,21 @@ except Exception as _interp_imp_err:  # pragma: no cover
     _INTERPRETER_AVAILABLE = False
     logging.getLogger(__name__).warning(f"Code interpreter unavailable: {_interp_imp_err}")
 
+# Live Microsoft 365 (Graph) + image-generation tools (always-on)
+try:
+    from agent.graph_tools import (
+        GraphToolContext,
+        build_graph_tools,
+        graph_tools_instructions,
+    )
+    _GRAPH_TOOLS_AVAILABLE = True
+except Exception as _graph_imp_err:  # pragma: no cover
+    GraphToolContext = None  # type: ignore
+    build_graph_tools = None  # type: ignore
+    graph_tools_instructions = None  # type: ignore
+    _GRAPH_TOOLS_AVAILABLE = False
+    logging.getLogger(__name__).warning(f"Graph tools unavailable: {_graph_imp_err}")
+
 
 from smart_router import (
     decide_route as smart_decide_route,
@@ -149,6 +164,9 @@ logging.getLogger("teams").setLevel(logging.CRITICAL)
 logging.getLogger("aiohttp").setLevel(logging.CRITICAL)
 logging.getLogger("botbuilder").setLevel(logging.CRITICAL)
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+# Enable INFO-level logs for our own sub-modules (indexer, embeddings, search)
+for _mod in ("search", "search.ai_search_worker", "search.ai_search_ingestion", "sharepoint"):
+    logging.getLogger(_mod).setLevel(logging.INFO)
 
 # Suppress noisy Bot Framework OAuth token lookups in logs
 class _SuppressTokenApiFilter(logging.Filter):
@@ -809,6 +827,64 @@ def validate_file_attachment(att) -> tuple[bool, str]:
     except Exception as e:
         logger.error(f"Error validating attachment: {e}")
         return False, f"âŒ Unable to validate file: {str(e)}"
+
+
+# ---------------------------
+# SharePoint/OneDrive link resolution
+# ---------------------------
+# Cloud-picker files (and pasted document links) frequently arrive as URLs in the
+# message text rather than as file attachments the bot can read. We detect those URLs
+# and resolve them to real, downloadable attachments via Microsoft Graph.
+_CLOUD_FILE_URL_RE = re.compile(r"https?://[^\s)>\]}\"']+", re.IGNORECASE)
+_CLOUD_FILE_HOST_RE = re.compile(
+    r"(sharepoint\.com|onedrive\.live\.com|1drv\.ms)", re.IGNORECASE
+)
+
+
+def _extract_cloud_file_urls(text: str) -> list[str]:
+    """Return de-duplicated SharePoint/OneDrive URLs found in free text."""
+    if not text:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _CLOUD_FILE_URL_RE.findall(text):
+        url = match.rstrip(".,);]}'\"")
+        if _CLOUD_FILE_HOST_RE.search(url) and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def _resolve_cloud_file_attachments(text: str) -> list:
+    """Resolve SharePoint/OneDrive URLs in the text into synthetic attachment objects.
+
+    Each returned object mimics a Teams file attachment (``.name``, ``.content_type``
+    and a ``.content`` dict with a pre-authenticated ``downloadUrl``) so the existing
+    attachment pipeline can download and extract it unchanged.
+    """
+    from types import SimpleNamespace
+
+    from sharepoint.graph_client import resolve_sharing_url
+
+    resolved: list = []
+    for url in _extract_cloud_file_urls(text):
+        try:
+            info = resolve_sharing_url(url)
+        except Exception as exc:
+            logger.info("Cloud URL resolve error for %s: %s", url[:80], type(exc).__name__)
+            info = None
+        if not info or not info.get("download_url"):
+            continue
+        name = info.get("name") or "shared-file"
+        resolved.append(
+            SimpleNamespace(
+                name=name,
+                content_type="application/vnd.microsoft.teams.file.download.info",
+                content={"downloadUrl": info["download_url"], "name": name},
+            )
+        )
+        logger.info("Resolved cloud file link into attachment: %s", name)
+    return resolved
 
 
 # ---------------------------
@@ -2432,6 +2508,23 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     
     attachments = [a for a in attachments_raw if is_file_attachment(a)]
     web_results = []  # Initialize to avoid NameError if search is skipped
+
+    # Resolve any SharePoint/OneDrive links pasted in the message into real
+    # attachments. Cloud-picker files are frequently NOT delivered to bots as file
+    # attachments, so without this the user's shared document would be invisible.
+    if user_text and _CLOUD_FILE_HOST_RE.search(user_text):
+        try:
+            cloud_atts = await asyncio.to_thread(
+                _resolve_cloud_file_attachments, user_text
+            )
+        except Exception as _cf_err:
+            cloud_atts = []
+            logger.debug(f"Cloud file URL resolution failed: {_cf_err}")
+        if cloud_atts:
+            attachments = attachments + cloud_atts
+            logger.info(
+                f"Added {len(cloud_atts)} resolved cloud file attachment(s) from message links"
+            )
 
     logger.info(
         f"User: '{user_text[:60]}...' | Attachments: {len(attachments)} (raw: {len(attachments_raw)})"
@@ -4884,8 +4977,12 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
         logger.info(f"âœ… Document results found - skipping {len(web_results)} web result(s) to prioritize document relevance")
     
     # For follow-up questions, reload previous sources into context
-    # so the LLM has the data it discussed previously
-    if not model_doc_items and action == "refine_previous":
+    # so the LLM has the data it discussed previously.
+    # CRITICAL: never reload old sources when a file was uploaded THIS turn —
+    # that was the root cause of the "public health messages" hallucination where
+    # ATTACHMENT ISOLATION cleared model_doc_items but this block re-added 3
+    # completely unrelated docs from a previous session.
+    if not model_doc_items and action == "refine_previous" and not attachments and not attachment_texts:
         _prev_source_docs = conversation_last_sources.get(conversation_id, [])
         if _prev_source_docs:
             logger.info(f"Follow-up: reloading {len(_prev_source_docs)} previous source(s) into context")
@@ -5062,12 +5159,42 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
         interpreter_turn = None
         interpreter_tools = None
 
-    chat_prompt = ChatPrompt(model, functions=interpreter_tools) if interpreter_tools else ChatPrompt(model)
+    # â”€â”€ LIVE MICROSOFT 365 (GRAPH) + IMAGE TOOLS (always-on) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # These act in the user's Microsoft 365 (mail/calendar/planner/files) and can
+    # generate images. They are exposed every turn; the model decides when to call.
+    graph_ctx = None
+    graph_tools = None
+    if _GRAPH_TOOLS_AVAILABLE:
+        try:
+            _sender = getattr(ctx.activity, "from_", None)
+            _graph_user_id = (
+                getattr(_sender, "aad_object_id", None)
+                or getattr(_sender, "aadObjectId", None)
+                or getattr(_sender, "id", None)
+                or ""
+            )
+            if _graph_user_id:
+                graph_ctx = GraphToolContext(
+                    user_id=str(_graph_user_id),
+                    conversation_id=conversation_id,
+                    display_name=getattr(_sender, "name", "") or "",
+                )
+                graph_tools = build_graph_tools(graph_ctx)
+                logger.info(f"ðŸŒ Microsoft 365 tools ENABLED for this turn (tools={len(graph_tools)})")
+            else:
+                logger.info("Microsoft 365 tools skipped: no user object id on activity")
+        except Exception as _graph_err:
+            logger.warning(f"Failed to enable Microsoft 365 tools: {_graph_err}")
+            graph_ctx = None
+            graph_tools = None
+
+    _combined_tools = list(interpreter_tools or []) + list(graph_tools or [])
+    chat_prompt = ChatPrompt(model, functions=_combined_tools) if _combined_tools else ChatPrompt(model)
 
     # When the interpreter is active, tell the model how/when to use it.
     _effective_instructions = BASE_INSTRUCTIONS
     if interpreter_tools:
-        _effective_instructions = (BASE_INSTRUCTIONS or "") + (
+        _effective_instructions = (_effective_instructions or "") + (
             "\n\n## CODE INTERPRETER\n"
             "You have a `run_python` tool that executes Python in a secure sandbox "
             "(pandas, numpy, openpyxl, matplotlib, python-docx, python-pptx, reportlab, "
@@ -5082,29 +5209,51 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
             "Generated files are delivered to the user automatically — do NOT fabricate "
             "download links or claim a file exists unless run_python actually created it."
         )
+    if graph_tools:
+        try:
+            _now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            _now_iso = ""
+        _effective_instructions = (_effective_instructions or "") + graph_tools_instructions(_now_iso)
 
     _artifacts_delivered = {"done": False}
 
+    def _collect_turn_artifacts():
+        arts = []
+        if interpreter_turn and interpreter_turn.artifacts:
+            arts.extend(interpreter_turn.artifacts)
+        if graph_ctx and graph_ctx.artifacts:
+            arts.extend(graph_ctx.artifacts)
+        return arts
+
     async def deliver_interpreter_artifacts():
-        """Send any files produced by run_python this turn as download links."""
+        """Send files produced this turn (run_python docs, generated images) to the user."""
         if _artifacts_delivered["done"]:
             return
         _artifacts_delivered["done"] = True
-        if not interpreter_turn or not interpreter_turn.artifacts:
+        artifacts = _collect_turn_artifacts()
+        if not artifacts:
             return
         try:
+            _img_exts = (".png", ".jpg", ".jpeg", ".gif", ".webp")
             lines = ["**Generated file(s):**", ""]
-            for art in interpreter_turn.artifacts:
+            for art in artifacts:
                 size_kb = max(1, art.size // 1024)
                 url = art.url
+                is_image = art.filename.lower().endswith(_img_exts)
                 if url.startswith("http"):
-                    lines.append(f"- [{art.filename}]({url}) ({size_kb} KB)")
+                    if is_image:
+                        # Render inline; Teams shows image URLs in markdown.
+                        lines.append(f"![{art.filename}]({url})")
+                        lines.append(f"- [{art.filename}]({url}) ({size_kb} KB)")
+                    else:
+                        lines.append(f"- [{art.filename}]({url}) ({size_kb} KB)")
                 else:
                     # No absolute base URL configured; show filename only.
                     lines.append(f"- {art.filename} ({size_kb} KB)")
             msg = "\n".join(lines)
             await ctx.send(MessageActivityInput(text=msg).add_ai_generated())
-            logger.info(f"ðŸ“Ž Delivered {len(interpreter_turn.artifacts)} artifact link(s)")
+            logger.info(f"ðŸ“Ž Delivered {len(artifacts)} artifact(s)")
         except Exception as _deliver_err:
             logger.warning(f"Failed to deliver interpreter artifacts: {_deliver_err}")
 
@@ -5222,11 +5371,31 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
         # CRITICAL: Guard against empty responses
         full_response_text = "".join(full_response_chunks).strip()
         if not full_response_text or full_response_text == "":
-            logger.error("ðŸš¨ CRITICAL: LLM returned empty response - sending fallback message")
-            empty_msg = "I encountered an issue generating a response. Please try again."
-            await ctx.send(MessageActivityInput(text=empty_msg).add_ai_generated())
-            await typing_mgr.stop_refresh()
-            return
+            # SDK bug: generate_text() recurses for tool-call continuations but
+            # does NOT pass on_chunk, so streaming never fires for the final response
+            # after a function call.  The answer IS in chat_result.response.content.
+            _fallback_text = ""
+            try:
+                _fallback_text = (
+                    (chat_result.response.content or "").strip()
+                    if chat_result and getattr(chat_result, "response", None)
+                    else ""
+                )
+            except Exception:
+                pass
+            if _fallback_text:
+                logger.info(
+                    f"📌 Recovered tool-call response from chat_result "
+                    f"({len(_fallback_text)} chars) — SDK on_chunk not called for continuation"
+                )
+                full_response_text = _fallback_text
+                full_response_chunks.append(_fallback_text)
+            else:
+                logger.error("ðŸš¨ CRITICAL: LLM returned empty response - sending fallback message")
+                empty_msg = "I encountered an issue generating a response. Please try again."
+                await ctx.send(MessageActivityInput(text=empty_msg).add_ai_generated())
+                await typing_mgr.stop_refresh()
+                return
         
         def _source_citation(idx: int, source: dict) -> str:
             url = (source.get("url") or "").strip()
