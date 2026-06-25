@@ -180,6 +180,44 @@ def _is_sharepoint_url(url: str) -> bool:
     return "sharepoint.com" in url_lower or "onedrive.com" in url_lower
 
 
+def _download_cloud_bytes_via_graph(url: str, display_name: str, prefix: str = "") -> Optional[bytes]:
+    """Download a SharePoint/OneDrive file's raw bytes using the app-only Graph token.
+
+    Resolves the sharing/item URL to a driveItem, then downloads via the
+    pre-authenticated downloadUrl or the /content endpoint. This fixes the common
+    case where a Teams upload lands in OneDrive and the bot only receives a link
+    (no pre-auth downloadUrl). Returns the bytes, or None if it can't be resolved
+    (caller falls back to the legacy text-only path).
+    """
+    try:
+        from sharepoint.graph_client import resolve_sharing_url, download_file_bytes
+    except Exception as e:
+        logger.info(f"{prefix}Graph client unavailable for cloud download: {e}")
+        return None
+    try:
+        info = resolve_sharing_url(url)
+        if not info:
+            logger.info(f"{prefix}Could not resolve cloud URL to a drive item")
+            return None
+        dl = info.get("download_url")
+        if dl:
+            import requests
+            resp = requests.get(dl, timeout=30, allow_redirects=True)
+            if resp.status_code == 200 and resp.content:
+                logger.info(f"{prefix}Downloaded {len(resp.content)} bytes via resolved downloadUrl")
+                return resp.content
+        drive_id = info.get("drive_id")
+        item_id = info.get("item_id")
+        if drive_id and item_id:
+            data = download_file_bytes(drive_id, item_id)
+            if data:
+                logger.info(f"{prefix}Downloaded {len(data)} bytes via Graph /content")
+                return data
+    except Exception as e:
+        logger.warning(f"{prefix}App-only Graph download failed for {display_name}: {e}")
+    return None
+
+
 def _analyze_csv_content(csv_text: str, display_name: str) -> str:
     """
     Analyze CSV content intelligently:
@@ -492,8 +530,28 @@ def process_attachment(attachment, corr_id: Optional[str] = None, user_id: Optio
 
 The attachment payload did not include a usable download URL, which typically indicates a timing issue with mobile uploads."""
         
-        # If SharePoint/OneDrive URL and no pre-auth downloadUrl, use robust Graph download+extract
+        # If SharePoint/OneDrive URL and no pre-auth downloadUrl, download the real bytes
+        # via the app-only Graph token, cache them to blob storage, capture them for the
+        # code interpreter, and extract locally. This fixes Teams uploads that land in
+        # OneDrive where only a link (no pre-auth downloadUrl) reaches the bot.
         if _is_sharepoint_url(url_to_use) and not download_url:
+            graph_bytes = _download_cloud_bytes_via_graph(url_to_use, display_name, prefix)
+            if graph_bytes is not None:
+                content = graph_bytes
+                if raw_sink is not None:
+                    try:
+                        if len(content) <= 25 * 1024 * 1024:
+                            raw_sink[display_name] = content
+                    except Exception:
+                        pass
+                try:
+                    from storage import blob_store
+                    blob_store.upload_bytes(content, user_id or "shared", display_name)
+                except Exception as _blob_err:
+                    logger.debug(f"{prefix}Blob cache skipped: {_blob_err}")
+                extracted = _extract_content(display_name, content)
+                return extracted if extracted else f"📎 {display_name}"
+            # Fall back to the legacy shares/path text extraction
             try:
                 from knowledge_base import get_graph_token, download_and_extract_content
                 token = get_graph_token()
@@ -506,6 +564,29 @@ The attachment payload did not include a usable download URL, which typically in
                 logger.error(f"{prefix}Graph download/extract error: {e}", exc_info=True)
                 return f"❌ Error downloading {display_name} via Graph: {str(e)}"
         
+        # Handle data: URIs (inline content — used in testing/emulator and some clients)
+        if url_to_use.startswith("data:"):
+            try:
+                # Format: data:<mime>[;base64],<data>
+                header, raw_data = url_to_use.split(",", 1)
+                if ";base64" in header:
+                    content = base64.b64decode(raw_data)
+                else:
+                    # URL-encoded text
+                    from urllib.parse import unquote
+                    content = unquote(raw_data).encode("utf-8")
+                logger.info(f"{prefix}Decoded data URI inline ({len(content)} bytes)")
+                if raw_sink is not None:
+                    try:
+                        raw_sink[display_name] = content
+                    except Exception:
+                        pass
+                extracted = _extract_content(display_name, content)
+                return extracted if extracted else f"📎 {display_name}"
+            except Exception as e:
+                logger.warning(f"{prefix}Failed to decode data URI: {e}")
+                return f"❌ Could not decode inline data for {display_name}: {e}"
+
         # Otherwise direct download and local extraction
         logger.info(f"{prefix}Downloading from: {url_to_use[:120]}...")
         import requests
@@ -665,7 +746,26 @@ def _extract_content(display_name: str, content: bytes) -> str:
     - Adds clear indication when content is truncated
     """
     file_name = display_name.lower()
-    
+
+    # Document Intelligence (server-side OCR + tables) is the primary extractor for
+    # PDFs — it reads scanned/image PDFs that local pypdf returns empty for. Falls
+    # through to local pypdf extraction when DI is disabled or yields nothing.
+    if file_name.endswith(".pdf") and getattr(Config, "ENABLE_DOCUMENT_INTELLIGENCE", False):
+        try:
+            from sharepoint.sharepoint_reader import _extract_with_document_intelligence
+            di_text = _extract_with_document_intelligence(content, display_name)
+            if di_text and di_text.strip():
+                summary = (
+                    f"📄 **PDF Document**: {display_name} "
+                    f"(extracted via Document Intelligence)\n\n{di_text}"
+                )
+                return _smart_truncate(summary, "PDF")
+        except Exception as _di_err:
+            logger.info(
+                f"Document Intelligence unavailable for {display_name}, "
+                f"using local extraction: {_di_err}"
+            )
+
     # PDF with extensive analysis
     if file_name.endswith(".pdf"):
         if pypdf is None:
@@ -984,7 +1084,7 @@ def _extract_content(display_name: str, content: bytes) -> str:
             return f"📽️ PowerPoint: {display_name}\n\n(Error: {error_msg[:200]})"
     
     # Text files - simple extraction
-    if file_name.endswith((".txt", ".md", ".json", ".xml", ".csv", ".log")):
+    if file_name.endswith((".txt", ".md", ".json", ".xml", ".csv", ".log", ".yaml", ".yml", ".tsv")):
         try:
             text = content.decode("utf-8", errors="ignore").strip()
             
@@ -1016,7 +1116,22 @@ def _extract_content(display_name: str, content: bytes) -> str:
                 label = "XML Data"
                 summary = f"📄 **{label}**: {display_name} | **Size:** {len(text):,} chars\n\n{text}"
                 return _smart_truncate(summary, "XML")
-            
+
+            # YAML / YML
+            elif file_name.endswith((".yaml", ".yml")):
+                summary = f"📄 **YAML Data**: {display_name}\n\n{text}"
+                return _smart_truncate(summary, "YAML")
+
+            # TSV - tab-separated values
+            elif file_name.endswith(".tsv"):
+                try:
+                    rows = list(csv.reader(io.StringIO(text), delimiter="\t"))
+                    tsv_text = "\n".join("\t".join(row) for row in rows)
+                    summary = f"📊 **TSV File**: {display_name} | **Rows:** {len(rows):,}\n\n{tsv_text}"
+                    return _smart_truncate(summary, "TSV")
+                except Exception:
+                    pass  # fall through to plain text
+
             # Default text file
             label = "Text File"
             summary = f"📄 **{label}**: {display_name}\n\n{text}"
@@ -1024,14 +1139,14 @@ def _extract_content(display_name: str, content: bytes) -> str:
         except Exception as e:
             return f"📄 Text: {display_name}\n\n(Error: {str(e)})"
     
-    # Images
-    if file_name.endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp")):
+    # Images (including TIFF and WEBP)
+    if file_name.endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif", ".webp")):
         if Image is None:
             return f"🖼️ Image: {display_name}\n\n(Install pillow to inspect image.)"
         try:
             img = Image.open(io.BytesIO(content))
             img_info = f"🖼️ **Image**: {display_name} ({img.width}x{img.height}px, {img.format})"
-            
+
             # Analyze image using Azure OpenAI vision
             analysis = _analyze_image_vision(content, display_name)
             if analysis:
@@ -1039,6 +1154,71 @@ def _extract_content(display_name: str, content: bytes) -> str:
             return img_info
         except Exception as e:
             return f"🖼️ Image: {display_name}\n\n(Error: {str(e)})"
+
+    # HTML / HTM — strip tags with stdlib html.parser (no external dep)
+    if file_name.endswith((".html", ".htm")):
+        try:
+            from html.parser import HTMLParser
+
+            class _HTMLTextExtractor(HTMLParser):
+                _SKIP = frozenset({"script", "style", "head"})
+                _NL = frozenset({"p", "br", "div", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "li"})
+
+                def __init__(self):
+                    super().__init__()
+                    self._buf: list[str] = []
+                    self._depth = 0
+
+                def handle_starttag(self, tag, attrs):
+                    if tag.lower() in self._SKIP:
+                        self._depth += 1
+                    elif tag.lower() in self._NL:
+                        self._buf.append("\n")
+
+                def handle_endtag(self, tag):
+                    if tag.lower() in self._SKIP:
+                        self._depth = max(0, self._depth - 1)
+
+                def handle_data(self, data):
+                    if not self._depth:
+                        self._buf.append(data)
+
+                def get_text(self):
+                    cleaned = re.sub(r"\n{3,}", "\n\n", "".join(self._buf)).strip()
+                    return cleaned
+
+            raw = content.decode("utf-8", errors="ignore")
+            parser = _HTMLTextExtractor()
+            parser.feed(raw)
+            text = parser.get_text()
+            summary = f"🌐 **HTML Document**: {display_name}\n\n{text}"
+            return _smart_truncate(summary, "HTML")
+        except Exception as e:
+            return f"🌐 HTML: {display_name}\n\n(Error: {str(e)})"
+
+    # RTF — regex-based control-word stripping (no external library needed)
+    if file_name.endswith(".rtf"):
+        try:
+            raw = content.decode("latin-1", errors="ignore")
+            # Remove RTF groups, control words, and symbols
+            text = re.sub(r"\\[a-z]+\-?\d*\s?", " ", raw)
+            text = re.sub(r"\\.", " ", text)
+            text = re.sub(r"[{}]", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            summary = f"📄 **RTF Document**: {display_name}\n\n{text}"
+            return _smart_truncate(summary, "RTF")
+        except Exception as e:
+            return f"📄 RTF: {display_name}\n\n(Error: {str(e)})"
+
+    # Unknown / unsupported — return a helpful notice so the user knows what happened
+    return (
+        f"📎 **File**: {display_name}\n\n"
+        f"⚠️ No text extractor available for this file type.\n"
+        f"File size: {len(content):,} bytes.\n"
+        f"Supported types: PDF, Word (.doc/.docx), Excel (.xls/.xlsx), "
+        f"PowerPoint (.ppt/.pptx), CSV, TSV, TXT, MD, JSON, XML, YAML, HTML, RTF, images "
+        f"(PNG/JPG/TIFF/WEBP/BMP/GIF)."
+    )
 
 
 def _analyze_image_vision(image_bytes: bytes, display_name: str) -> str:
@@ -1067,6 +1247,10 @@ def _analyze_image_vision(image_bytes: bytes, display_name: str) -> str:
             media_type = "image/gif"
         elif file_name_lower.endswith(".bmp"):
             media_type = "image/bmp"
+        elif file_name_lower.endswith((".tiff", ".tif")):
+            media_type = "image/tiff"
+        elif file_name_lower.endswith(".webp"):
+            media_type = "image/webp"
         else:  # .jpg, .jpeg, or default
             media_type = "image/jpeg"
         
