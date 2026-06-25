@@ -55,6 +55,7 @@ devTools/*.log
 # Runtime logs (never commit — can contain PII/tokens in stack traces)
 *.log
 *.log.*
+*.err
 
 # Teams Toolkit generated build artifacts
 build/
