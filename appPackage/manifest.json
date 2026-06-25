@@ -1,25 +1,25 @@
 {
     "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.24/MicrosoftTeams.schema.json",
     "manifestVersion": "1.24",
-    "version": "1.0.6",
+    "version": "1.1.0",
     "id": "${{TEAMS_APP_ID}}",
     "developer": {
-        "name": "Martin Muchuki",
-        "websiteUrl": "https://swopehealth.com",
-        "privacyUrl": "https://swopehealth.com/privacy",
-        "termsOfUseUrl": "https://swopehealth.com/terms"
+        "name": "Armely",
+        "websiteUrl": "https://dynamocapital.com/",
+        "privacyUrl": "https://dynamocapital.com/privacy",
+        "termsOfUseUrl": "https://dynamocapital.com/terms"
     },
     "icons": {
         "color": "color.png",
         "outline": "outline.png"
     },
     "name": {
-        "short": "Armely AI",
-        "full": "Armely AI"
+        "short": "Dynamo Capital assistant",
+        "full": "Dynamo Capital assistant"
     },
     "description": {
-        "short": "Armely AI - Your AI-powered assistant",
-        "full": "Armely AI is an advanced AI-powered assistant designed for internal team collaboration and productivity. Analyze documents, search SharePoint content through Azure AI Search, and get intelligent responses. Supports file uploads up to 20MB including PDF, Word, Excel, PowerPoint, and more."
+        "short": "Dynamo Capital assistant - Your AI-powered assistant",
+        "full": "Dynamo Capital assistant is an advanced AI-powered assistant designed for internal team collaboration and productivity. Analyze documents, search SharePoint content through Azure AI Search, and get intelligent responses. Supports file uploads up to 20MB including PDF, Word, Excel, PowerPoint, and more."
     },
     "accentColor": "#FFFFFF",
     "bots": [
@@ -40,7 +40,7 @@
                     "commands": [
                         {
                             "title": "How can you help me?",
-                            "description": "Learn about Armely AI's capabilities and features"
+                            "description": "Learn about Dynamo capital AI's capabilities and features"
                         },
                         {
                             "title": "Search documents",
