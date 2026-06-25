@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import logging
 import re
 import time
@@ -93,6 +94,103 @@ def download_file_bytes(drive_id: str, item_id: str) -> bytes:
     response = requests.get(url, headers={"Authorization": f"Bearer {get_graph_access_token()}"}, timeout=Config.GRAPH_TIMEOUT)
     response.raise_for_status()
     return response.content
+
+
+def _encode_sharing_url(url: str) -> str:
+    """Encode a sharing URL into the Graph /shares share-id format ('u!...')."""
+    b64 = base64.urlsafe_b64encode(url.strip().encode("utf-8")).decode("utf-8")
+    return "u!" + b64.rstrip("=")
+
+
+def resolve_sharing_url(url: str) -> dict | None:
+    """Resolve a SharePoint/OneDrive sharing or item URL to its driveItem.
+
+    Uses the Graph /shares/{share-id}/driveItem endpoint with the app-only token, so
+    it works for any file the indexing app registration can access. Returns a dict with
+    ``name``, ``download_url`` (pre-authenticated, no auth header required), ``drive_id``
+    and ``item_id`` — or None if the URL can't be resolved (e.g. the app lacks access).
+    """
+    if not url:
+        return None
+    try:
+        share_id = _encode_sharing_url(url)
+        item = graph_get(f"/shares/{share_id}/driveItem")
+    except Exception as exc:
+        logger.info("Could not resolve sharing URL %s: %s", url[:80], type(exc).__name__)
+        return None
+    if not isinstance(item, dict) or "file" not in item:
+        return None  # folders / non-file items are not attachments
+    return {
+        "name": item.get("name") or "",
+        "download_url": item.get("@microsoft.graph.downloadUrl") or "",
+        "drive_id": (item.get("parentReference") or {}).get("driveId") or "",
+        "item_id": item.get("id") or "",
+        "web_url": item.get("webUrl") or url,
+    }
+
+
+def search_drive_items(drive_id: str, query: str, *, top: int = 5) -> list[dict]:
+    """Search a single drive for items matching a filename/term via Graph search.
+
+    Used as a targeted, document-specific fallback when the AI Search index has no
+    match for a named file. Returns raw driveItem dicts (with site_id/drive_id set).
+    """
+    if not drive_id or not query.strip():
+        return []
+    safe = query.replace("'", "''")
+    try:
+        data = graph_get(f"/drives/{drive_id}/root/search(q='{safe}')?$top={int(top)}")
+    except Exception as exc:
+        logger.info("Drive search failed on %s for %r: %s", drive_id, query[:60], type(exc).__name__)
+        return []
+    items = []
+    for item in data.get("value", []):
+        if "file" in item:
+            item["drive_id"] = drive_id
+            items.append(item)
+    return items
+
+
+def list_drive_delta(site_id: str, drive_id: str, delta_link: str | None = None) -> dict:
+    """Walk the drive delta feed for incremental indexing.
+
+    With no delta_link this returns the full drive contents and establishes a token;
+    with one it returns only items changed or deleted since the last run. The returned
+    delta_link MUST be persisted (storage.delta_state) and passed back next run.
+
+    Returns ``{"files": [...changed files...], "deleted_ids": [...item ids...],
+    "delta_link": "<next token url>"}``. Deleted items carry only their id (Graph's
+    ``deleted`` facet); folders are ignored for indexing but their deletions are still
+    surfaced so any indexed children can be cleaned up by document_id.
+    """
+    files: list[dict] = []
+    deleted_ids: list[str] = []
+    next_delta: str | None = None
+    url = delta_link or f"/drives/{drive_id}/root/delta?$top=200"
+    while url:
+        data = graph_get(url)
+        for item in data.get("value", []):
+            item_id = item.get("id")
+            if item.get("deleted") is not None:
+                if item_id:
+                    deleted_ids.append(item_id)
+                continue
+            if "file" in item:
+                item["site_id"] = site_id
+                item["drive_id"] = drive_id
+                files.append(item)
+        next_link = data.get("@odata.nextLink")
+        if next_link:
+            url = next_link
+            continue
+        next_delta = data.get("@odata.deltaLink")
+        url = None
+    logger.info(
+        "Drive delta walked | drive=%s | changed_files=%s | deleted=%s | initial=%s",
+        drive_id, len(files), len(deleted_ids), delta_link is None,
+    )
+    return {"files": files, "deleted_ids": deleted_ids, "delta_link": next_delta}
+
 
 
 # ---------------------------------------------------------------------------
