@@ -62,6 +62,7 @@ from microsoft_teams.api import (
 from config import Config
 # Simple file handler for direct uploads
 from simple_file_handler import process_attachment, search_local_files, aggregate_tabular_files
+import attachment_resolver  # Graph-based recovery of attachments Teams doesn't deliver inline
 # Data calculator for accurate numeric operations (overcomes LLM arithmetic limitations)
 from data_calculator import process_calculation_request, detect_calculation_intent, process_multi_file_calculation
 # Graph API for SharePoint search and optional Microsoft 365 sources
@@ -1457,7 +1458,9 @@ def is_small_talk(text: str) -> bool:
 
     small_talk_exact = {
         "hi", "hello", "hey", "yo", "sup", "hola",
-        "good morning", "good afternoon", "good evening",
+        "howdy", "hiya", "heya", "hey there", "hello there", "hi there",
+        "good morning", "good afternoon", "good evening", "good day",
+        "morning", "afternoon", "evening",
         "gm", "bye", "goodbye", "see ya", "later",
         "thanks", "thank you", "thanks a lot", "appreciate it",
         "ok", "okay", "k", "yes", "no", "sure", "got it", "understood",
@@ -1475,6 +1478,12 @@ def is_small_talk(text: str) -> bool:
         "hows it going",
         "what's up",
         "whats up",
+        "wassup",
+        "whatsup",
+        "what's good",
+        "whats good",
+        "how do you do",
+        "nice to meet you",
         "thank you for",
         "thanks for",
         "i appreciate you",
@@ -1518,7 +1527,7 @@ def small_talk_response(text: str) -> str:
     normalized = re.sub(r"[^a-z0-9' ]+", "", (text or "").strip().lower())
     normalized = " ".join(normalized.split())
 
-    if normalized in {"hi", "hello", "hey", "yo", "sup", "hola", "good morning", "good afternoon", "good evening", "gm"}:
+    if normalized in {"hi", "hello", "hey", "yo", "sup", "hola", "howdy", "hiya", "heya", "hey there", "hello there", "hi there", "good morning", "good afternoon", "good evening", "good day", "morning", "afternoon", "evening", "gm"} or "how are you" in normalized or "how's it going" in normalized or "hows it going" in normalized:
         return "Hi! How can I help you today?"
     if normalized in {"thanks", "thank you", "thanks a lot", "appreciate it", "thank you for", "thanks for"} or normalized.startswith(("thanks for", "thank you for")):
         return "You're welcome. What would you like to work on next?"
@@ -2139,6 +2148,38 @@ async def send_typing_indicator(ctx: ActivityContext[MessageActivity], status: s
         else:
             logger.warning(f"Failed to send typing indicator: {e}")
 
+async def deliver_final(
+    ctx: ActivityContext[MessageActivity],
+    text: str,
+    *,
+    is_group: bool = False,
+    ai_generated: bool = True,
+) -> None:
+    """Deliver the assistant's FINAL message for a turn and finalize any open stream.
+
+    In personal chats the bot shows progress via ``ctx.stream.update`` ("Working
+    on it..."), which opens an *informative* stream. Teams keeps that status
+    animating (with a Stop button) until a final stream message carrying text is
+    sent — the SDK auto-closes the stream when the handler returns, but
+    ``stream.close()`` is a no-op when no text was ever emitted. So answering an
+    early-return path with a separate ``ctx.send`` bubble leaves the status stuck
+    and Teams eventually renders "This response was stopped".
+
+    Emitting the answer THROUGH the stream lets the SDK replace the status in
+    place and close cleanly. Group chats (which cannot stream) and any stream
+    failure fall back to a normal message."""
+    msg = MessageActivityInput(text=text)
+    if ai_generated:
+        msg = msg.add_ai_generated()
+    stream = getattr(ctx, "stream", None)
+    if stream is not None and not is_group:
+        try:
+            stream.emit(msg)
+            return
+        except Exception as e:
+            logger.debug(f"deliver_final: stream.emit failed, falling back to ctx.send: {e}")
+    await ctx.send(msg)
+
 async def send_typing_with_status(ctx: ActivityContext[MessageActivity], status: str) -> Optional[str]:
     """Send typing indicator with a brief status message for long operations.
     Returns the activity ID of the status message so it can be deleted later."""
@@ -2567,10 +2608,7 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     # These are not document questions, so do not route, search, or inject previous sources.
     if user_text and not attachments and is_small_talk(user_text):
         logger.info(f"ðŸ’¬ Small-talk bypass: '{user_text[:60]}'")
-        await send_typing_indicator(ctx)
-        await ctx.send(
-            MessageActivityInput(text=small_talk_response(user_text)).add_ai_generated()
-        )
+        await deliver_final(ctx, small_talk_response(user_text), is_group=is_group)
         return
 
     # Send typing indicator IMMEDIATELY to show the bot is processing
@@ -2625,6 +2663,47 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
     except Exception:
         pass
 
+    # ── ATTACHMENT RECOVERY ────────────────────────────────────────────────
+    # Teams often does NOT deliver OneDrive/SharePoint "cloud" files to bots
+    # inline (especially in 1:1 chats — only the typed text arrives). Before we
+    # give up, try every other channel to recover the file via Microsoft Graph:
+    # links in the text/attachment body, the real group/channel message, or a
+    # file the user named. Recovered files become normal attachments so the rest
+    # of the pipeline (download → Document Intelligence/pypdf → answer) is
+    # unchanged. Only runs when the user seems to want a document but none
+    # arrived — so plain chat never pays for a Graph call.
+    if (
+        not attachments
+        and (refers_to_attached_document(user_text) or attachment_resolver.extract_filename_query(user_text))
+    ):
+        try:
+            _chatter_id = (
+                getattr(ctx.activity.from_, "aad_object_id", None)
+                or getattr(ctx.activity.from_, "aadObjectId", None)
+                or ""
+            )
+            recovered = await asyncio.wait_for(
+                asyncio.to_thread(
+                    attachment_resolver.resolve_extra_attachments,
+                    user_text=user_text or "",
+                    attachments_raw=attachments_raw,
+                    conversation_id=conversation_id,
+                    is_group=is_group,
+                    chatter_aad_id=str(_chatter_id),
+                    message_id=str(getattr(ctx.activity, "id", "") or ""),
+                ),
+                timeout=20,
+            )
+        except Exception as _rec_err:
+            recovered = []
+            logger.info(f"Attachment recovery skipped/failed: {_rec_err}")
+        if recovered:
+            attachments = attachments + recovered
+            logger.info(
+                f"✅ Recovered {len(recovered)} attachment(s) via Graph fallback: "
+                f"{[getattr(a, 'name', '?') for a in recovered]}"
+            )
+
     # ── ANTI-HALLUCINATION GUARD ───────────────────────────────────────────
     # If the user refers to a document they just attached ("summarize this
     # document") but no file actually reached the bot this turn (a OneDrive/
@@ -2665,17 +2744,18 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
             )
         else:
             _msg = (
-                "I can see you wanted me to work with a document, but no file reached "
-                "me — so I won't guess at its contents.\n\n"
-                "This usually happens when a file is attached **from OneDrive/"
-                "SharePoint as a cloud link**, which Teams doesn't always pass to me.\n\n"
-                "**Please try one of these:**\n"
-                "1️⃣ Use the **paperclip** and choose **Upload from this device** "
-                "(this attaches the actual file, not a link)\n"
-                "2️⃣ Or **download the file first**, then upload it directly here\n"
-                "3️⃣ Then resend your request (e.g. \"summarize this document\")"
+                "I can see you wanted me to work with a document, but Teams didn't "
+                "pass the file to me — so I won't guess at its contents.\n\n"
+                "This happens in 1:1 chats when a file is attached **from OneDrive/"
+                "SharePoint as a cloud link**, which Teams doesn't deliver to bots.\n\n"
+                "**Any of these will work:**\n"
+                "1️⃣ **Tell me the file name** (e.g. \"summarize Edgar Offer "
+                "Letter\") — I'll find it in your OneDrive or our SharePoint and read it.\n"
+                "2️⃣ Use the **paperclip → Upload from this device** so the actual "
+                "file is sent.\n"
+                "3️⃣ Or **paste the file's link** in your message."
             )
-        await ctx.send(MessageActivityInput(text=_msg).add_ai_generated())
+        await deliver_final(ctx, _msg, is_group=is_group)
         return
 
     # Add simple conversation reset functionality
@@ -5049,7 +5129,8 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
             attachment_texts,
         )
         if not guard.allowed:
-            await ctx.send(MessageActivityInput(text=guard.response).add_ai_generated())
+            await typing_mgr.stop_refresh()
+            await deliver_final(ctx, guard.response, is_group=is_group)
             return
     except Exception:
         pass
@@ -5130,7 +5211,8 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
 
             if calculation_result:
                 logger.info("Deterministic calculation response generated before LLM")
-                await ctx.send(MessageActivityInput(text=calculation_result).add_ai_generated())
+                await typing_mgr.stop_refresh()
+                await deliver_final(ctx, calculation_result, is_group=is_group)
                 return
     except Exception as calc_err:
         logger.warning(f"Deterministic calculation interceptor failed; falling back to LLM: {calc_err}")
@@ -5393,8 +5475,8 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
             else:
                 logger.error("ðŸš¨ CRITICAL: LLM returned empty response - sending fallback message")
                 empty_msg = "I encountered an issue generating a response. Please try again."
-                await ctx.send(MessageActivityInput(text=empty_msg).add_ai_generated())
                 await typing_mgr.stop_refresh()
+                await deliver_final(ctx, empty_msg, is_group=is_group)
                 return
         
         def _source_citation(idx: int, source: dict) -> str:
@@ -5518,8 +5600,11 @@ async def _handle_stateful_conversation_inner(model: AIModel, ctx: ActivityConte
                 # CRITICAL: Even if chunk_buffer is empty, we MUST send the response
                 # This handles cases where streaming didn't emit or LLM didn't chunk response
                 try:
-                    logger.info(f"ðŸ“¤ No buffered chunks, sending complete response ({len(full_response_text)} chars) as regular message")
-                    await ctx.send(MessageActivityInput(text=full_response_text).add_ai_generated())
+                    logger.info(f"ðŸ“¤ No buffered chunks, streaming complete response ({len(full_response_text)} chars)")
+                    # Emit through the stream (not a separate ctx.send) so the
+                    # "Working on it..." informative status is finalized in place
+                    # instead of being left dangling.
+                    await deliver_final(ctx, full_response_text, is_group=False)
                     logger.info(f"âœ… Complete response sent successfully")
                 except Exception as send_error:
                     logger.error(f"âŒ FATAL: Failed to send response: {send_error}")
