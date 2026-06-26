@@ -57,6 +57,117 @@ param graphClientId string = ''
 @description('Graph Client Secret for Microsoft Graph API access')
 param graphClientSecret string = ''
 
+@description('Graph tenant ID for app-only Graph calls')
+param graphTenantId string = ''
+
+@description('Graph scopes string')
+param graphScopesStr string = 'https://graph.microsoft.com/.default'
+
+@description('Azure client ID for Graph enterprise connector (AZURE_CLIENT_ID)')
+param azureClientId string = ''
+
+@secure()
+@description('Azure client secret for Graph enterprise connector (AZURE_CLIENT_SECRET)')
+param azureClientSecret string = ''
+
+// Azure Storage
+@secure()
+@description('Azure Storage connection string')
+param azureStorageConnectionString string = ''
+
+@description('Azure Storage account name')
+param azureStorageAccountName string = ''
+
+@secure()
+@description('Azure Storage account key')
+param azureStorageAccountKey string = ''
+
+@description('Azure Storage container for documents')
+param azureStorageContainerDocuments string = ''
+
+@description('Azure Storage container for uploads')
+param azureStorageContainerUploads string = ''
+
+@description('Azure Storage container for agent memory')
+param azureStorageContainerAgentMemory string = ''
+
+// Azure Document Intelligence
+@description('Azure Document Intelligence endpoint')
+param azureDocumentIntelligenceEndpoint string = ''
+
+@secure()
+@description('Azure Document Intelligence key')
+param azureDocumentIntelligenceKey string = ''
+
+// Image generation — DALL-E
+@description('DALL-E / gpt-image-1 endpoint')
+param imageDalleEndpoint string = ''
+
+@secure()
+@description('DALL-E API key')
+param imageDalleApiKey string = ''
+
+@description('DALL-E API version')
+param imageDalleApiVersion string = '2025-04-01-preview'
+
+@description('DALL-E deployment name')
+param imageDalleDeployment string = 'gpt-image-1'
+
+// Image generation — FLUX (optional)
+@description('FLUX image generation endpoint (optional)')
+param imageFluxEndpoint string = ''
+
+@secure()
+@description('FLUX API key (optional)')
+param imageFluxApiKey string = ''
+
+@description('FLUX deployment name')
+param imageFluxDeployment string = ''
+
+@description('FLUX API version')
+param imageFluxApiVersion string = '2024-05-01-preview'
+
+@description('Image provider order (comma-separated, e.g. dalle or flux,dalle)')
+param imageProviderOrder string = 'dalle'
+
+// Azure OpenAI API version
+@description('Azure OpenAI API version')
+param azureOpenaiApiVersion string = '2024-05-01-preview'
+
+// Azure Search scoring profile
+@description('Azure AI Search scoring profile name')
+param azureSearchScoringProfile string = 'freshness-boost'
+
+// Context limit overrides (ACCURACY FIX values)
+@description('Max LLM attachment chars total')
+param maxLlmAttachChars int = 90000
+
+@description('Max chars per document snippet in LLM')
+param maxDocSnippetChars int = 8000
+
+@description('Max LLM context chars total')
+param maxLlmContextChars int = 60000
+
+@description('Max attachment snippet chars')
+param maxAttachSnippetChars int = 8000
+
+@description('Max LLM exposure chars')
+param maxLlmExposureChars int = 8000
+
+// Retrieval precision tuning
+@description('Minimum semantic reranker score threshold (0–4 Azure scale)')
+param minRerankerScore string = '1.3'
+
+@description('Max chars per index chunk')
+param chunkMaxChars int = 1500
+
+@description('Chunk overlap chars')
+param chunkOverlapChars int = 300
+
+// Org website
+@description('Allowed organisation website domain(s) for grounded web answering')
+param orgWebsiteAllowlist string = ''
+
 @description('Retry configuration: maximum number of retries')
 param retryMaxRetries int = 4
 
@@ -80,34 +191,34 @@ param minCachedScoreBeforeAi int = 55
 param minCachedScoreBeforeGraph int = 30
 
 @description('Max characters per single document included in model input')
-param maxDocContextChars int = 3000
+param maxDocContextChars int = 40000
 
 @description('Max total characters from documents added to model input')
-param maxTotalContextChars int = 12000
+param maxTotalContextChars int = 60000
 
 @description('Approximate max prompt tokens (fallback limiter)')
-param maxPromptTokensApprox int = 3500
+param maxPromptTokensApprox int = 90000
 
 @description('Max model completion tokens')
-param maxCompletionTokens int = 512
+param maxCompletionTokens int = 4000
 
 @description('Hard cap for total prompt characters (optional)')
-param maxPromptChars int = 14000
+param maxPromptChars int = 180000
 
 @description('Max number of document snippets to include')
-param maxDocs int = 3
+param maxDocs int = 5
 
 @description('Max snippet length per document')
-param maxSnippetChars int = 800
+param maxSnippetChars int = 8000
 
 @description('Max total characters from attachments in prompt')
-param maxAttachChars int = 2000
+param maxAttachChars int = 40000
 
 @description('Max total characters from web cache in prompt')
 param maxWebChars int = 1200
 
 @description('Max turns of memory to include')
-param maxMemoryTurns int = 8
+param maxMemoryTurns int = 5
 
 @description('Min interval (seconds) between streaming chunks')
 param streamChunkInterval string = '0.3'
@@ -120,14 +231,10 @@ param attachmentCheckTimeout int = 1
 param conversationHistoryTimeout int = 1
 param sharepointIndexPollSeconds int = 900
 param sharepointIndexRunOnStartup bool = true
-param sharepointIndexMaxItemsPerRun int = 200
+param sharepointIndexMaxItemsPerRun int = 2000
 param sharepointIndexMaxDepth int = 8
 param minSearchResultsBeforeGraph int = 3
 param requireMultiDocumentSearch bool = true
-param maxLlmContextChars int = 10000
-param maxAttachSnippetChars int = 1000
-param maxLlmExposureChars int = 1500
-param maxLlmAttachChars int = 12000
 param maxFileSizeMb int = 10
 param maxContentSizeChars int = 5000000
 param maxExtractedChars int = 200000
@@ -403,18 +510,6 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
           value: string(minCachedScoreBeforeGraph)
         }
         {
-          name: 'MAX_LLM_CONTEXT_CHARS'
-          value: string(maxLlmContextChars)
-        }
-        {
-          name: 'MAX_ATTACH_SNIPPET_CHARS'
-          value: string(maxAttachSnippetChars)
-        }
-        {
-          name: 'MAX_LLM_EXPOSURE_CHARS'
-          value: string(maxLlmExposureChars)
-        }
-        {
           name: 'MAX_FILE_SIZE_MB'
           value: string(maxFileSizeMb)
         }
@@ -453,6 +548,143 @@ resource webApp 'Microsoft.Web/sites@2021-02-01' = {
         {
           name: 'GRAPH_ALLOW_APP_ONLY_FALLBACK'
           value: string(graphAllowAppOnlyFallback)
+        }
+        // Graph enterprise connector identity (app-only SharePoint/OneDrive indexing)
+        {
+          name: 'AZURE_CLIENT_ID'
+          value: azureClientId
+        }
+        {
+          name: 'AZURE_CLIENT_SECRET'
+          value: azureClientSecret
+        }
+        {
+          name: 'GRAPH_TENANT_ID'
+          value: graphTenantId
+        }
+        {
+          name: 'GRAPH_SCOPES'
+          value: graphScopesStr
+        }
+        // Azure Storage (attachment cache + blob storage)
+        {
+          name: 'AZURE_STORAGE_CONNECTION_STRING'
+          value: azureStorageConnectionString
+        }
+        {
+          name: 'AZURE_STORAGE_ACCOUNT_NAME'
+          value: azureStorageAccountName
+        }
+        {
+          name: 'AZURE_STORAGE_ACCOUNT_KEY'
+          value: azureStorageAccountKey
+        }
+        {
+          name: 'AZURE_STORAGE_CONTAINER_DOCUMENTS'
+          value: azureStorageContainerDocuments
+        }
+        {
+          name: 'AZURE_STORAGE_CONTAINER_UPLOADS'
+          value: azureStorageContainerUploads
+        }
+        {
+          name: 'AZURE_STORAGE_CONTAINER_AGENT_MEMORY'
+          value: azureStorageContainerAgentMemory
+        }
+        // Azure Document Intelligence (PDF/OCR extraction)
+        {
+          name: 'AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT'
+          value: azureDocumentIntelligenceEndpoint
+        }
+        {
+          name: 'AZURE_DOCUMENT_INTELLIGENCE_KEY'
+          value: azureDocumentIntelligenceKey
+        }
+        // Image generation
+        {
+          name: 'IMAGE_PROVIDER_ORDER'
+          value: imageProviderOrder
+        }
+        {
+          name: 'AZURE_DALLE_ENDPOINT'
+          value: imageDalleEndpoint
+        }
+        {
+          name: 'AZURE_DALLE_API_KEY'
+          value: imageDalleApiKey
+        }
+        {
+          name: 'AZURE_DALLE_API_VERSION'
+          value: imageDalleApiVersion
+        }
+        {
+          name: 'AZURE_DALLE_DEPLOYMENT'
+          value: imageDalleDeployment
+        }
+        {
+          name: 'FLUX_ENDPOINT'
+          value: imageFluxEndpoint
+        }
+        {
+          name: 'FLUX_API_KEY'
+          value: imageFluxApiKey
+        }
+        {
+          name: 'FLUX_DEPLOYMENT'
+          value: imageFluxDeployment
+        }
+        {
+          name: 'FLUX_API_VERSION'
+          value: imageFluxApiVersion
+        }
+        // Azure OpenAI API version
+        {
+          name: 'AZURE_OPENAI_API_VERSION'
+          value: azureOpenaiApiVersion
+        }
+        // Azure Search scoring profile
+        {
+          name: 'AZURE_SEARCH_SCORING_PROFILE'
+          value: azureSearchScoringProfile
+        }
+        // Context limit overrides (ACCURACY FIX — matched to config.py defaults)
+        {
+          name: 'MAX_LLM_ATTACH_CHARS'
+          value: string(maxLlmAttachChars)
+        }
+        {
+          name: 'MAX_DOC_SNIPPET_CHARS'
+          value: string(maxDocSnippetChars)
+        }
+        {
+          name: 'MAX_LLM_CONTEXT_CHARS'
+          value: string(maxLlmContextChars)
+        }
+        {
+          name: 'MAX_ATTACH_SNIPPET_CHARS'
+          value: string(maxAttachSnippetChars)
+        }
+        {
+          name: 'MAX_LLM_EXPOSURE_CHARS'
+          value: string(maxLlmExposureChars)
+        }
+        // Retrieval precision
+        {
+          name: 'MIN_RERANKER_SCORE'
+          value: minRerankerScore
+        }
+        {
+          name: 'CHUNK_MAX_CHARS'
+          value: string(chunkMaxChars)
+        }
+        {
+          name: 'CHUNK_OVERLAP_CHARS'
+          value: string(chunkOverlapChars)
+        }
+        // Organisation website
+        {
+          name: 'ORG_WEBSITE_ALLOWLIST'
+          value: orgWebsiteAllowlist
         }
       ]
       ftpsState: 'FtpsOnly'

@@ -7,31 +7,30 @@ environmentFolderPath: ./env
 
 # Triggered when 'teamsfx provision' is executed
 provision:
-  # Creates an app
-  - uses: teamsApp/create
-    with:
-      # app name
-      name: Armely AI
-    # Write the information of created resources into environment file for
-    # the specified environment variable(s).
-    writeToEnvironmentFile:
-      teamsAppId: TEAMS_APP_ID
+  # teamsApp/create is DISABLED — app cf3c6d50-382e-4c30-a02c-40e90ac11ea0 already exists
+  # owned by malvine.owuor@armely.com. TEAMS_APP_ID is already set in env.dev.
+  # Re-enable only if the Teams app needs to be recreated from scratch.
+  # - uses: teamsApp/create
+  #   with:
+  #     # app name
+  #     name: Armely AI
+  #   # Write the information of created resources into environment file for
+  #   # the specified environment variable(s).
+  #   writeToEnvironmentFile:
+  #     teamsAppId: TEAMS_APP_ID
 
-  # Create or reuse an existing Microsoft Entra application for bot.
-  - uses: aadApp/create
-    with:
-      # The Microsoft Entra application's display name
-      name: Armely AI
-      generateClientSecret: true
-      generateServicePrincipal: true
-      signInAudience: AzureADMultipleOrgs
-    writeToEnvironmentFile:
-      # The Microsoft Entra application's client id created for bot.
-      clientId: BOT_ID
-      # The Microsoft Entra application's client secret created for bot.
-      clientSecret: SECRET_BOT_PASSWORD
-      # The Microsoft Entra application's object id created for bot.
-      objectId: BOT_OBJECT_ID
+  # aadApp/create is DISABLED — bot uses UserAssignedMSI (no client secret).
+  # Re-enable only when the Teams SSO app registration needs to be recreated.
+  # - uses: aadApp/create
+  #   with:
+  #     name: Armely AI
+  #     generateClientSecret: true
+  #     generateServicePrincipal: true
+  #     signInAudience: AzureADMultipleOrgs
+  #   writeToEnvironmentFile:
+  #     clientId: BOT_ID
+  #     clientSecret: SECRET_BOT_PASSWORD
+  #     objectId: BOT_OBJECT_ID
 
   # Deploy Azure resources (App Service, etc.) - MUST run before aadApp/update to create BOT_DOMAIN
   - uses: arm/deploy
@@ -44,12 +43,12 @@ provision:
           deploymentName: Create-resources-for-bot
       bicepCliVersion: v0.9.1
 
-  # Configure Entra app for SSO (expose API + Graph permissions for delegated access)
-  # MOVED AFTER arm/deploy so BOT_DOMAIN is available
-  - uses: aadApp/update
-    with:
-      manifestPath: ./aad.manifest.json
-      outputFilePath: ./build/aad.manifest.${{TEAMSFX_ENV}}.json
+  # aadApp/update is DISABLED — SSO manifest update not needed for this deployment.
+  # Re-enable together with aadApp/create when updating SSO configuration.
+  # - uses: aadApp/update
+  #   with:
+  #     manifestPath: ./aad.manifest.json
+  #     outputFilePath: ./build/aad.manifest.${{TEAMSFX_ENV}}.json
 
   # Validate using manifest schema
   - uses: teamsApp/validateManifest

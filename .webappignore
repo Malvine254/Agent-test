@@ -22,3 +22,9 @@ src/analyze_*.py
 src/view_*.py
 src/flask_app_with_typing.py
 src/.webappignore
+# Local runtime state — never deploy these
+src/attachment_cache.json
+src/conversation_store.json
+src/delta_state.json
+src/user_profiles_cache.json
+
