@@ -129,6 +129,81 @@ def resolve_sharing_url(url: str) -> dict | None:
     }
 
 
+def get_item_download_url(drive_id: str, item_id: str) -> str:
+    """Return a pre-authenticated download URL for a drive item (app-only).
+
+    Graph search results don't include ``@microsoft.graph.downloadUrl``, so when a
+    file is located by name we fetch the item to get a short-lived, pre-auth URL the
+    attachment pipeline can download without any auth header.
+    """
+    if not drive_id or not item_id:
+        return ""
+    try:
+        # NB: do NOT use $select for the download URL — Graph omits the computed
+        # ``@microsoft.graph.downloadUrl`` annotation when $select is present.
+        item = graph_get(f"/drives/{drive_id}/items/{item_id}")
+    except Exception as exc:
+        logger.info("get_item_download_url failed for %s/%s: %s", drive_id, item_id, type(exc).__name__)
+        return ""
+    return item.get("@microsoft.graph.downloadUrl") or ""
+
+
+def search_user_drive(user_id: str, query: str, *, top: int = 5) -> list[dict]:
+    """Search a specific user's OneDrive for files matching a name/term (app-only).
+
+    Requires Files.Read.All. Returns raw driveItem dicts (file items only); each has
+    ``id`` and ``parentReference.driveId`` so the caller can fetch a download URL via
+    get_item_download_url().
+    """
+    if not user_id or not query.strip():
+        return []
+    safe = query.replace("'", "''")
+    try:
+        data = graph_get(f"/users/{user_id}/drive/root/search(q='{safe}')?$top={int(top)}")
+    except Exception as exc:
+        logger.info("OneDrive search failed for user %s %r: %s", (user_id or "")[:8], query[:50], type(exc).__name__)
+        return []
+    return [item for item in data.get("value", []) if "file" in item]
+
+
+def get_teams_message_file_attachments(chat_id: str, message_id: str = "") -> list[dict]:
+    """Return file (``reference``) attachments for a Teams chat/channel message via Graph.
+
+    Requires Chat.Read.All / ChannelMessage.Read.All (app-only). Works for group chats
+    and channels whose conversation id is a real Graph thread (``...@thread.v2``); 1:1
+    bot chats are NOT Graph-addressable and will simply yield nothing. Tries the exact
+    message first, then falls back to the newest recent message that carries file
+    attachments. Returns ``[{"name", "content_url"}]``.
+    """
+    if not chat_id:
+        return []
+    out: list[dict] = []
+
+    def _collect(msg: dict) -> None:
+        for a in msg.get("attachments", []) or []:
+            ct = (a.get("contentType") or "").lower()
+            url = a.get("contentUrl") or ""
+            if ct == "reference" and url:
+                out.append({"name": a.get("name") or "", "content_url": url})
+
+    try:
+        if message_id:
+            try:
+                _collect(graph_get(f"/chats/{chat_id}/messages/{message_id}"))
+                if out:
+                    return out
+            except Exception:
+                pass
+        data = graph_get(f"/chats/{chat_id}/messages?$top=10")
+        for msg in data.get("value", []):
+            _collect(msg)
+            if out:
+                break
+    except Exception as exc:
+        logger.info("Teams message attachment fetch failed for %s: %s", (chat_id or "")[:40], type(exc).__name__)
+    return out
+
+
 def search_drive_items(drive_id: str, query: str, *, top: int = 5) -> list[dict]:
     """Search a single drive for items matching a filename/term via Graph search.
 

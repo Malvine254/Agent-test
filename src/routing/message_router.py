@@ -17,24 +17,36 @@ logger = logging.getLogger(__name__)
 
 _BOT_SELF_PATTERNS = [
     "how can you help", "how can you help me", "how do you help",
+    "what can you help", "what can you help me", "what can you help me with",
     "what can you do", "what do you do", "what are you",
+    "what can you assist", "how can you assist", "what do you offer",
     "what are your capabilities", "what are your features",
     "tell me about yourself", "tell me what you can do",  # EXACT: only "yourself", not general topics
-    "what is your purpose", "what's your purpose",
+    "what is your purpose", "what's your purpose", "whats your purpose",
     "how do you work", "what can this bot do", "what can the bot do",
     "what kind of questions can i ask", "what questions can i ask",
+    "what can i ask you", "what can i ask",
     "what should i ask", "how does this work",
     "what kind of help can you", "what type of help can you",
+    "who are you",
 ]
 
 
 def is_bot_self_question(text: str) -> bool:
-    """Check if this is a question about the BOT itself, not a general organizational query."""
+    """Check if this is a question about the BOT itself, not a general organizational query.
+
+    A question is bot-self when the whole message (ignoring trailing punctuation)
+    is one of the patterns or starts with one. These phrasings are about the
+    assistant's abilities, so they should be answered directly rather than
+    triggering a SharePoint/document search."""
+    t = (text or "").strip().lower().rstrip("?.! ")
+    if not t:
+        return False
+    # Match the whole message or a clean word-boundary prefix only. A bare
+    # prefix match would wrongly catch org queries (e.g. "what are your
+    # vacation days" should NOT match the "what are you" pattern).
     for pattern in _BOT_SELF_PATTERNS:
-        if text == pattern or (text.startswith(pattern) and (
-            pattern in ["what can you do", "what kind of help can you", "what type of help can you", "how can you help"] or
-            pattern == "tell me about yourself" and text == pattern
-        )):
+        if t == pattern or t.startswith(pattern + " "):
             return True
     return False
 

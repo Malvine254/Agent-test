@@ -225,7 +225,9 @@ def search_documents(query: str, top: int = 20) -> list:
             "captions": "extractive",
             "answers": "extractive|count-3",
             "top": requested_top,
-            "queryLanguage": "en-us"
+            # NB: no "queryLanguage" — API version 2025-09-01 rejects it for the
+            # search operation (HTTP 400) and falls back to keyword. en-us is the
+            # default for the semantic configuration anyway.
         }, 20.0),
         ("keyword-all", {
             "search": search_term,
@@ -250,7 +252,7 @@ def search_documents(query: str, top: int = 20) -> list:
 
     query_terms = [
         term
-        for term in query_tokens(query)
+        for term in _extract_query_terms(query, min_len=1, include_joined=True)
         if len(term) > 3 and term not in {"about", "document", "documents", "file", "files", "please", "show", "tell", "info", "information"}
     ]
     specific_lookup = (
@@ -382,7 +384,7 @@ def search_documents(query: str, top: int = 20) -> list:
         "captions": "extractive",
         "answers": "extractive|count-3",
         "top": min(top, 15),  # Respect top parameter â€” cap at 15 for performance
-        "queryLanguage": "en-us"  # Improve semantic understanding
+        # NB: no "queryLanguage" — rejected by API 2025-09-01 (HTTP 400).
     }
     
     # Log final body for diagnostics
@@ -2827,7 +2829,9 @@ def search_sharepoint(query: str, token: str, user_context: bool = True, user_up
                 "https://graph.microsoft.com/v1.0/search/query",
                 headers=headers,
                 json=search_body,
-                timeout=config.GRAPH_TIMEOUT,
+                # Search is far slower than ordinary Graph reads — use its own,
+                # longer budget so a cold/complex query isn't dropped at 8s.
+                timeout=getattr(config, "GRAPH_SEARCH_TIMEOUT", 25),
             )
         
         try:

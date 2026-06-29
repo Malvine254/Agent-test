@@ -205,6 +205,10 @@ class Config:
     # Resilience and performance tuning
     HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "8"))  # seconds
     GRAPH_TIMEOUT = int(os.environ.get("GRAPH_TIMEOUT", "8"))  # seconds - fast-fail for Graph API calls
+    # The Graph /search/query endpoint is much slower than item/mail/calendar reads
+    # (a cold first call is ~6s and complex expanded queries exceed GRAPH_TIMEOUT,
+    # silently returning zero live-SharePoint hits). Give search its own budget.
+    GRAPH_SEARCH_TIMEOUT = int(os.environ.get("GRAPH_SEARCH_TIMEOUT", "25"))  # seconds
     CACHE_LOAD_TIMEOUT = int(os.environ.get("CACHE_LOAD_TIMEOUT", "2"))  # seconds for loading cache files
     PROFILE_LOOKUP_TIMEOUT = int(os.environ.get("PROFILE_LOOKUP_TIMEOUT", "2"))  # seconds for Graph profile lookups
     USER_DETAILS_TIMEOUT = int(os.environ.get("USER_DETAILS_TIMEOUT", "1"))  # seconds for user details disk I/O

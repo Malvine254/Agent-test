@@ -1,10 +1,11 @@
-# Core Teams SDK
-microsoft-teams-ai>=2.0.0a8
-microsoft-teams-apps>=2.0.0a8
-microsoft-teams-api>=2.0.0a8
-microsoft-teams-openai>=2.0.0a8
+# Core Teams SDK — pinned to known-working versions (do not upgrade without testing)
+microsoft-teams-ai==2.0.0a78
+microsoft-teams-apps==2.0.13.4
+microsoft-teams-api==2.0.13.4
+microsoft-teams-openai==2.0.0a78
 
 # Web server for Azure
+uvicorn>=0.24.0
 gunicorn>=21.0.0
 
 # Azure and authentication

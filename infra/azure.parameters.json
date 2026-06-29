@@ -110,6 +110,99 @@
     "streamChunkInterval": {
       "value": "${{STREAM_CHUNK_INTERVAL}}"
     },
+    "graphTenantId": {
+      "value": "${{GRAPH_TENANT_ID}}"
+    },
+    "graphScopesStr": {
+      "value": "${{GRAPH_SCOPES}}"
+    },
+    "azureClientId": {
+      "value": "${{AZURE_CLIENT_ID}}"
+    },
+    "azureClientSecret": {
+      "value": "${{AZURE_CLIENT_SECRET}}"
+    },
+    "azureStorageConnectionString": {
+      "value": "${{AZURE_STORAGE_CONNECTION_STRING}}"
+    },
+    "azureStorageAccountName": {
+      "value": "${{AZURE_STORAGE_ACCOUNT_NAME}}"
+    },
+    "azureStorageAccountKey": {
+      "value": "${{AZURE_STORAGE_ACCOUNT_KEY}}"
+    },
+    "azureStorageContainerDocuments": {
+      "value": "${{AZURE_STORAGE_CONTAINER_DOCUMENTS}}"
+    },
+    "azureStorageContainerUploads": {
+      "value": "${{AZURE_STORAGE_CONTAINER_UPLOADS}}"
+    },
+    "azureStorageContainerAgentMemory": {
+      "value": "${{AZURE_STORAGE_CONTAINER_AGENT_MEMORY}}"
+    },
+    "azureDocumentIntelligenceEndpoint": {
+      "value": "${{AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT}}"
+    },
+    "azureDocumentIntelligenceKey": {
+      "value": "${{AZURE_DOCUMENT_INTELLIGENCE_KEY}}"
+    },
+    "imageDalleEndpoint": {
+      "value": "${{AZURE_DALLE_ENDPOINT}}"
+    },
+    "imageDalleApiKey": {
+      "value": "${{AZURE_DALLE_API_KEY}}"
+    },
+    "imageDalleApiVersion": {
+      "value": "${{AZURE_DALLE_API_VERSION}}"
+    },
+    "imageDalleDeployment": {
+      "value": "${{AZURE_DALLE_DEPLOYMENT}}"
+    },
+    "imageFluxEndpoint": {
+      "value": "${{FLUX_ENDPOINT}}"
+    },
+    "imageFluxApiKey": {
+      "value": "${{FLUX_API_KEY}}"
+    },
+    "imageFluxDeployment": {
+      "value": "${{FLUX_DEPLOYMENT}}"
+    },
+    "imageFluxApiVersion": {
+      "value": "${{FLUX_API_VERSION}}"
+    },
+    "imageProviderOrder": {
+      "value": "${{IMAGE_PROVIDER_ORDER}}"
+    },
+    "azureOpenaiApiVersion": {
+      "value": "${{AZURE_OPENAI_API_VERSION}}"
+    },
+    "maxLlmAttachChars": {
+      "value": ${{MAX_LLM_ATTACH_CHARS}}
+    },
+    "maxDocSnippetChars": {
+      "value": ${{MAX_DOC_SNIPPET_CHARS}}
+    },
+    "maxLlmContextChars": {
+      "value": ${{MAX_LLM_CONTEXT_CHARS}}
+    },
+    "maxAttachSnippetChars": {
+      "value": ${{MAX_ATTACH_SNIPPET_CHARS}}
+    },
+    "maxLlmExposureChars": {
+      "value": ${{MAX_LLM_EXPOSURE_CHARS}}
+    },
+    "minRerankerScore": {
+      "value": "${{MIN_RERANKER_SCORE}}"
+    },
+    "chunkMaxChars": {
+      "value": ${{CHUNK_MAX_CHARS}}
+    },
+    "chunkOverlapChars": {
+      "value": ${{CHUNK_OVERLAP_CHARS}}
+    },
+    "orgWebsiteAllowlist": {
+      "value": "${{ORG_WEBSITE_ALLOWLIST}}"
+    },
     "webAppSKU": {
       "value": "S1"
     },
